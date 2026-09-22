@@ -15,6 +15,12 @@ from .grid import estimate_grid, iter_grid_origins
 
 DEFAULT_IMAGE = "gosom/google-maps-scraper:v1.18.1"
 _RESUME_STATE_VERSION = 1
+_GO_TRIM_SPACE_CHARS = (
+    " \t\n\v\f\r"
+    "\u0085\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 
 
 @dataclass(frozen=True)
@@ -258,12 +264,17 @@ def _read_file_via_container(path: Path, image: str) -> str:
     return completed.stdout
 
 
+def _go_trim_space(value: str) -> str:
+    """Mirror Go strings.TrimSpace for upstream query parsing."""
+    return value.strip(_GO_TRIM_SPACE_CHARS)
+
+
 def _parse_upstream_query_identity(line: str) -> tuple[str, str]:
-    value = line.strip()
+    value = _go_trim_space(line)
     if "#!#" in value:
         before, after = value.split("#!#", 1)
-        query_text = before.strip()
-        query_id = after.strip()
+        query_text = _go_trim_space(before)
+        query_id = _go_trim_space(after)
     else:
         query_text = value
         query_id = ""
