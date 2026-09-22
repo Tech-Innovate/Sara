@@ -1,3 +1,4 @@
+import os
 import stat
 from pathlib import Path
 
@@ -38,7 +39,8 @@ def test_docker_command_mounts_query_snapshot_and_disables_telemetry(tmp_path):
     assert "-grid-bbox" in command
     assert "-resume" in command
     assert output.exists()
-    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
 def test_dry_run_command_preparation_does_not_create_output(tmp_path):
