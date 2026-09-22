@@ -278,12 +278,12 @@ def cmd_collect(args) -> int:
     print(f"run_id={run_id} cells={estimate.cells} planned_searches={estimate.searches}")
 
     if args.dry_run:
-        write_query_snapshot(query_snapshot, queries)
         command = build_docker_command(
             area=area,
             queries_file=query_snapshot,
             output_file=output_file,
             options=options,
+            prepare_paths=False,
         )
         print(command_for_display(command))
         return 0
