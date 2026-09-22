@@ -182,7 +182,7 @@ A recorded raw file can be re-ingested idempotently, for example after improving
 sara ingest --run-id <run-id> --file output/<run-id>/results.jsonl
 ```
 
-For provenance safety, the supplied file must resolve to the run's recorded `raw_path`. Re-ingestion also re-verifies the run's recorded resume completion evidence before touching canonical storage, so an interrupted or otherwise unverifiable raw file cannot bypass the collection-time completion gate. If acquisition completed but a prior canonical-ingestion attempt failed, a successful verified re-ingest promotes that run to `complete`.
+For provenance safety, the supplied file must resolve to the run's recorded `raw_path`. Re-ingestion also re-verifies the run's recorded resume completion evidence before touching canonical storage, so an interrupted or otherwise unverifiable raw file cannot bypass the collection-time completion gate. If acquisition completed but a prior canonical-ingestion attempt failed, a successful verified re-ingest promotes that run to `complete` while preserving the scraper exit-code evidence already recorded for the run.
 
 Re-ingestion uses the run's recorded strict-bounds policy and is blocked while the same run is actively collecting. Historical re-ingestion is chronology-aware: an older run can establish an earlier `first_run_id` / `first_seen_at`, but it cannot overwrite newer canonical business fields, `raw_json`, `last_run_id`, or `last_seen_at`.
 
@@ -192,9 +192,11 @@ Re-ingestion uses the run's recorded strict-bounds policy and is blocked while t
 
 Sara keeps the raw JSON object from the latest retained run for each canonical business, while promoting commonly used fields such as title, category, address, coordinates, phone, website, rating, review count and status into typed columns. The original run JSONL remains the raw evidence for rows that were excluded from canonical storage or superseded by later observations.
 
+After completion evidence is verified, canonical ingestion, coverage metrics, and the transition to `status=complete` are committed in one SQLite transaction. Interrupts or failures before that commit roll back canonical mutations instead of exposing a partially ingested run as completed.
+
 ## Validation boundary
 
-CI validates Sara's Python orchestration and state-management contracts on Ubuntu and Windows with Python 3.11 and 3.12, including configuration validation, command construction, query normalization, cross-platform run locking, resume provenance, exact upstream-compatible grid planning, deterministic completion IDs, incomplete-run rejection, root-owned resume-sidecar handling, completion-gated re-ingestion, transactional ingestion, canonical identity convergence, chronology-aware re-ingestion, strong-identity conflict handling, output-file preparation, re-ingestion idempotence, and strict bounding-box accounting.
+CI validates Sara's Python orchestration and state-management contracts on Ubuntu and Windows with Python 3.11 and 3.12, including configuration validation, command construction, query normalization, cross-platform run locking, resume provenance, exact upstream-compatible grid planning, deterministic completion IDs, streaming completion comparison, incomplete-run rejection, root-owned resume-sidecar handling, completion-gated re-ingestion, interrupt rollback, atomic lifecycle finalization, exit-code provenance, transactional ingestion, canonical identity convergence, chronology-aware re-ingestion, strong-identity conflict handling, output-file preparation, re-ingestion idempotence, and strict bounding-box accounting.
 
 CI deliberately does **not** perform a live Google Maps scrape. A successful CI run therefore does not prove that Google's current page shape, anti-bot behavior, network path, proxy provider, the persistent `/opt` Playwright cache, or the pinned upstream scraper image will succeed together at collection time. Validate the first real crawl with a small representative query set before scaling the grid.
 
@@ -206,6 +208,8 @@ CI deliberately does **not** perform a live Google Maps scrape. A successful CI 
 - Run rows written by older Sara revisions are not retroactively reclassified at database-open time. Collection and every re-ingest now enforce completion evidence prospectively; historical status labels should not be treated as newly verified merely because the software was upgraded.
 - The `v1.18.1` image is pinned by version tag, not immutable registry digest; record/lock a digest separately if byte-for-byte container reproducibility is required.
 - Completion-ID verification intentionally depends on v1.18.1-compatible grid/identity semantics. An overridden or retagged image with incompatible semantics will fail closed rather than be silently trusted.
+- Upstream v1.18.1 rewrites, sorts, syncs, and atomically replaces the full `completed_inputs` resume-state list whenever another input completes. Very large single-run grids therefore incur increasing resume-state I/O; broad discovery should be partitioned into bounded geographic runs/tiles instead of one country-sized run.
+- Sara streams expected completion IDs through the loaded upstream completion set, avoiding a second full expected-ID set during verification. The upstream resume sidecar itself remains an unavoidable per-run scaling cost.
 - The upstream project currently recommends a persistent `gmaps-playwright-cache:/opt` volume even though v1.18.1 also contains its browser/driver under `/opt`. Sara follows the upstream invocation for now; validate an existing/stale cache volume during the first live smoke test before relying on it operationally.
 - Fallback identity is heuristic when Google strong IDs are absent. Raw JSONL should be retained for later reconciliation.
 - Keep extra review and email enrichment separate from discovery until the canonical place set is stable; otherwise overlapping cells multiply unnecessary network work.
