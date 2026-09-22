@@ -452,14 +452,22 @@ def cmd_collect(args) -> int:
                 run_id,
                 iter_jsonl(output_file),
                 bbox=area.bbox if strict_bounds else None,
+                finalize_run=("complete", scraper_exit_code, None),
             )
-            _mark_run(conn, run_id, status="complete", exit_code=scraper_exit_code, error=None)
         except KeyboardInterrupt:
+            status_row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if status_row is not None and status_row["status"] == "complete":
+                print("collection completed; reporting interrupted", file=sys.stderr)
+                return 130
             recorded_exit = scraper_exit_code if scraper_exit_code is not None else 130
             _mark_run(conn, run_id, status="interrupted", exit_code=recorded_exit, error="interrupted")
             print("collection interrupted", file=sys.stderr)
             return 130
         except Exception as exc:
+            status_row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if status_row is not None and status_row["status"] == "complete":
+                print(f"collection completed but post-commit handling failed: {exc}", file=sys.stderr)
+                return 1
             _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=str(exc))
             print(f"collection failed: {exc}", file=sys.stderr)
             return 1
@@ -539,13 +547,12 @@ def cmd_ingest(args) -> int:
                 run_id,
                 iter_jsonl(supplied),
                 bbox=bbox if strict_bounds else None,
+                finalize_run=("complete", row["exit_code"], None) if row["status"] != "complete" else None,
             )
         except Exception as exc:
             print(f"ingest failed: {exc}", file=sys.stderr)
             return 1
 
-        if row["status"] != "complete":
-            _mark_run(conn, run_id, status="complete", exit_code=row["exit_code"], error=None)
         return _report_stats(stats, operation="ingest")
     finally:
         lock.release()
