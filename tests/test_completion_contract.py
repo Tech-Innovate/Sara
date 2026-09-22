@@ -77,3 +77,21 @@ def test_streaming_comparison_reports_missing_without_allocating_expected_set():
     assert comparison.matched == 0
     assert comparison.missing == 1
     assert comparison.unexpected == 0
+
+
+def test_duplicate_streamed_expected_id_fails_closed_as_missing(monkeypatch):
+    area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
+    expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
+    expected._count = 2
+
+    monkeypatch.setattr(
+        scraper,
+        "_iter_expected_resume_input_ids",
+        lambda *_args, **_kwargs: iter(["resume:x", "resume:x"]),
+    )
+
+    comparison = expected.compare_completed({"resume:x"})
+
+    assert comparison.matched == 1
+    assert comparison.missing == 1
+    assert comparison.unexpected == 0
