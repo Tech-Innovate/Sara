@@ -389,6 +389,7 @@ def cmd_collect(args) -> int:
             print(str(exc), file=sys.stderr)
             return 2
 
+        scraper_exit_code: int | None = None
         try:
             write_query_snapshot(query_snapshot, queries)
             command = build_docker_command(
@@ -398,18 +399,18 @@ def cmd_collect(args) -> int:
                 options=options,
             )
             print(command_for_display(command))
-            exit_code = run_scraper(command)
-            if exit_code != 0:
-                error = f"scraper failed with exit code {exit_code}"
-                _mark_run(conn, run_id, status="failed", exit_code=exit_code, error=error)
+            scraper_exit_code = run_scraper(command)
+            if scraper_exit_code != 0:
+                error = f"scraper failed with exit code {scraper_exit_code}"
+                _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
-                return exit_code
+                return scraper_exit_code
 
             try:
                 completed_inputs = load_resume_completed_input_ids(output_file, options.image)
             except Exception as exc:
                 error = f"completion verification failed after scraper exit 0: {exc}"
-                _mark_run(conn, run_id, status="failed", exit_code=0, error=error)
+                _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
                 return 1
 
@@ -419,7 +420,7 @@ def cmd_collect(args) -> int:
                     "resume completion state does not match this run: "
                     f"{len(unexpected_inputs)} unexpected completed input(s)"
                 )
-                _mark_run(conn, run_id, status="failed", exit_code=0, error=error)
+                _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
                 return 1
 
@@ -429,7 +430,7 @@ def cmd_collect(args) -> int:
                     "scraper exited before all planned searches completed: "
                     f"completed {len(completed_inputs)}/{len(expected_inputs)}"
                 )
-                _mark_run(conn, run_id, status="interrupted", exit_code=0, error=error)
+                _mark_run(conn, run_id, status="interrupted", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
                 return 130
 
@@ -439,15 +440,16 @@ def cmd_collect(args) -> int:
                 iter_jsonl(output_file),
                 bbox=area.bbox if strict_bounds else None,
             )
-            _mark_run(conn, run_id, status="complete", exit_code=0, error=None)
+            _mark_run(conn, run_id, status="complete", exit_code=scraper_exit_code, error=None)
             _print_stats(stats)
             return 0
         except KeyboardInterrupt:
-            _mark_run(conn, run_id, status="interrupted", exit_code=130, error="interrupted")
+            recorded_exit = scraper_exit_code if scraper_exit_code is not None else 130
+            _mark_run(conn, run_id, status="interrupted", exit_code=recorded_exit, error="interrupted")
             print("collection interrupted", file=sys.stderr)
             return 130
         except Exception as exc:
-            _mark_run(conn, run_id, status="failed", exit_code=None, error=str(exc))
+            _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=str(exc))
             print(f"collection failed: {exc}", file=sys.stderr)
             return 1
     finally:
@@ -460,7 +462,7 @@ def cmd_ingest(args) -> int:
     row = conn.execute(
         """
         SELECT id, area_name, cell_km, queries_json, scraper_image, raw_path,
-               bbox_json, config_json, status
+               bbox_json, config_json, status, exit_code
         FROM runs WHERE id = ?
         """,
         (run_id,),
@@ -530,7 +532,7 @@ def cmd_ingest(args) -> int:
             return 1
 
         if row["status"] != "complete":
-            _mark_run(conn, run_id, status="complete", exit_code=0, error=None)
+            _mark_run(conn, run_id, status="complete", exit_code=row["exit_code"], error=None)
         _print_stats(stats)
         return 0
     finally:
