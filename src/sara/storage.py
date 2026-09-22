@@ -460,7 +460,7 @@ def ingest_records(
         )
         _refresh_canonical_counts(conn)
         conn.commit()
-    except Exception:
+    except BaseException:
         conn.rollback()
         raise
 
