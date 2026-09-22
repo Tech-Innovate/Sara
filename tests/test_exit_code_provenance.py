@@ -48,10 +48,10 @@ def _collect_args(tmp_path):
 def test_post_scraper_ingest_failure_preserves_zero_exit_code(tmp_path, monkeypatch):
     args = _collect_args(tmp_path)
     area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
-    expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
+    completed = set(expected_resume_input_ids(area, ["restaurant"], 2.0))
 
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
-    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: set(completed))
     monkeypatch.setattr(
         cli,
         "ingest_records",
