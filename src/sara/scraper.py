@@ -64,6 +64,14 @@ def build_docker_command(
         output_file.parent.mkdir(parents=True, exist_ok=True)
         if not queries_file.is_file():
             raise FileNotFoundError(queries_file)
+
+        resume_state = Path(str(output_file) + ".resume.json")
+        if options.resume and resume_state.exists() and not output_file.exists():
+            # Match upstream's own resume invariant. Creating an empty results
+            # file here would let a complete sidecar suppress all work and turn
+            # missing raw evidence into a false successful run.
+            raise RuntimeError("resume state exists but results file is missing")
+
         # The upstream container runs as root and resume mode creates new result
         # files with mode 0600. Pre-creating the bind-mounted result as the host
         # user preserves host ownership when the container appends or truncates it,
@@ -127,17 +135,16 @@ def expected_resume_input_ids(area: AreaConfig, queries: list[str], cell_km: flo
     if not cells:
         raise ValueError("grid produced 0 cells; check bounding box and cell size")
 
-    expected: list[str] = []
+    expected: set[str] = set()
     for query_line in queries:
         query_text, query_id = _parse_upstream_query_identity(query_line)
         identity = query_id or query_text
         for coordinates in cells:
-            expected.append(_deterministic_seed_id(identity, coordinates))
-
-    expected_set = set(expected)
-    if len(expected_set) != len(expected):
-        raise ValueError("query IDs produce duplicate resume identities; use unique query IDs")
-    return expected_set
+            input_id = _deterministic_seed_id(identity, coordinates)
+            if input_id in expected:
+                raise ValueError("query IDs produce duplicate resume identities; use unique query IDs")
+            expected.add(input_id)
+    return expected
 
 
 def load_resume_completed_input_ids(output_file: Path, image: str) -> set[str]:
