@@ -1,0 +1,9 @@
+{
+  "name": "example-city",
+  "bbox": {
+    "min_lat": 21.45,
+    "min_lon": 39.10,
+    "max_lat": 21.75,
+    "max_lon": 39.35
+  }
+}
