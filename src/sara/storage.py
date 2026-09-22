@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .config import BoundingBox
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -16,6 +18,7 @@ def utc_now() -> str:
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -25,12 +28,18 @@ CREATE TABLE IF NOT EXISTS runs (
     depth INTEGER NOT NULL,
     queries_json TEXT NOT NULL,
     scraper_image TEXT NOT NULL,
+    config_json TEXT,
     raw_path TEXT,
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
     exit_code INTEGER,
+    error TEXT,
     raw_records INTEGER NOT NULL DEFAULT 0,
+    accepted_records INTEGER NOT NULL DEFAULT 0,
+    out_of_bounds_records INTEGER NOT NULL DEFAULT 0,
+    unlocated_records INTEGER NOT NULL DEFAULT 0,
+    unidentified_records INTEGER NOT NULL DEFAULT 0,
     unique_seen INTEGER NOT NULL DEFAULT 0,
     new_businesses INTEGER NOT NULL DEFAULT 0
 );
@@ -77,12 +86,29 @@ CREATE TABLE IF NOT EXISTS run_businesses (
 );
 """
 
+_RUN_COLUMN_MIGRATIONS = {
+    "config_json": "config_json TEXT",
+    "error": "error TEXT",
+    "accepted_records": "accepted_records INTEGER NOT NULL DEFAULT 0",
+    "out_of_bounds_records": "out_of_bounds_records INTEGER NOT NULL DEFAULT 0",
+    "unlocated_records": "unlocated_records INTEGER NOT NULL DEFAULT 0",
+    "unidentified_records": "unidentified_records INTEGER NOT NULL DEFAULT 0",
+}
+
 
 @dataclass(frozen=True)
 class IngestStats:
     raw_records: int
+    accepted_records: int
+    out_of_bounds_records: int
+    unlocated_records: int
+    unidentified_records: int
     unique_seen: int
     new_businesses: int
+
+
+class UnidentifiableRecord(ValueError):
+    pass
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -91,6 +117,11 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+    for name, definition in _RUN_COLUMN_MIGRATIONS.items():
+        if name not in existing_columns:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {definition}")
+    conn.commit()
     return conn
 
 
@@ -117,6 +148,13 @@ def _int(value: Any) -> int | None:
         return None
 
 
+def _coordinates(record: dict[str, Any]) -> tuple[float | None, float | None]:
+    longitude = record.get("longitude")
+    if longitude is None:
+        longitude = record.get("longtitude")
+    return _float(record.get("latitude")), _float(longitude)
+
+
 def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
     place_id = _text(record.get("place_id"))
     cid = _text(record.get("cid"))
@@ -128,11 +166,20 @@ def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | Non
     if data_id:
         return place_id, cid, data_id, f"data:{data_id}"
 
-    fallback = "|".join(
-        str(record.get(key) or "").strip().lower()
-        for key in ("title", "phone", "website", "latitude", "longitude")
+    latitude, longitude = _coordinates(record)
+    values = (
+        _text(record.get("link")),
+        _text(record.get("title")),
+        _text(record.get("address")),
+        _text(record.get("phone")),
+        _text(record.get("website")),
+        None if latitude is None else str(latitude),
+        None if longitude is None else str(longitude),
     )
-    digest = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
+    normalized = [value.strip().lower() if value else "" for value in values]
+    if not any(normalized):
+        raise UnidentifiableRecord("record has no usable identity fields")
+    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
     return place_id, cid, data_id, f"fallback:{digest}"
 
 
@@ -197,15 +244,13 @@ def _merge_matches(conn: sqlite3.Connection, matches: list[sqlite3.Row]) -> sqli
 
 
 def _payload(record: dict[str, Any]) -> dict[str, Any]:
-    longitude = record.get("longitude")
-    if longitude is None:
-        longitude = record.get("longtitude")
+    latitude, longitude = _coordinates(record)
     return {
         "title": _text(record.get("title")),
         "category": _text(record.get("category")),
         "address": _text(record.get("address")),
-        "latitude": _float(record.get("latitude")),
-        "longitude": _float(longitude),
+        "latitude": latitude,
+        "longitude": longitude,
         "phone": _text(record.get("phone")),
         "website": _text(record.get("website")),
         "review_rating": _float(record.get("review_rating")),
@@ -261,29 +306,97 @@ def upsert_business(conn: sqlite3.Connection, run_id: str, record: dict[str, Any
     return int(existing["id"]), False
 
 
-def ingest_records(conn: sqlite3.Connection, run_id: str, records: Iterable[dict[str, Any]]) -> IngestStats:
+def _refresh_canonical_counts(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        UPDATE runs
+        SET unique_seen = (
+                SELECT COUNT(*) FROM run_businesses rb WHERE rb.run_id = runs.id
+            ),
+            new_businesses = (
+                SELECT COUNT(*) FROM businesses b WHERE b.first_run_id = runs.id
+            )
+        """
+    )
+
+
+def ingest_records(
+    conn: sqlite3.Connection,
+    run_id: str,
+    records: Iterable[dict[str, Any]],
+    *,
+    bbox: BoundingBox | None = None,
+) -> IngestStats:
+    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
+        raise ValueError(f"run_id {run_id} does not exist")
+
     raw_records = 0
-    new_businesses = 0
-    seen_ids: set[int] = set()
+    accepted_records = 0
+    out_of_bounds_records = 0
+    unlocated_records = 0
+    unidentified_records = 0
     now = utc_now()
 
-    for record in records:
-        raw_records += 1
-        business_id, is_new = upsert_business(conn, run_id, record)
-        if is_new:
-            new_businesses += 1
-        seen_ids.add(business_id)
-        conn.execute(
-            "INSERT OR IGNORE INTO run_businesses(run_id, business_id, first_observed_at) VALUES (?, ?, ?)",
-            (run_id, business_id, now),
-        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for record in records:
+            raw_records += 1
+            if bbox is not None:
+                latitude, longitude = _coordinates(record)
+                if latitude is None or longitude is None:
+                    unlocated_records += 1
+                    continue
+                if not bbox.contains(latitude, longitude):
+                    out_of_bounds_records += 1
+                    continue
 
-    conn.execute(
-        "UPDATE runs SET raw_records = ?, unique_seen = ?, new_businesses = ? WHERE id = ?",
-        (raw_records, len(seen_ids), new_businesses, run_id),
+            try:
+                business_id, _ = upsert_business(conn, run_id, record)
+            except UnidentifiableRecord:
+                unidentified_records += 1
+                continue
+
+            accepted_records += 1
+            conn.execute(
+                "INSERT OR IGNORE INTO run_businesses(run_id, business_id, first_observed_at) VALUES (?, ?, ?)",
+                (run_id, business_id, now),
+            )
+
+        conn.execute(
+            """
+            UPDATE runs SET
+                raw_records = ?, accepted_records = ?, out_of_bounds_records = ?,
+                unlocated_records = ?, unidentified_records = ?
+            WHERE id = ?
+            """,
+            (
+                raw_records, accepted_records, out_of_bounds_records,
+                unlocated_records, unidentified_records, run_id,
+            ),
+        )
+        _refresh_canonical_counts(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    row = conn.execute(
+        """
+        SELECT raw_records, accepted_records, out_of_bounds_records, unlocated_records,
+               unidentified_records, unique_seen, new_businesses
+        FROM runs WHERE id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    return IngestStats(
+        raw_records=int(row["raw_records"]),
+        accepted_records=int(row["accepted_records"]),
+        out_of_bounds_records=int(row["out_of_bounds_records"]),
+        unlocated_records=int(row["unlocated_records"]),
+        unidentified_records=int(row["unidentified_records"]),
+        unique_seen=int(row["unique_seen"]),
+        new_businesses=int(row["new_businesses"]),
     )
-    conn.commit()
-    return IngestStats(raw_records, len(seen_ids), new_businesses)
 
 
 def iter_jsonl(path: str | Path):
