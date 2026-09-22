@@ -152,6 +152,8 @@ Use progressive passes instead of assuming one crawl is exhaustive:
 3. 0.5 km cells in dense areas if the additional unique-business yield remains worthwhile.
 4. Add relevant category/query variants and measure their marginal gain.
 
+Partition broad geographic work into bounded area/run tiles rather than one very large resume run. This limits the upstream resume-state rewrite cost and gives each tile an independently auditable completion receipt.
+
 The important metric is `new_businesses`, not raw result count. Stop tightening the grid when additional searches produce very few new canonical businesses.
 
 Identity convergence is handled retroactively: if two provisional rows later prove to be the same business through strong identifiers, Sara merges them and refreshes historical `unique_seen` / `new_businesses` counts so the coverage history remains canonical. Conflicting non-empty strong identifiers are treated as an ingestion error rather than silently replacing canonical identity.
