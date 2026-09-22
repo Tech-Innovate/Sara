@@ -18,6 +18,9 @@ class BoundingBox:
         if not (-180 <= self.min_lon < self.max_lon <= 180):
             raise ValueError("longitude bounds must satisfy -180 <= min_lon < max_lon <= 180")
 
+    def contains(self, latitude: float, longitude: float) -> bool:
+        return self.min_lat <= latitude <= self.max_lat and self.min_lon <= longitude <= self.max_lon
+
     def as_scraper_arg(self) -> str:
         return f"{self.min_lat},{self.min_lon},{self.max_lat},{self.max_lon}"
 
@@ -45,12 +48,23 @@ def load_area(path: str | Path) -> AreaConfig:
 
 
 def load_queries(path: str | Path) -> list[str]:
-    queries = []
+    queries: list[str] = []
+    seen: set[str] = set()
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         value = line.strip()
         if not value or value.startswith("#"):
             continue
+        if value in seen:
+            continue
+        seen.add(value)
         queries.append(value)
     if not queries:
         raise ValueError("query file contains no queries")
     return queries
+
+
+def write_query_snapshot(path: str | Path, queries: list[str]) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(queries) + "\n", encoding="utf-8")
+    return destination
