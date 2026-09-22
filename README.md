@@ -103,6 +103,8 @@ The collector mounts:
 - the run output directory at `/out`;
 - an optional proxy file read-only at `/run/secrets/gmaps-proxies`.
 
+Before Docker starts a real crawl, Sara pre-creates the result file as the host user. On POSIX systems it uses mode `0600`. This prevents a rootful upstream container from creating a root-owned resume output that the host-side Sara process cannot immediately ingest.
+
 Proxy credentials are never placed directly on the command line:
 
 ```bash
@@ -131,7 +133,7 @@ If Docker or the host is interrupted, reuse the same ID with the same configurat
 sara collect ... --run-id <existing-run-id>
 ```
 
-A changed resume configuration is rejected. Completed run IDs are protected from accidental reuse. Sara also places a per-run local lock beside the output so two processes cannot write the same results/resume files concurrently; a lock left by a dead local process is recognized as stale on the next attempt.
+A changed resume configuration is rejected. Completed run IDs are protected from accidental reuse. Sara also places a per-run local lock beside the output so two processes cannot write the same results/resume files concurrently; a lock left by a dead local process is recognized as stale on the next attempt. The liveness check is platform-specific so the Windows implementation does not use `os.kill(pid, 0)`.
 
 If a run ID has scraper output on disk but no corresponding database row, `collect` refuses to adopt those files silently. This prevents unrelated old output from becoming part of a new run.
 
@@ -146,7 +148,7 @@ Use progressive passes instead of assuming one crawl is exhaustive:
 
 The important metric is `new_businesses`, not raw result count. Stop tightening the grid when additional searches produce very few new canonical businesses.
 
-Identity convergence is handled retroactively: if two provisional rows later prove to be the same business through strong identifiers, Sara merges them and refreshes historical `unique_seen` / `new_businesses` counts so the coverage history remains canonical.
+Identity convergence is handled retroactively: if two provisional rows later prove to be the same business through strong identifiers, Sara merges them and refreshes historical `unique_seen` / `new_businesses` counts so the coverage history remains canonical. Conflicting non-empty strong identifiers are treated as an ingestion error rather than silently replacing canonical identity.
 
 ## Inspect coverage
 
@@ -174,23 +176,26 @@ sara ingest --run-id <run-id> --file output/<run-id>/results.jsonl
 
 For provenance safety, the supplied file must resolve to the run's recorded `raw_path`. Re-ingestion uses the run's recorded strict-bounds policy and is blocked while the same run is actively collecting.
 
+Historical re-ingestion is chronology-aware: an older run can establish an earlier `first_run_id` / `first_seen_at`, but it cannot overwrite newer canonical business fields, `raw_json`, `last_run_id`, or `last_seen_at`.
+
 ## Data model
 
 `businesses` is the canonical table. `run_businesses` records which businesses appeared in each accepted crawl result set. `runs` stores crawl configuration, lifecycle state, errors and coverage metrics.
 
-Sara keeps the most recent raw JSON object for each canonical business, while promoting commonly used fields such as title, category, address, coordinates, phone, website, rating, review count and status into typed columns. The original run JSONL remains the immutable raw evidence for rows that were excluded from canonical storage.
+Sara keeps the raw JSON object from the latest retained run for each canonical business, while promoting commonly used fields such as title, category, address, coordinates, phone, website, rating, review count and status into typed columns. The original run JSONL remains the immutable raw evidence for rows that were excluded from canonical storage or superseded by later observations.
 
 ## Validation boundary
 
-CI validates Sara's Python orchestration and state-management contracts on Python 3.11 and 3.12, including configuration validation, command construction, query normalization, run locking, resume provenance, transactional ingestion, canonical identity convergence, re-ingestion idempotence, and strict bounding-box accounting.
+CI validates Sara's Python orchestration and state-management contracts on Ubuntu and Windows with Python 3.11 and 3.12, including configuration validation, command construction, query normalization, cross-platform run locking, resume provenance, transactional ingestion, canonical identity convergence, chronology-aware re-ingestion, strong-identity conflict handling, output-file preparation, re-ingestion idempotence, and strict bounding-box accounting.
 
-CI deliberately does **not** perform a live Google Maps scrape. A successful CI run therefore does not prove that Google's current page shape, anti-bot behavior, network path, proxy provider, or the pinned upstream scraper image will succeed at collection time. Validate the first real crawl with a small representative query set before scaling the grid.
+CI deliberately does **not** perform a live Google Maps scrape. A successful CI run therefore does not prove that Google's current page shape, anti-bot behavior, network path, proxy provider, the persistent `/opt` Playwright cache, or the pinned upstream scraper image will succeed together at collection time. Validate the first real crawl with a small representative query set before scaling the grid.
 
 ## Notes and current boundaries
 
 - The upstream JSON writer emits one JSON object per line; Sara therefore treats scraper JSON output as JSONL.
 - Grid search improves geographic coverage but cannot guarantee every Google Maps listing.
 - The `v1.18.1` image is pinned by version tag, not immutable registry digest; record/lock a digest separately if byte-for-byte container reproducibility is required.
+- The upstream project currently recommends a persistent `gmaps-playwright-cache:/opt` volume even though v1.18.1 also contains its browser/driver under `/opt`. Sara follows the upstream invocation for now; validate an existing/stale cache volume during the first live smoke test before relying on it operationally.
 - Fallback identity is heuristic when Google strong IDs are absent. Raw JSONL should be retained for later reconciliation.
 - Keep extra review and email enrichment separate from discovery until the canonical place set is stable; otherwise overlapping cells multiply unnecessary network work.
 - `data/` and `output/` are intentionally gitignored.
