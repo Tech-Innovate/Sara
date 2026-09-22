@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from .config import BoundingBox
 
 KM_PER_DEGREE_LAT = 111.32
+MIN_COS_LATITUDE = 1e-6
 
 
 @dataclass(frozen=True)
@@ -23,12 +24,25 @@ def estimate_grid(bbox: BoundingBox, cell_km: float, query_count: int) -> GridEs
         raise ValueError("query_count must be greater than zero")
 
     bbox.validate()
-    lat_km = (bbox.max_lat - bbox.min_lat) * KM_PER_DEGREE_LAT
+    lat_step = cell_km / KM_PER_DEGREE_LAT
     midpoint = math.radians((bbox.min_lat + bbox.max_lat) / 2)
-    lon_km_per_degree = KM_PER_DEGREE_LAT * max(math.cos(midpoint), 1e-6)
-    lon_km = (bbox.max_lon - bbox.min_lon) * lon_km_per_degree
+    cos_midpoint = math.cos(midpoint)
+    if abs(cos_midpoint) < MIN_COS_LATITUDE:
+        cos_midpoint = -MIN_COS_LATITUDE if cos_midpoint < 0 else MIN_COS_LATITUDE
+    lon_step = cell_km / (KM_PER_DEGREE_LAT * cos_midpoint)
 
-    rows = max(1, math.ceil(lat_km / cell_km))
-    columns = max(1, math.ceil(lon_km / cell_km))
+    # Mirror upstream GenerateCells exactly: origins start half a cell from the
+    # minimum edge and are emitted only while the center remains below max.
+    rows = _count_origins(bbox.min_lat, bbox.max_lat, lat_step)
+    columns = _count_origins(bbox.min_lon, bbox.max_lon, lon_step)
     cells = rows * columns
     return GridEstimate(rows=rows, columns=columns, cells=cells, searches=cells * query_count)
+
+
+def _count_origins(minimum: float, maximum: float, step: float) -> int:
+    count = 0
+    value = minimum + step / 2
+    while value < maximum:
+        count += 1
+        value += step
+    return count
