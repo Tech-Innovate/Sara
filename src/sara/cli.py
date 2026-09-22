@@ -12,7 +12,15 @@ from pathlib import Path
 
 from .config import BoundingBox, load_area, load_queries, write_query_snapshot
 from .grid import estimate_grid
-from .scraper import DEFAULT_IMAGE, ScrapeOptions, build_docker_command, command_for_display, run_scraper
+from .scraper import (
+    DEFAULT_IMAGE,
+    ScrapeOptions,
+    build_docker_command,
+    command_for_display,
+    expected_resume_input_ids,
+    load_resume_completed_input_ids,
+    run_scraper,
+)
 from .storage import connect, ingest_records, iter_jsonl, utc_now
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -310,9 +318,21 @@ def cmd_collect(args) -> int:
         proxy_file=Path(args.proxy_file).resolve() if args.proxy_file else None,
     )
     options.validate()
+    if not options.resume:
+        print(
+            "collection requires resume mode because upstream exit code 0 does not prove crawl completion",
+            file=sys.stderr,
+        )
+        return 2
+
     strict_bounds = not args.include_out_of_bounds
     config_json = _run_config_json(area=area, queries=queries, options=options, strict_bounds=strict_bounds)
     estimate = estimate_grid(area.bbox, args.cell_km, len(queries))
+    expected_inputs = expected_resume_input_ids(area, queries, options.cell_km)
+    if len(expected_inputs) != estimate.searches:
+        raise RuntimeError(
+            f"internal grid mismatch: planner expects {estimate.searches} searches but completion model expects {len(expected_inputs)}"
+        )
     print(f"run_id={run_id} cells={estimate.cells} planned_searches={estimate.searches}")
 
     if args.dry_run:
@@ -380,6 +400,27 @@ def cmd_collect(args) -> int:
                 _mark_run(conn, run_id, status="failed", exit_code=exit_code, error=error)
                 print(error, file=sys.stderr)
                 return exit_code
+
+            completed_inputs = load_resume_completed_input_ids(output_file, options.image)
+            unexpected_inputs = completed_inputs - expected_inputs
+            if unexpected_inputs:
+                error = (
+                    "resume completion state does not match this run: "
+                    f"{len(unexpected_inputs)} unexpected completed input(s)"
+                )
+                _mark_run(conn, run_id, status="failed", exit_code=0, error=error)
+                print(error, file=sys.stderr)
+                return 1
+
+            missing_inputs = expected_inputs - completed_inputs
+            if missing_inputs:
+                error = (
+                    "scraper exited before all planned searches completed: "
+                    f"completed {len(completed_inputs)}/{len(expected_inputs)}"
+                )
+                _mark_run(conn, run_id, status="interrupted", exit_code=0, error=error)
+                print(error, file=sys.stderr)
+                return 130
 
             stats = ingest_records(
                 conn,
