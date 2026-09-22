@@ -48,10 +48,10 @@ def _args(tmp_path):
 def test_stdout_reporting_failure_does_not_downgrade_complete_run(tmp_path, monkeypatch):
     args = _args(tmp_path)
     area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
-    expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
+    completed = set(expected_resume_input_ids(area, ["restaurant"], 2.0))
 
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
-    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: set(completed))
     monkeypatch.setattr(cli, "_print_stats", lambda _stats: (_ for _ in ()).throw(BrokenPipeError("closed")))
 
     assert cmd_collect(args) == 1
@@ -67,10 +67,10 @@ def test_stdout_reporting_failure_does_not_downgrade_complete_run(tmp_path, monk
 def test_reporting_interrupt_does_not_reclassify_complete_run(tmp_path, monkeypatch):
     args = _args(tmp_path)
     area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
-    expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
+    completed = set(expected_resume_input_ids(area, ["restaurant"], 2.0))
 
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
-    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: set(completed))
 
     def interrupt(_stats):
         raise KeyboardInterrupt
