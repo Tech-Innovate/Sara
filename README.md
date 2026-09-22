@@ -92,7 +92,7 @@ sara collect \
   --lang en
 ```
 
-Sara prints the exact Docker command before execution. Add `--dry-run` to inspect it without starting Docker. Dry-run still writes the normalized query snapshot for the generated/provided run ID.
+Sara prints the exact Docker command before execution. Add `--dry-run` to inspect the intended command without starting Docker. Dry-run is non-mutating: it does not create or overwrite run files or database state.
 
 Upstream telemetry is disabled by default for Sara-launched containers with `DISABLE_TELEMETRY=1`.
 
