@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+import sara.cli as cli
 from sara.cli import RunLock, _ensure_run, _run_config_json, _validate_run_id, cmd_collect, cmd_ingest
 from sara.config import AreaConfig, BoundingBox
 from sara.scraper import ScrapeOptions
@@ -56,6 +57,23 @@ def test_run_lock_rejects_second_live_writer(tmp_path):
             second.acquire()
     finally:
         first.release()
+
+
+def test_windows_pid_probe_never_uses_os_kill(monkeypatch):
+    seen = []
+
+    def safe_windows_probe(pid):
+        seen.append(pid)
+        return True
+
+    def forbidden_kill(*_args):
+        pytest.fail("os.kill must not be used as a Windows liveness probe")
+
+    monkeypatch.setattr(cli, "_pid_alive_windows", safe_windows_probe)
+    monkeypatch.setattr(cli.os, "kill", forbidden_kill)
+
+    assert cli._pid_alive(123, platform="nt") is True
+    assert seen == [123]
 
 
 def test_resume_configuration_change_is_rejected(tmp_path):
