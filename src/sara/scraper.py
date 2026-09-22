@@ -8,9 +8,10 @@ import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from .config import AreaConfig
-from .grid import iter_grid_origins
+from .grid import estimate_grid, iter_grid_origins
 
 DEFAULT_IMAGE = "gosom/google-maps-scraper:v1.18.1"
 _RESUME_STATE_VERSION = 1
@@ -140,26 +141,73 @@ def validate_resume_query_identities(queries: list[str]) -> None:
         seen.add(identity)
 
 
-def expected_resume_input_ids(area: AreaConfig, queries: list[str], cell_km: float) -> set[str]:
-    """Reproduce v1.18.1 grid seed IDs so completion can be proven exactly."""
-    validate_resume_query_identities(queries)
+class ExpectedResumeInputs:
+    """Set-like completion model that materializes only when comparison is needed.
 
-    expected: set[str] = set()
-    emitted_cells = False
+    Collection uses only ``len()`` before Docker starts, keeping the Python parent
+    from retaining one large hash set while the scraper container is running.
+    Exact IDs are materialized after acquisition, when set comparison begins.
+    """
+
+    def __init__(self, area: AreaConfig, queries: list[str], cell_km: float):
+        validate_resume_query_identities(queries)
+        estimate = estimate_grid(area.bbox, cell_km, len(queries))
+        if estimate.cells == 0:
+            raise ValueError("grid produced 0 cells; check bounding box and cell size")
+        self._area = area
+        self._queries = tuple(queries)
+        self._cell_km = cell_km
+        self._count = estimate.searches
+        self._materialized: set[str] | None = None
+
+    def __len__(self) -> int:
+        return self._count
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._get_set())
+
+    def __sub__(self, other) -> set[str]:
+        return self._get_set() - other
+
+    def __rsub__(self, other) -> set[str]:
+        return other - self._get_set()
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, ExpectedResumeInputs):
+            return self._get_set() == other._get_set()
+        return self._get_set() == other
+
+    def _get_set(self) -> set[str]:
+        if self._materialized is None:
+            materialized = set(_iter_expected_resume_input_ids(self._area, self._queries, self._cell_km))
+            if len(materialized) != self._count:
+                raise ValueError(
+                    "grid/query configuration produces duplicate resume identities at six-decimal coordinate precision"
+                )
+            self._materialized = materialized
+        return self._materialized
+
+
+def expected_resume_input_ids(
+    area: AreaConfig,
+    queries: list[str],
+    cell_km: float,
+) -> ExpectedResumeInputs:
+    """Return the exact v1.18.1 grid completion model as a lazy set-like value."""
+    return ExpectedResumeInputs(area, queries, cell_km)
+
+
+def _iter_expected_resume_input_ids(
+    area: AreaConfig,
+    queries: tuple[str, ...],
+    cell_km: float,
+) -> Iterator[str]:
     for query_line in queries:
         query_text, query_id = _parse_upstream_query_identity(query_line)
         identity = query_id or query_text
         for lat, lon in iter_grid_origins(area.bbox, cell_km):
-            emitted_cells = True
             coordinates = f"{lat:.6f},{lon:.6f}"
-            input_id = _deterministic_seed_id(identity, coordinates)
-            if input_id in expected:
-                raise ValueError("grid produces duplicate resume identities at six-decimal coordinate precision")
-            expected.add(input_id)
-
-    if not emitted_cells:
-        raise ValueError("grid produced 0 cells; check bounding box and cell size")
-    return expected
+            yield _deterministic_seed_id(identity, coordinates)
 
 
 def load_resume_completed_input_ids(output_file: Path, image: str) -> set[str]:
