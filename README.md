@@ -180,6 +180,12 @@ For provenance safety, the supplied file must resolve to the run's recorded `raw
 
 Sara keeps the most recent raw JSON object for each canonical business, while promoting commonly used fields such as title, category, address, coordinates, phone, website, rating, review count and status into typed columns. The original run JSONL remains the immutable raw evidence for rows that were excluded from canonical storage.
 
+## Validation boundary
+
+CI validates Sara's Python orchestration and state-management contracts on Python 3.11 and 3.12, including configuration validation, command construction, query normalization, run locking, resume provenance, transactional ingestion, canonical identity convergence, re-ingestion idempotence, and strict bounding-box accounting.
+
+CI deliberately does **not** perform a live Google Maps scrape. A successful CI run therefore does not prove that Google's current page shape, anti-bot behavior, network path, proxy provider, or the pinned upstream scraper image will succeed at collection time. Validate the first real crawl with a small representative query set before scaling the grid.
+
 ## Notes and current boundaries
 
 - The upstream JSON writer emits one JSON object per line; Sara therefore treats scraper JSON output as JSONL.
