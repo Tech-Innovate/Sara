@@ -1,17 +1,17 @@
 import pytest
 
 from sara.config import BoundingBox
-from sara.storage import connect, ingest_records
+from sara.storage import IdentityConflict, connect, ingest_records
 
 
-def make_run(conn, run_id):
+def make_run(conn, run_id, started_at="now"):
     conn.execute(
         """
         INSERT INTO runs(id, area_name, bbox_json, cell_km, depth, queries_json,
                          scraper_image, status, started_at)
-        VALUES (?, 'x', '{}', 1.0, 5, '[]', 'image', 'running', 'now')
+        VALUES (?, 'x', '{}', 1.0, 5, '[]', 'image', 'running', ?)
         """,
-        (run_id,),
+        (run_id, started_at),
     )
     conn.commit()
 
@@ -87,6 +87,59 @@ def test_reingest_is_metric_idempotent(tmp_path):
     assert first.new_businesses == 1
     assert second.new_businesses == 1
     assert second.unique_seen == 1
+
+
+def test_historical_reingest_does_not_regress_latest_state(tmp_path):
+    conn = connect(tmp_path / "sara.db")
+    old_time = "2026-01-01T00:00:00+00:00"
+    new_time = "2026-02-01T00:00:00+00:00"
+    make_run(conn, "old", old_time)
+    make_run(conn, "new", new_time)
+
+    ingest_records(
+        conn,
+        "new",
+        [{"place_id": "p1", "cid": "c1", "title": "Current", "phone": "+200"}],
+    )
+    ingest_records(
+        conn,
+        "old",
+        [{"place_id": "p1", "cid": "c1", "title": "Historical", "phone": "+100"}],
+    )
+
+    business = conn.execute(
+        """
+        SELECT title, phone, first_run_id, last_run_id, first_seen_at, last_seen_at, raw_json
+        FROM businesses WHERE place_id = 'p1'
+        """
+    ).fetchone()
+    assert business["title"] == "Current"
+    assert business["phone"] == "+200"
+    assert business["first_run_id"] == "old"
+    assert business["last_run_id"] == "new"
+    assert business["first_seen_at"] == old_time
+    assert business["last_seen_at"] == new_time
+    assert '"title": "Current"' in business["raw_json"]
+
+    old_metrics = conn.execute("SELECT new_businesses FROM runs WHERE id = 'old'").fetchone()
+    new_metrics = conn.execute("SELECT new_businesses FROM runs WHERE id = 'new'").fetchone()
+    assert old_metrics["new_businesses"] == 1
+    assert new_metrics["new_businesses"] == 0
+
+
+def test_conflicting_strong_identifiers_roll_back(tmp_path):
+    conn = connect(tmp_path / "sara.db")
+    make_run(conn, "r1", "2026-01-01T00:00:00+00:00")
+    make_run(conn, "r2", "2026-02-01T00:00:00+00:00")
+    ingest_records(conn, "r1", [{"place_id": "p1", "cid": "c1", "title": "Alpha"}])
+
+    with pytest.raises(IdentityConflict, match="strong identity conflict"):
+        ingest_records(conn, "r2", [{"place_id": "p1", "cid": "different", "title": "Wrong"}])
+
+    business = conn.execute("SELECT cid, title, last_run_id FROM businesses WHERE place_id = 'p1'").fetchone()
+    assert tuple(business) == ("c1", "Alpha", "r1")
+    r2 = conn.execute("SELECT raw_records, unique_seen, new_businesses FROM runs WHERE id = 'r2'").fetchone()
+    assert tuple(r2) == (0, 0, 0)
 
 
 def test_strict_bbox_excludes_outside_and_unlocated_rows(tmp_path):
