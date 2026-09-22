@@ -17,8 +17,8 @@ class GridEstimate:
 
 
 def estimate_grid(bbox: BoundingBox, cell_km: float, query_count: int) -> GridEstimate:
-    if cell_km <= 0:
-        raise ValueError("cell_km must be greater than zero")
+    if not math.isfinite(cell_km) or cell_km <= 0:
+        raise ValueError("cell_km must be a finite value greater than zero")
     if query_count <= 0:
         raise ValueError("query_count must be greater than zero")
 
