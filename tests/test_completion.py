@@ -1,0 +1,177 @@
+import argparse
+import json
+from types import SimpleNamespace
+
+import pytest
+
+import sara.cli as cli
+from sara.cli import cmd_collect
+from sara.config import AreaConfig, BoundingBox
+from sara.scraper import expected_resume_input_ids, load_resume_completed_input_ids
+from sara.storage import connect
+
+
+def _collect_args(tmp_path, *, run_id="guard", lang="en", no_resume=False):
+    area_file = tmp_path / "area.json"
+    area_file.write_text(
+        json.dumps({
+            "name": "smoke",
+            "bbox": {
+                "min_lat": 21.52,
+                "min_lon": 39.17,
+                "max_lat": 21.535,
+                "max_lon": 39.185,
+            },
+        }),
+        encoding="utf-8",
+    )
+    query_file = tmp_path / "queries.txt"
+    query_file.write_text("restaurant\n", encoding="utf-8")
+    return argparse.Namespace(
+        db=str(tmp_path / "sara.db"),
+        area=str(area_file),
+        run_id=run_id,
+        queries=str(query_file),
+        cell_km=2.0,
+        depth=2,
+        concurrency=1,
+        browser_pool_size=1,
+        pages_per_browser=1,
+        lang=lang,
+        zoom=15,
+        image="gosom/google-maps-scraper:v1.18.1",
+        proxy_file=None,
+        output_dir=str(tmp_path / "output"),
+        no_resume=no_resume,
+        include_out_of_bounds=False,
+        dry_run=False,
+    )
+
+
+def _stats():
+    return SimpleNamespace(
+        raw_records=20,
+        accepted_records=2,
+        out_of_bounds_records=18,
+        unlocated_records=0,
+        unidentified_records=0,
+        unique_seen=2,
+        new_businesses=0,
+    )
+
+
+def test_expected_resume_id_matches_upstream_smoke_job():
+    area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
+
+    assert expected_resume_input_ids(area, ["restaurant"], 2.0) == {
+        "resume:9467a14e5b28588a84acfd173c50d808ee059cc5e55ab076080420722a8658a7"
+    }
+
+
+def test_load_resume_completed_ids_from_readable_sidecar(tmp_path):
+    output = tmp_path / "results.jsonl"
+    output.write_text("", encoding="utf-8")
+    state = tmp_path / "results.jsonl.resume.json"
+    state.write_text(
+        json.dumps({"version": 1, "completed_inputs": ["resume:abc"]}),
+        encoding="utf-8",
+    )
+
+    assert load_resume_completed_input_ids(output, "image") == {"resume:abc"}
+
+
+def test_missing_resume_sidecar_is_incomplete_not_success(tmp_path):
+    output = tmp_path / "results.jsonl"
+    output.write_text("", encoding="utf-8")
+
+    assert load_resume_completed_input_ids(output, "image") == set()
+
+
+def test_zero_exit_with_incomplete_resume_state_is_interrupted_and_not_ingested(tmp_path, monkeypatch):
+    args = _collect_args(tmp_path)
+    ingested = False
+
+    monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: set())
+
+    def forbidden_ingest(*_args, **_kwargs):
+        nonlocal ingested
+        ingested = True
+        pytest.fail("partial output must not be ingested")
+
+    monkeypatch.setattr(cli, "ingest_records", forbidden_ingest)
+
+    assert cmd_collect(args) == 130
+    assert ingested is False
+
+    row = connect(args.db).execute("SELECT status, exit_code, error, raw_records FROM runs WHERE id = 'guard'").fetchone()
+    assert row["status"] == "interrupted"
+    assert row["exit_code"] == 0
+    assert "completed 0/1" in row["error"]
+    assert row["raw_records"] == 0
+
+
+def test_unexpected_resume_identity_fails_closed(tmp_path, monkeypatch):
+    args = _collect_args(tmp_path)
+    monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: {"resume:foreign"})
+    monkeypatch.setattr(cli, "ingest_records", lambda *_args, **_kwargs: pytest.fail("must not ingest"))
+
+    assert cmd_collect(args) == 1
+
+    row = connect(args.db).execute("SELECT status, error FROM runs WHERE id = 'guard'").fetchone()
+    assert row["status"] == "failed"
+    assert "unexpected completed input" in row["error"]
+
+
+def test_complete_resume_state_allows_ingest(tmp_path, monkeypatch):
+    args = _collect_args(tmp_path)
+    area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
+    expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
+    calls = []
+
+    monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
+
+    def fake_ingest(*_args, **_kwargs):
+        calls.append(True)
+        return _stats()
+
+    monkeypatch.setattr(cli, "ingest_records", fake_ingest)
+
+    assert cmd_collect(args) == 0
+    assert calls == [True]
+    row = connect(args.db).execute("SELECT status, error FROM runs WHERE id = 'guard'").fetchone()
+    assert row["status"] == "complete"
+    assert row["error"] is None
+
+
+def test_changed_configuration_after_interruption_is_rejected_before_scraper(tmp_path, monkeypatch):
+    first = _collect_args(tmp_path, run_id="config-guard", lang="en")
+    calls = []
+
+    def fake_scraper(_command):
+        calls.append(True)
+        return 0
+
+    monkeypatch.setattr(cli, "run_scraper", fake_scraper)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: set())
+    monkeypatch.setattr(cli, "ingest_records", lambda *_args, **_kwargs: pytest.fail("must not ingest"))
+
+    assert cmd_collect(first) == 130
+    assert calls == [True]
+
+    changed = _collect_args(tmp_path, run_id="config-guard", lang="ar")
+    assert cmd_collect(changed) == 2
+    assert calls == [True]
+
+    row = connect(first.db).execute("SELECT status FROM runs WHERE id = 'config-guard'").fetchone()
+    assert row["status"] == "interrupted"
+
+
+def test_no_resume_collection_is_rejected_without_mutation(tmp_path):
+    args = _collect_args(tmp_path, no_resume=True)
+
+    assert cmd_collect(args) == 2
+    assert not (tmp_path / "sara.db").exists()
+    assert not (tmp_path / "output").exists()
