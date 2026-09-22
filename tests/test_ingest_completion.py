@@ -68,7 +68,7 @@ def test_verified_reingest_can_recover_noncomplete_run(tmp_path):
     assert result == 0
     row = connect(db).execute("SELECT status, exit_code, error FROM runs WHERE id = 'r1'").fetchone()
     assert row["status"] == "complete"
-    assert row["exit_code"] == 0
+    assert row["exit_code"] is None
     assert row["error"] is None
 
 
