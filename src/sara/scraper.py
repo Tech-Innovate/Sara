@@ -50,14 +50,16 @@ def build_docker_command(
     queries_file: Path,
     output_file: Path,
     options: ScrapeOptions,
+    prepare_paths: bool = True,
 ) -> list[str]:
     options.validate()
     queries_file = queries_file.resolve()
     output_file = output_file.resolve()
-    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if not queries_file.is_file():
-        raise FileNotFoundError(queries_file)
+    if prepare_paths:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        if not queries_file.is_file():
+            raise FileNotFoundError(queries_file)
 
     command = [
         "docker", "run", "--rm",
