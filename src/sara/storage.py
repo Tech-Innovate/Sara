@@ -136,13 +136,64 @@ def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | Non
     return place_id, cid, data_id, f"fallback:{digest}"
 
 
-def _find_existing(conn: sqlite3.Connection, place_id: str | None, cid: str | None, data_id: str | None, canonical_key: str):
+def _find_matches(
+    conn: sqlite3.Connection,
+    place_id: str | None,
+    cid: str | None,
+    data_id: str | None,
+    canonical_key: str,
+) -> list[sqlite3.Row]:
+    matches: dict[int, sqlite3.Row] = {}
     for column, value in (("place_id", place_id), ("cid", cid), ("data_id", data_id), ("canonical_key", canonical_key)):
         if value:
             row = conn.execute(f"SELECT * FROM businesses WHERE {column} = ?", (value,)).fetchone()
             if row:
-                return row
-    return None
+                matches[int(row["id"])] = row
+    return [matches[key] for key in sorted(matches)]
+
+
+def _merge_matches(conn: sqlite3.Connection, matches: list[sqlite3.Row]) -> sqlite3.Row | None:
+    if not matches:
+        return None
+    primary = matches[0]
+    if len(matches) == 1:
+        return primary
+
+    fields = (
+        "place_id", "cid", "data_id", "title", "category", "address", "latitude",
+        "longitude", "phone", "website", "review_rating", "review_count", "status",
+    )
+    merged = {field: primary[field] for field in fields}
+    first_seen_at = primary["first_seen_at"]
+    first_run_id = primary["first_run_id"]
+
+    for duplicate in matches[1:]:
+        for field in fields:
+            if merged[field] in (None, "") and duplicate[field] not in (None, ""):
+                merged[field] = duplicate[field]
+        if duplicate["first_seen_at"] < first_seen_at:
+            first_seen_at = duplicate["first_seen_at"]
+            first_run_id = duplicate["first_run_id"]
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO run_businesses(run_id, business_id, first_observed_at)
+            SELECT run_id, ?, first_observed_at FROM run_businesses WHERE business_id = ?
+            """,
+            (primary["id"], duplicate["id"]),
+        )
+        conn.execute("DELETE FROM businesses WHERE id = ?", (duplicate["id"],))
+
+    conn.execute(
+        """
+        UPDATE businesses SET
+            place_id = ?, cid = ?, data_id = ?, title = ?, category = ?, address = ?,
+            latitude = ?, longitude = ?, phone = ?, website = ?, review_rating = ?,
+            review_count = ?, status = ?, first_seen_at = ?, first_run_id = ?
+        WHERE id = ?
+        """,
+        tuple(merged[field] for field in fields) + (first_seen_at, first_run_id, primary["id"]),
+    )
+    return conn.execute("SELECT * FROM businesses WHERE id = ?", (primary["id"],)).fetchone()
 
 
 def _payload(record: dict[str, Any]) -> dict[str, Any]:
@@ -166,7 +217,8 @@ def _payload(record: dict[str, Any]) -> dict[str, Any]:
 
 def upsert_business(conn: sqlite3.Connection, run_id: str, record: dict[str, Any]) -> tuple[int, bool]:
     place_id, cid, data_id, canonical_key = _identity(record)
-    existing = _find_existing(conn, place_id, cid, data_id, canonical_key)
+    matches = _find_matches(conn, place_id, cid, data_id, canonical_key)
+    existing = _merge_matches(conn, matches)
     now = utc_now()
     payload = _payload(record)
 
