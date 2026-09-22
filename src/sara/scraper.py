@@ -163,8 +163,10 @@ def load_resume_completed_input_ids(output_file: Path, image: str) -> set[str]:
         raise RuntimeError(f"invalid resume state JSON: {state_path}") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("resume state must be a JSON object")
-    if payload.get("version") != _RESUME_STATE_VERSION:
-        raise RuntimeError(f"unsupported resume state version: {payload.get('version')!r}")
+
+    version = payload.get("version")
+    if type(version) is not int or version != _RESUME_STATE_VERSION:
+        raise RuntimeError(f"unsupported resume state version: {version!r}")
 
     completed = payload.get("completed_inputs")
     if not isinstance(completed, list) or not all(isinstance(item, str) and item for item in completed):
