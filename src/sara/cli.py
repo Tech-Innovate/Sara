@@ -405,7 +405,14 @@ def cmd_collect(args) -> int:
                 print(error, file=sys.stderr)
                 return exit_code
 
-            completed_inputs = load_resume_completed_input_ids(output_file, options.image)
+            try:
+                completed_inputs = load_resume_completed_input_ids(output_file, options.image)
+            except Exception as exc:
+                error = f"completion verification failed after scraper exit 0: {exc}"
+                _mark_run(conn, run_id, status="failed", exit_code=0, error=error)
+                print(error, file=sys.stderr)
+                return 1
+
             unexpected_inputs = completed_inputs - expected_inputs
             if unexpected_inputs:
                 error = (
