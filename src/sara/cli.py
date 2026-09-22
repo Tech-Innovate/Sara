@@ -10,7 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from .config import BoundingBox, load_area, load_queries, write_query_snapshot
+from .config import AreaConfig, BoundingBox, load_area, load_queries, write_query_snapshot
 from .grid import estimate_grid
 from .scraper import (
     DEFAULT_IMAGE,
@@ -328,12 +328,10 @@ def cmd_collect(args) -> int:
     strict_bounds = not args.include_out_of_bounds
     config_json = _run_config_json(area=area, queries=queries, options=options, strict_bounds=strict_bounds)
     estimate = estimate_grid(area.bbox, args.cell_km, len(queries))
-    expected_inputs = expected_resume_input_ids(area, queries, options.cell_km)
-    if len(expected_inputs) != estimate.searches:
-        raise RuntimeError(
-            f"internal grid mismatch: planner expects {estimate.searches} searches but completion model expects {len(expected_inputs)}"
-        )
     print(f"run_id={run_id} cells={estimate.cells} planned_searches={estimate.searches}")
+    if estimate.cells == 0:
+        print("grid produced 0 cells; check bounding box and cell size", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         command = build_docker_command(
@@ -345,6 +343,12 @@ def cmd_collect(args) -> int:
         )
         print(command_for_display(command))
         return 0
+
+    expected_inputs = expected_resume_input_ids(area, queries, options.cell_km)
+    if len(expected_inputs) != estimate.searches:
+        raise RuntimeError(
+            f"internal grid mismatch: planner expects {estimate.searches} searches but completion model expects {len(expected_inputs)}"
+        )
 
     lock = RunLock(output_dir / ".sara.lock")
     try:
@@ -447,7 +451,11 @@ def cmd_ingest(args) -> int:
     run_id = _validate_run_id(args.run_id)
     conn = connect(args.db)
     row = conn.execute(
-        "SELECT id, raw_path, bbox_json, config_json FROM runs WHERE id = ?",
+        """
+        SELECT id, area_name, cell_km, queries_json, scraper_image, raw_path,
+               bbox_json, config_json, status
+        FROM runs WHERE id = ?
+        """,
         (run_id,),
     ).fetchone()
     if row is None:
@@ -468,6 +476,15 @@ def cmd_ingest(args) -> int:
     bbox.validate()
     config = json.loads(row["config_json"]) if row["config_json"] else {}
     strict_bounds = bool(config.get("strict_bounds", True))
+    if not bool(config.get("resume", False)):
+        print("ingest requires a run with verifiable resume completion state", file=sys.stderr)
+        return 2
+
+    queries = json.loads(row["queries_json"])
+    if not isinstance(queries, list) or not queries or not all(isinstance(query, str) for query in queries):
+        print("run has invalid recorded query configuration", file=sys.stderr)
+        return 2
+    area = AreaConfig(str(row["area_name"]), bbox)
 
     lock = RunLock(expected.parent / ".sara.lock")
     try:
@@ -476,6 +493,24 @@ def cmd_ingest(args) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     try:
+        try:
+            expected_inputs = expected_resume_input_ids(area, queries, float(row["cell_km"]))
+            completed_inputs = load_resume_completed_input_ids(expected, str(row["scraper_image"]))
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"ingest completion verification failed: {exc}", file=sys.stderr)
+            return 2
+
+        unexpected_inputs = completed_inputs - expected_inputs
+        missing_inputs = expected_inputs - completed_inputs
+        if unexpected_inputs or missing_inputs:
+            print(
+                "ingest requires verified complete crawl evidence: "
+                f"completed {len(completed_inputs)}/{len(expected_inputs)}, "
+                f"unexpected={len(unexpected_inputs)}",
+                file=sys.stderr,
+            )
+            return 2
+
         try:
             stats = ingest_records(
                 conn,
@@ -486,6 +521,9 @@ def cmd_ingest(args) -> int:
         except Exception as exc:
             print(f"ingest failed: {exc}", file=sys.stderr)
             return 1
+
+        if row["status"] != "complete":
+            _mark_run(conn, run_id, status="complete", exit_code=0, error=None)
         _print_stats(stats)
         return 0
     finally:
