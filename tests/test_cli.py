@@ -9,6 +9,38 @@ from sara.scraper import ScrapeOptions
 from sara.storage import connect
 
 
+def _collect_args(tmp_path, *, dry_run=False):
+    area_file = tmp_path / "area.json"
+    area_file.write_text(
+        json.dumps({
+            "name": "x",
+            "bbox": {"min_lat": 0, "min_lon": 0, "max_lat": 1, "max_lon": 1},
+        }),
+        encoding="utf-8",
+    )
+    query_file = tmp_path / "queries.txt"
+    query_file.write_text("# comment\ndentist\n", encoding="utf-8")
+    return argparse.Namespace(
+        db=str(tmp_path / "sara.db"),
+        area=str(area_file),
+        run_id="r1",
+        queries=str(query_file),
+        cell_km=1.0,
+        depth=5,
+        concurrency=4,
+        browser_pool_size=1,
+        pages_per_browser=4,
+        lang="en",
+        zoom=15,
+        image="gosom/google-maps-scraper:v1.18.1",
+        proxy_file=None,
+        output_dir=str(tmp_path / "output"),
+        no_resume=False,
+        include_out_of_bounds=False,
+        dry_run=dry_run,
+    )
+
+
 def test_run_id_rejects_path_components():
     with pytest.raises(ValueError):
         _validate_run_id("../escape")
@@ -87,39 +119,22 @@ def test_ingest_rejects_file_not_recorded_for_run(tmp_path):
 
 
 def test_new_run_rejects_preexisting_scraper_output(tmp_path):
-    area_file = tmp_path / "area.json"
-    area_file.write_text(
-        json.dumps({
-            "name": "x",
-            "bbox": {"min_lat": 0, "min_lon": 0, "max_lat": 1, "max_lon": 1},
-        }),
-        encoding="utf-8",
-    )
-    query_file = tmp_path / "queries.txt"
-    query_file.write_text("dentist\n", encoding="utf-8")
-    output_root = tmp_path / "output"
-    run_dir = output_root / "r1"
+    args = _collect_args(tmp_path)
+    run_dir = tmp_path / "output" / "r1"
     run_dir.mkdir(parents=True)
     (run_dir / "results.jsonl").write_text("{}\n", encoding="utf-8")
 
-    args = argparse.Namespace(
-        db=str(tmp_path / "sara.db"),
-        area=str(area_file),
-        run_id="r1",
-        queries=str(query_file),
-        cell_km=1.0,
-        depth=5,
-        concurrency=4,
-        browser_pool_size=1,
-        pages_per_browser=4,
-        lang="en",
-        zoom=15,
-        image="gosom/google-maps-scraper:v1.18.1",
-        proxy_file=None,
-        output_dir=str(output_root),
-        no_resume=False,
-        include_out_of_bounds=False,
-        dry_run=False,
-    )
-
     assert cmd_collect(args) == 2
+
+
+def test_dry_run_does_not_modify_existing_run_files(tmp_path):
+    args = _collect_args(tmp_path, dry_run=True)
+    run_dir = tmp_path / "output" / "r1"
+    run_dir.mkdir(parents=True)
+    snapshot = run_dir / "queries.txt"
+    snapshot.write_text("original\n", encoding="utf-8")
+
+    assert cmd_collect(args) == 0
+    assert snapshot.read_text(encoding="utf-8") == "original\n"
+    assert not (run_dir / ".sara.lock").exists()
+    assert not (tmp_path / "sara.db").exists()
