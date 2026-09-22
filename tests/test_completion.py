@@ -1,10 +1,12 @@
 import argparse
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import sara.cli as cli
+import sara.scraper as scraper
 from sara.cli import cmd_collect
 from sara.config import AreaConfig, BoundingBox
 from sara.scraper import expected_resume_input_ids, load_resume_completed_input_ids
@@ -68,6 +70,13 @@ def test_expected_resume_id_matches_upstream_smoke_job():
     }
 
 
+def test_expected_resume_ids_reject_zero_cell_grid():
+    area = AreaConfig("tiny", BoundingBox(0, 0, 0.001, 0.001))
+
+    with pytest.raises(ValueError, match="0 cells"):
+        expected_resume_input_ids(area, ["restaurant"], 1.0)
+
+
 def test_load_resume_completed_ids_from_readable_sidecar(tmp_path):
     output = tmp_path / "results.jsonl"
     output.write_text("", encoding="utf-8")
@@ -80,11 +89,68 @@ def test_load_resume_completed_ids_from_readable_sidecar(tmp_path):
     assert load_resume_completed_input_ids(output, "image") == {"resume:abc"}
 
 
+def test_root_owned_resume_sidecar_falls_back_to_isolated_container(tmp_path, monkeypatch):
+    output = tmp_path / "results.jsonl"
+    output.write_text("", encoding="utf-8")
+    state_path = Path(str(output) + ".resume.json")
+    state_path.write_text("unreadable-on-host", encoding="utf-8")
+    original_read_text = Path.read_text
+    seen = []
+
+    def deny_state_read(self, *args, **kwargs):
+        if self == state_path:
+            raise PermissionError("root-owned")
+        return original_read_text(self, *args, **kwargs)
+
+    def fake_container_read(path, image):
+        seen.append((path, image))
+        return json.dumps({"version": 1, "completed_inputs": ["resume:abc"]})
+
+    monkeypatch.setattr(Path, "read_text", deny_state_read)
+    monkeypatch.setattr(scraper, "_read_file_via_container", fake_container_read)
+
+    assert load_resume_completed_input_ids(output, "image") == {"resume:abc"}
+    assert seen == [(state_path, "image")]
+
+
+def test_container_sidecar_reader_is_network_disabled_and_read_only(tmp_path, monkeypatch):
+    state_path = tmp_path / "results.jsonl.resume.json"
+    seen = {}
+
+    monkeypatch.setattr(scraper, "shutil_which", lambda binary: "/usr/bin/docker" if binary == "docker" else None)
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="state", stderr="")
+
+    monkeypatch.setattr(scraper.subprocess, "run", fake_run)
+
+    assert scraper._read_file_via_container(state_path, "image:tag") == "state"
+    command = seen["command"]
+    assert command[:7] == [
+        "docker", "run", "--rm", "--network", "none", "--entrypoint", "/bin/cat"
+    ]
+    assert f"{tmp_path.resolve()}:/out:ro" in command
+    assert command[-2:] == ["image:tag", "/out/results.jsonl.resume.json"]
+    assert seen["kwargs"] == {"check": False, "capture_output": True, "text": True}
+
+
 def test_missing_resume_sidecar_is_incomplete_not_success(tmp_path):
     output = tmp_path / "results.jsonl"
     output.write_text("", encoding="utf-8")
 
     assert load_resume_completed_input_ids(output, "image") == set()
+
+
+def test_invalid_resume_state_is_rejected(tmp_path):
+    output = tmp_path / "results.jsonl"
+    output.write_text("", encoding="utf-8")
+    state = tmp_path / "results.jsonl.resume.json"
+    state.write_text(json.dumps({"version": 2, "completed_inputs": []}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unsupported resume state version"):
+        load_resume_completed_input_ids(output, "image")
 
 
 def test_zero_exit_with_incomplete_resume_state_is_interrupted_and_not_ingested(tmp_path, monkeypatch):
