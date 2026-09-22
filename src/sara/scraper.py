@@ -126,24 +126,39 @@ def run_scraper(command: list[str], *, env: dict[str, str] | None = None) -> int
     return completed.returncode
 
 
-def expected_resume_input_ids(area: AreaConfig, queries: list[str], cell_km: float) -> set[str]:
-    """Reproduce v1.18.1 grid seed IDs so completion can be proven exactly."""
+def validate_resume_query_identities(queries: list[str]) -> None:
+    """Reject query identities that upstream resume state cannot distinguish."""
     if not queries:
         raise ValueError("queries cannot be empty")
 
-    cells = [f"{lat:.6f},{lon:.6f}" for lat, lon in iter_grid_origins(area.bbox, cell_km)]
-    if not cells:
-        raise ValueError("grid produced 0 cells; check bounding box and cell size")
-
-    expected: set[str] = set()
+    seen: set[str] = set()
     for query_line in queries:
         query_text, query_id = _parse_upstream_query_identity(query_line)
         identity = query_id or query_text
-        for coordinates in cells:
+        if identity in seen:
+            raise ValueError("query IDs produce duplicate resume identities; use unique query IDs")
+        seen.add(identity)
+
+
+def expected_resume_input_ids(area: AreaConfig, queries: list[str], cell_km: float) -> set[str]:
+    """Reproduce v1.18.1 grid seed IDs so completion can be proven exactly."""
+    validate_resume_query_identities(queries)
+
+    expected: set[str] = set()
+    emitted_cells = False
+    for query_line in queries:
+        query_text, query_id = _parse_upstream_query_identity(query_line)
+        identity = query_id or query_text
+        for lat, lon in iter_grid_origins(area.bbox, cell_km):
+            emitted_cells = True
+            coordinates = f"{lat:.6f},{lon:.6f}"
             input_id = _deterministic_seed_id(identity, coordinates)
             if input_id in expected:
-                raise ValueError("query IDs produce duplicate resume identities; use unique query IDs")
+                raise ValueError("grid produces duplicate resume identities at six-decimal coordinate precision")
             expected.add(input_id)
+
+    if not emitted_cells:
+        raise ValueError("grid produced 0 cells; check bounding box and cell size")
     return expected
 
 
