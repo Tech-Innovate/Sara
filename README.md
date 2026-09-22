@@ -135,7 +135,7 @@ If Docker exits `0` but completion evidence is missing or incomplete, Sara prese
 sara collect ... --run-id <existing-run-id>
 ```
 
-If the resume sidecar contains input IDs that do not belong to the current run, Sara fails closed rather than ingesting ambiguous output. A changed resume configuration is rejected before Docker starts. Completed run IDs are protected from accidental reuse.
+If the resume sidecar contains input IDs that do not belong to the current run, Sara fails closed rather than ingesting ambiguous output. A changed resume configuration is rejected before Docker starts. Completed run IDs are protected from accidental reuse. A resume sidecar without its corresponding results file is also rejected; Sara will not recreate an empty results file underneath existing completion evidence.
 
 `collect` currently requires upstream resume mode; `--no-resume` is rejected because the pinned upstream process does not expose an equally strong independent completion receipt outside resume mode. A custom `--image` must preserve the v1.18.1 grid and resume-state contract or Sara's completion verification will fail closed.
 
@@ -182,9 +182,9 @@ A recorded raw file can be re-ingested idempotently, for example after improving
 sara ingest --run-id <run-id> --file output/<run-id>/results.jsonl
 ```
 
-For provenance safety, the supplied file must resolve to the run's recorded `raw_path`. Re-ingestion uses the run's recorded strict-bounds policy and is blocked while the same run is actively collecting.
+For provenance safety, the supplied file must resolve to the run's recorded `raw_path`. Re-ingestion also re-verifies the run's recorded resume completion evidence before touching canonical storage, so an interrupted or otherwise unverifiable raw file cannot bypass the collection-time completion gate. If acquisition completed but a prior canonical-ingestion attempt failed, a successful verified re-ingest promotes that run to `complete`.
 
-Historical re-ingestion is chronology-aware: an older run can establish an earlier `first_run_id` / `first_seen_at`, but it cannot overwrite newer canonical business fields, `raw_json`, `last_run_id`, or `last_seen_at`.
+Re-ingestion uses the run's recorded strict-bounds policy and is blocked while the same run is actively collecting. Historical re-ingestion is chronology-aware: an older run can establish an earlier `first_run_id` / `first_seen_at`, but it cannot overwrite newer canonical business fields, `raw_json`, `last_run_id`, or `last_seen_at`.
 
 ## Data model
 
@@ -194,7 +194,7 @@ Sara keeps the raw JSON object from the latest retained run for each canonical b
 
 ## Validation boundary
 
-CI validates Sara's Python orchestration and state-management contracts on Ubuntu and Windows with Python 3.11 and 3.12, including configuration validation, command construction, query normalization, cross-platform run locking, resume provenance, exact upstream-compatible grid planning, deterministic completion IDs, incomplete-run rejection, root-owned resume-sidecar handling, transactional ingestion, canonical identity convergence, chronology-aware re-ingestion, strong-identity conflict handling, output-file preparation, re-ingestion idempotence, and strict bounding-box accounting.
+CI validates Sara's Python orchestration and state-management contracts on Ubuntu and Windows with Python 3.11 and 3.12, including configuration validation, command construction, query normalization, cross-platform run locking, resume provenance, exact upstream-compatible grid planning, deterministic completion IDs, incomplete-run rejection, root-owned resume-sidecar handling, completion-gated re-ingestion, transactional ingestion, canonical identity convergence, chronology-aware re-ingestion, strong-identity conflict handling, output-file preparation, re-ingestion idempotence, and strict bounding-box accounting.
 
 CI deliberately does **not** perform a live Google Maps scrape. A successful CI run therefore does not prove that Google's current page shape, anti-bot behavior, network path, proxy provider, the persistent `/opt` Playwright cache, or the pinned upstream scraper image will succeed together at collection time. Validate the first real crawl with a small representative query set before scaling the grid.
 
@@ -203,6 +203,7 @@ CI deliberately does **not** perform a live Google Maps scrape. A successful CI 
 - The upstream JSON writer emits one JSON object per line; Sara therefore treats scraper JSON output as JSONL.
 - Grid search improves geographic coverage but cannot guarantee every Google Maps listing.
 - Completion verification proves that the pinned upstream resume contract reports every planned query/cell input complete; it does not protect against later manual tampering with run files.
+- Run rows written by older Sara revisions are not retroactively reclassified at database-open time. Collection and every re-ingest now enforce completion evidence prospectively; historical status labels should not be treated as newly verified merely because the software was upgraded.
 - The `v1.18.1` image is pinned by version tag, not immutable registry digest; record/lock a digest separately if byte-for-byte container reproducibility is required.
 - Completion-ID verification intentionally depends on v1.18.1-compatible grid/identity semantics. An overridden or retagged image with incompatible semantics will fail closed rather than be silently trusted.
 - The upstream project currently recommends a persistent `gmaps-playwright-cache:/opt` volume even though v1.18.1 also contains its browser/driver under `/opt`. Sara follows the upstream invocation for now; validate an existing/stale cache volume during the first live smoke test before relying on it operationally.
