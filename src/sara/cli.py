@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import re
+import socket
 import sys
 import uuid
 from pathlib import Path
 
-from .config import load_area, load_queries
+from .config import BoundingBox, load_area, load_queries, write_query_snapshot
 from .grid import estimate_grid
 from .scraper import DEFAULT_IMAGE, ScrapeOptions, build_docker_command, command_for_display, run_scraper
 from .storage import connect, ingest_records, iter_jsonl, utc_now
+
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -27,28 +40,81 @@ def _parser() -> argparse.ArgumentParser:
     collect.add_argument("--run-id", help="Reuse a failed/interrupted run ID so upstream resume state is preserved")
     collect.add_argument("--queries", required=True)
     collect.add_argument("--cell-km", type=float, default=1.0)
-    collect.add_argument("--depth", type=int, default=5)
-    collect.add_argument("--concurrency", type=int, default=4)
-    collect.add_argument("--browser-pool-size", type=int, default=1)
-    collect.add_argument("--pages-per-browser", type=int, default=4)
+    collect.add_argument("--depth", type=_positive_int, default=5)
+    collect.add_argument("--concurrency", type=_positive_int, default=4)
+    collect.add_argument("--browser-pool-size", type=_positive_int, default=1)
+    collect.add_argument("--pages-per-browser", type=_positive_int, default=4)
     collect.add_argument("--lang", default="en")
     collect.add_argument("--zoom", type=int, default=15)
     collect.add_argument("--image", default=DEFAULT_IMAGE)
     collect.add_argument("--proxy-file")
     collect.add_argument("--output-dir", default="output")
     collect.add_argument("--no-resume", action="store_true")
+    collect.add_argument(
+        "--include-out-of-bounds",
+        action="store_true",
+        help="retain results outside the configured bounding box in canonical storage",
+    )
     collect.add_argument("--dry-run", action="store_true")
 
-    ingest = sub.add_parser("ingest", help="Ingest an existing scraper JSONL file")
+    ingest = sub.add_parser("ingest", help="Re-ingest the recorded JSONL file for an existing run")
     ingest.add_argument("--run-id", required=True)
     ingest.add_argument("--file", required=True)
 
     stats = sub.add_parser("stats", help="Show run and canonical business counts")
-    stats.add_argument("--limit", type=int, default=20)
+    stats.add_argument("--limit", type=_positive_int, default=20)
     return parser
 
 
-def _ensure_run(conn, *, run_id: str, area, queries, cell_km: float, depth: int, image: str, raw_path: str, status: str):
+def _validate_run_id(run_id: str) -> str:
+    if not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("run_id must be 1-64 characters using only letters, digits, '.', '_' or '-'")
+    return run_id
+
+
+def _file_sha256(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _run_config_json(*, area, queries: list[str], options: ScrapeOptions, strict_bounds: bool) -> str:
+    payload = {
+        "area_name": area.name,
+        "bbox": area.bbox.__dict__,
+        "queries": queries,
+        "cell_km": options.cell_km,
+        "depth": options.depth,
+        "concurrency": options.concurrency,
+        "browser_pool_size": options.browser_pool_size,
+        "pages_per_browser": options.pages_per_browser,
+        "lang": options.lang,
+        "zoom": options.zoom,
+        "resume": options.resume,
+        "image": options.image,
+        "proxy_sha256": _file_sha256(options.proxy_file),
+        "strict_bounds": strict_bounds,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _ensure_run(
+    conn,
+    *,
+    run_id: str,
+    area,
+    queries,
+    cell_km: float,
+    depth: int,
+    image: str,
+    raw_path: str,
+    config_json: str,
+    status: str,
+):
     bbox_json = json.dumps(area.bbox.__dict__, sort_keys=True)
     queries_json = json.dumps(queries, ensure_ascii=False)
     existing = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -57,23 +123,117 @@ def _ensure_run(conn, *, run_id: str, area, queries, cell_km: float, depth: int,
             """
             INSERT INTO runs(
                 id, area_name, bbox_json, cell_km, depth, queries_json, scraper_image,
-                raw_path, status, started_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                config_json, raw_path, status, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, area.name, bbox_json, cell_km, depth, queries_json, image, raw_path, status, utc_now()),
+            (
+                run_id, area.name, bbox_json, cell_km, depth, queries_json, image,
+                config_json, raw_path, status, utc_now(),
+            ),
         )
     else:
-        expected = (area.name, bbox_json, cell_km, depth, queries_json, image, raw_path)
-        actual = tuple(existing[key] for key in (
-            "area_name", "bbox_json", "cell_km", "depth", "queries_json", "scraper_image", "raw_path"
-        ))
+        expected = (area.name, bbox_json, cell_km, depth, queries_json, image, config_json, raw_path)
+        actual = tuple(
+            existing[key]
+            for key in (
+                "area_name", "bbox_json", "cell_km", "depth", "queries_json",
+                "scraper_image", "config_json", "raw_path",
+            )
+        )
         if actual != expected:
             raise ValueError(f"run_id {run_id} exists with different crawl configuration")
         conn.execute(
-            "UPDATE runs SET status = ?, finished_at = NULL, exit_code = NULL WHERE id = ?",
+            "UPDATE runs SET status = ?, finished_at = NULL, exit_code = NULL, error = NULL WHERE id = ?",
             (status, run_id),
         )
     conn.commit()
+
+
+def _mark_run(conn, run_id: str, *, status: str, exit_code: int | None, error: str | None) -> None:
+    conn.execute(
+        "UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, error = ? WHERE id = ?",
+        (status, utc_now(), exit_code, error, run_id),
+    )
+    conn.commit()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class RunLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self.token = uuid.uuid4().hex
+        self.acquired = False
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "token": self.token,
+            "created_at": utc_now(),
+        }
+        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+
+        for _ in range(2):
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                try:
+                    existing = json.loads(self.path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(f"run lock exists and cannot be verified: {self.path}") from exc
+                if existing.get("host") == socket.gethostname() and not _pid_alive(int(existing.get("pid", 0))):
+                    self.path.unlink(missing_ok=True)
+                    continue
+                raise RuntimeError(
+                    f"run is already locked by pid={existing.get('pid')} host={existing.get('host')}"
+                )
+            else:
+                try:
+                    os.write(fd, encoded)
+                finally:
+                    os.close(fd)
+                self.acquired = True
+                return
+        raise RuntimeError(f"could not acquire run lock: {self.path}")
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            existing = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if existing.get("token") == self.token:
+            self.path.unlink(missing_ok=True)
+        self.acquired = False
+
+
+def _print_stats(stats) -> None:
+    print(
+        " ".join(
+            (
+                f"raw={stats.raw_records}",
+                f"accepted={stats.accepted_records}",
+                f"out_of_bounds={stats.out_of_bounds_records}",
+                f"unlocated={stats.unlocated_records}",
+                f"unidentified={stats.unidentified_records}",
+                f"unique_seen={stats.unique_seen}",
+                f"new_businesses={stats.new_businesses}",
+            )
+        )
+    )
 
 
 def cmd_plan(args) -> int:
@@ -95,9 +255,10 @@ def cmd_plan(args) -> int:
 def cmd_collect(args) -> int:
     area = load_area(args.area)
     queries = load_queries(args.queries)
-    run_id = args.run_id or uuid.uuid4().hex[:12]
-    output_dir = Path(args.output_dir) / run_id
+    run_id = _validate_run_id(args.run_id or uuid.uuid4().hex[:12])
+    output_dir = (Path(args.output_dir) / run_id).resolve()
     output_file = output_dir / "results.jsonl"
+    query_snapshot = output_dir / "queries.txt"
     options = ScrapeOptions(
         cell_km=args.cell_km,
         depth=args.depth,
@@ -108,67 +269,148 @@ def cmd_collect(args) -> int:
         zoom=args.zoom,
         resume=not args.no_resume,
         image=args.image,
-        proxy_file=Path(args.proxy_file) if args.proxy_file else None,
+        proxy_file=Path(args.proxy_file).resolve() if args.proxy_file else None,
     )
-    command = build_docker_command(
-        area=area,
-        queries_file=Path(args.queries),
-        output_file=output_file,
-        options=options,
-    )
-
+    options.validate()
+    strict_bounds = not args.include_out_of_bounds
+    config_json = _run_config_json(area=area, queries=queries, options=options, strict_bounds=strict_bounds)
     estimate = estimate_grid(area.bbox, args.cell_km, len(queries))
     print(f"run_id={run_id} cells={estimate.cells} planned_searches={estimate.searches}")
-    print(command_for_display(command))
+
     if args.dry_run:
+        write_query_snapshot(query_snapshot, queries)
+        command = build_docker_command(
+            area=area,
+            queries_file=query_snapshot,
+            output_file=output_file,
+            options=options,
+        )
+        print(command_for_display(command))
         return 0
 
-    conn = connect(args.db)
-    existing = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
-    if existing is not None and existing["status"] == "complete":
-        print(f"run_id {run_id} is already complete; choose a new run ID", file=sys.stderr)
+    lock = RunLock(output_dir / ".sara.lock")
+    try:
+        lock.acquire()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
-    _ensure_run(
-        conn,
-        run_id=run_id,
-        area=area,
-        queries=queries,
-        cell_km=args.cell_km,
-        depth=args.depth,
-        image=args.image,
-        raw_path=str(output_file),
-        status="running",
-    )
 
-    exit_code = run_scraper(command)
-    if exit_code != 0:
-        conn.execute(
-            "UPDATE runs SET status = 'failed', finished_at = ?, exit_code = ? WHERE id = ?",
-            (utc_now(), exit_code, run_id),
-        )
-        conn.commit()
-        print(f"scraper failed with exit code {exit_code}", file=sys.stderr)
-        return exit_code
+    try:
+        conn = connect(args.db)
+        existing = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if existing is not None and existing["status"] == "complete":
+            print(f"run_id {run_id} is already complete; choose a new run ID", file=sys.stderr)
+            return 2
 
-    stats = ingest_records(conn, run_id, iter_jsonl(output_file))
-    conn.execute(
-        "UPDATE runs SET status = 'complete', finished_at = ?, exit_code = 0 WHERE id = ?",
-        (utc_now(), run_id),
-    )
-    conn.commit()
-    print(f"raw={stats.raw_records} unique_seen={stats.unique_seen} new_businesses={stats.new_businesses}")
-    return 0
+        resume_state = Path(str(output_file) + ".resume.json")
+        if existing is None and (output_file.exists() or resume_state.exists()):
+            print(
+                f"run_id {run_id} has pre-existing scraper output but no database run; choose a new run ID",
+                file=sys.stderr,
+            )
+            return 2
+
+        try:
+            _ensure_run(
+                conn,
+                run_id=run_id,
+                area=area,
+                queries=queries,
+                cell_km=args.cell_km,
+                depth=args.depth,
+                image=args.image,
+                raw_path=str(output_file),
+                config_json=config_json,
+                status="running",
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+        try:
+            write_query_snapshot(query_snapshot, queries)
+            command = build_docker_command(
+                area=area,
+                queries_file=query_snapshot,
+                output_file=output_file,
+                options=options,
+            )
+            print(command_for_display(command))
+            exit_code = run_scraper(command)
+            if exit_code != 0:
+                error = f"scraper failed with exit code {exit_code}"
+                _mark_run(conn, run_id, status="failed", exit_code=exit_code, error=error)
+                print(error, file=sys.stderr)
+                return exit_code
+
+            stats = ingest_records(
+                conn,
+                run_id,
+                iter_jsonl(output_file),
+                bbox=area.bbox if strict_bounds else None,
+            )
+            _mark_run(conn, run_id, status="complete", exit_code=0, error=None)
+            _print_stats(stats)
+            return 0
+        except KeyboardInterrupt:
+            _mark_run(conn, run_id, status="interrupted", exit_code=130, error="interrupted")
+            print("collection interrupted", file=sys.stderr)
+            return 130
+        except Exception as exc:
+            _mark_run(conn, run_id, status="failed", exit_code=None, error=str(exc))
+            print(f"collection failed: {exc}", file=sys.stderr)
+            return 1
+    finally:
+        lock.release()
 
 
 def cmd_ingest(args) -> int:
+    run_id = _validate_run_id(args.run_id)
     conn = connect(args.db)
-    row = conn.execute("SELECT id FROM runs WHERE id = ?", (args.run_id,)).fetchone()
+    row = conn.execute(
+        "SELECT id, raw_path, bbox_json, config_json FROM runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
     if row is None:
         print("run_id does not exist; use collect to create tracked runs", file=sys.stderr)
         return 2
-    stats = ingest_records(conn, args.run_id, iter_jsonl(args.file))
-    print(f"raw={stats.raw_records} unique_seen={stats.unique_seen} new_businesses={stats.new_businesses}")
-    return 0
+    if not row["raw_path"]:
+        print("run has no recorded raw_path", file=sys.stderr)
+        return 2
+
+    supplied = Path(args.file).resolve()
+    expected = Path(row["raw_path"]).resolve()
+    if supplied != expected:
+        print(f"ingest file must match the run raw_path: {expected}", file=sys.stderr)
+        return 2
+
+    bbox_data = json.loads(row["bbox_json"])
+    bbox = BoundingBox(**bbox_data)
+    bbox.validate()
+    config = json.loads(row["config_json"]) if row["config_json"] else {}
+    strict_bounds = bool(config.get("strict_bounds", True))
+
+    lock = RunLock(expected.parent / ".sara.lock")
+    try:
+        lock.acquire()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    try:
+        try:
+            stats = ingest_records(
+                conn,
+                run_id,
+                iter_jsonl(supplied),
+                bbox=bbox if strict_bounds else None,
+            )
+        except Exception as exc:
+            print(f"ingest failed: {exc}", file=sys.stderr)
+            return 1
+        _print_stats(stats)
+        return 0
+    finally:
+        lock.release()
 
 
 def cmd_stats(args) -> int:
@@ -177,8 +419,9 @@ def cmd_stats(args) -> int:
     print(f"canonical_businesses={total}")
     rows = conn.execute(
         """
-        SELECT id, area_name, cell_km, depth, status, raw_records, unique_seen,
-               new_businesses, started_at, finished_at
+        SELECT id, area_name, cell_km, depth, status, raw_records, accepted_records,
+               out_of_bounds_records, unlocated_records, unidentified_records,
+               unique_seen, new_businesses, started_at, finished_at, error
         FROM runs ORDER BY started_at DESC LIMIT ?
         """,
         (args.limit,),
@@ -190,14 +433,18 @@ def cmd_stats(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "plan":
-        return cmd_plan(args)
-    if args.command == "collect":
-        return cmd_collect(args)
-    if args.command == "ingest":
-        return cmd_ingest(args)
-    if args.command == "stats":
-        return cmd_stats(args)
+    try:
+        if args.command == "plan":
+            return cmd_plan(args)
+        if args.command == "collect":
+            return cmd_collect(args)
+        if args.command == "ingest":
+            return cmd_ingest(args)
+        if args.command == "stats":
+            return cmd_stats(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     raise AssertionError(args.command)
 
 
