@@ -282,6 +282,19 @@ def _print_stats(stats) -> None:
     )
 
 
+def _report_stats(stats, *, operation: str) -> int:
+    """Report committed results without letting presentation mutate lifecycle state."""
+    try:
+        _print_stats(stats)
+    except KeyboardInterrupt:
+        print(f"{operation} completed; reporting interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"{operation} completed but reporting failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_plan(args) -> int:
     area = load_area(args.area)
     queries = load_queries(args.queries)
@@ -441,8 +454,6 @@ def cmd_collect(args) -> int:
                 bbox=area.bbox if strict_bounds else None,
             )
             _mark_run(conn, run_id, status="complete", exit_code=scraper_exit_code, error=None)
-            _print_stats(stats)
-            return 0
         except KeyboardInterrupt:
             recorded_exit = scraper_exit_code if scraper_exit_code is not None else 130
             _mark_run(conn, run_id, status="interrupted", exit_code=recorded_exit, error="interrupted")
@@ -452,6 +463,8 @@ def cmd_collect(args) -> int:
             _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=str(exc))
             print(f"collection failed: {exc}", file=sys.stderr)
             return 1
+
+        return _report_stats(stats, operation="collection")
     finally:
         lock.release()
 
@@ -533,8 +546,7 @@ def cmd_ingest(args) -> int:
 
         if row["status"] != "complete":
             _mark_run(conn, run_id, status="complete", exit_code=row["exit_code"], error=None)
-        _print_stats(stats)
-        return 0
+        return _report_stats(stats, operation="ingest")
     finally:
         lock.release()
 
