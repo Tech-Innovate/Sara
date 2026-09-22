@@ -111,6 +111,10 @@ class UnidentifiableRecord(ValueError):
     pass
 
 
+class IdentityConflict(ValueError):
+    pass
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     db_path = Path(path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,6 +187,17 @@ def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | Non
     return place_id, cid, data_id, f"fallback:{digest}"
 
 
+def _order_key(seen_at: str | None, run_id: str | None) -> tuple[str, str]:
+    return str(seen_at or ""), str(run_id or "")
+
+
+def _run_started_at(conn: sqlite3.Connection, run_id: str) -> str:
+    row = conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"run_id {run_id} does not exist")
+    return str(row["started_at"])
+
+
 def _find_matches(
     conn: sqlite3.Connection,
     place_id: str | None,
@@ -202,25 +217,31 @@ def _find_matches(
 def _merge_matches(conn: sqlite3.Connection, matches: list[sqlite3.Row]) -> sqlite3.Row | None:
     if not matches:
         return None
-    primary = matches[0]
     if len(matches) == 1:
-        return primary
+        return matches[0]
 
-    fields = (
-        "place_id", "cid", "data_id", "title", "category", "address", "latitude",
-        "longitude", "phone", "website", "review_rating", "review_count", "status",
+    primary = matches[0]
+    identity_fields = ("place_id", "cid", "data_id")
+    mutable_fields = (
+        "title", "category", "address", "latitude", "longitude", "phone", "website",
+        "review_rating", "review_count", "status",
     )
-    merged = {field: primary[field] for field in fields}
-    first_seen_at = primary["first_seen_at"]
-    first_run_id = primary["first_run_id"]
+    earliest = min(matches, key=lambda row: _order_key(row["first_seen_at"], row["first_run_id"]))
+    latest = max(matches, key=lambda row: _order_key(row["last_seen_at"], row["last_run_id"]))
+
+    merged_identity = {field: primary[field] for field in identity_fields}
+    for row in matches[1:]:
+        for field in identity_fields:
+            if merged_identity[field] in (None, "") and row[field] not in (None, ""):
+                merged_identity[field] = row[field]
+
+    merged_mutable = {field: latest[field] for field in mutable_fields}
+    for row in sorted(matches, key=lambda item: _order_key(item["last_seen_at"], item["last_run_id"]), reverse=True):
+        for field in mutable_fields:
+            if merged_mutable[field] in (None, "") and row[field] not in (None, ""):
+                merged_mutable[field] = row[field]
 
     for duplicate in matches[1:]:
-        for field in fields:
-            if merged[field] in (None, "") and duplicate[field] not in (None, ""):
-                merged[field] = duplicate[field]
-        if duplicate["first_seen_at"] < first_seen_at:
-            first_seen_at = duplicate["first_seen_at"]
-            first_run_id = duplicate["first_run_id"]
         conn.execute(
             """
             INSERT OR IGNORE INTO run_businesses(run_id, business_id, first_observed_at)
@@ -235,10 +256,18 @@ def _merge_matches(conn: sqlite3.Connection, matches: list[sqlite3.Row]) -> sqli
         UPDATE businesses SET
             place_id = ?, cid = ?, data_id = ?, title = ?, category = ?, address = ?,
             latitude = ?, longitude = ?, phone = ?, website = ?, review_rating = ?,
-            review_count = ?, status = ?, first_seen_at = ?, first_run_id = ?
+            review_count = ?, status = ?, first_seen_at = ?, last_seen_at = ?,
+            first_run_id = ?, last_run_id = ?, raw_json = ?
         WHERE id = ?
         """,
-        tuple(merged[field] for field in fields) + (first_seen_at, first_run_id, primary["id"]),
+        (
+            merged_identity["place_id"], merged_identity["cid"], merged_identity["data_id"],
+            merged_mutable["title"], merged_mutable["category"], merged_mutable["address"],
+            merged_mutable["latitude"], merged_mutable["longitude"], merged_mutable["phone"],
+            merged_mutable["website"], merged_mutable["review_rating"], merged_mutable["review_count"],
+            merged_mutable["status"], earliest["first_seen_at"], latest["last_seen_at"],
+            earliest["first_run_id"], latest["last_run_id"], latest["raw_json"], primary["id"],
+        ),
     )
     return conn.execute("SELECT * FROM businesses WHERE id = ?", (primary["id"],)).fetchone()
 
@@ -260,11 +289,37 @@ def _payload(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def upsert_business(conn: sqlite3.Connection, run_id: str, record: dict[str, Any]) -> tuple[int, bool]:
+def _assert_identity_compatible(
+    existing: sqlite3.Row,
+    place_id: str | None,
+    cid: str | None,
+    data_id: str | None,
+) -> None:
+    for field, incoming in (("place_id", place_id), ("cid", cid), ("data_id", data_id)):
+        current = existing[field]
+        if current not in (None, "") and incoming not in (None, "") and current != incoming:
+            raise IdentityConflict(
+                f"strong identity conflict for business {existing['id']}: {field}={current!r} vs {incoming!r}"
+            )
+
+
+def _prefer(incoming: Any, current: Any, *, incoming_is_latest: bool) -> Any:
+    if incoming_is_latest:
+        return incoming if incoming not in (None, "") else current
+    return current if current not in (None, "") else incoming
+
+
+def upsert_business(
+    conn: sqlite3.Connection,
+    run_id: str,
+    record: dict[str, Any],
+    *,
+    run_started_at: str | None = None,
+) -> tuple[int, bool]:
     place_id, cid, data_id, canonical_key = _identity(record)
     matches = _find_matches(conn, place_id, cid, data_id, canonical_key)
     existing = _merge_matches(conn, matches)
-    now = utc_now()
+    observed_at = run_started_at or _run_started_at(conn, run_id)
     payload = _payload(record)
 
     if existing is None:
@@ -279,28 +334,51 @@ def upsert_business(conn: sqlite3.Connection, run_id: str, record: dict[str, Any
             (
                 canonical_key, place_id, cid, data_id, payload["title"], payload["category"], payload["address"],
                 payload["latitude"], payload["longitude"], payload["phone"], payload["website"],
-                payload["review_rating"], payload["review_count"], payload["status"], now, now, run_id, run_id,
-                payload["raw_json"],
+                payload["review_rating"], payload["review_count"], payload["status"],
+                observed_at, observed_at, run_id, run_id, payload["raw_json"],
             ),
         )
         return int(cursor.lastrowid), True
 
+    _assert_identity_compatible(existing, place_id, cid, data_id)
+    incoming_key = _order_key(observed_at, run_id)
+    first_key = _order_key(existing["first_seen_at"], existing["first_run_id"])
+    last_key = _order_key(existing["last_seen_at"], existing["last_run_id"])
+    incoming_is_latest = incoming_key >= last_key
+
+    first_seen_at = observed_at if incoming_key < first_key else existing["first_seen_at"]
+    first_run_id = run_id if incoming_key < first_key else existing["first_run_id"]
+    last_seen_at = observed_at if incoming_is_latest else existing["last_seen_at"]
+    last_run_id = run_id if incoming_is_latest else existing["last_run_id"]
+
+    mutable_fields = (
+        "title", "category", "address", "latitude", "longitude", "phone", "website",
+        "review_rating", "review_count", "status",
+    )
+    merged_payload = {
+        field: _prefer(payload[field], existing[field], incoming_is_latest=incoming_is_latest)
+        for field in mutable_fields
+    }
+    raw_json = payload["raw_json"] if incoming_is_latest else existing["raw_json"]
+
     conn.execute(
         """
         UPDATE businesses SET
-            place_id = COALESCE(?, place_id), cid = COALESCE(?, cid), data_id = COALESCE(?, data_id),
-            title = COALESCE(?, title), category = COALESCE(?, category), address = COALESCE(?, address),
-            latitude = COALESCE(?, latitude), longitude = COALESCE(?, longitude), phone = COALESCE(?, phone),
-            website = COALESCE(?, website), review_rating = COALESCE(?, review_rating),
-            review_count = COALESCE(?, review_count), status = COALESCE(?, status),
-            last_seen_at = ?, last_run_id = ?, raw_json = ?
+            place_id = ?, cid = ?, data_id = ?,
+            title = ?, category = ?, address = ?, latitude = ?, longitude = ?, phone = ?,
+            website = ?, review_rating = ?, review_count = ?, status = ?,
+            first_seen_at = ?, last_seen_at = ?, first_run_id = ?, last_run_id = ?, raw_json = ?
         WHERE id = ?
         """,
         (
-            place_id, cid, data_id, payload["title"], payload["category"], payload["address"],
-            payload["latitude"], payload["longitude"], payload["phone"], payload["website"],
-            payload["review_rating"], payload["review_count"], payload["status"], now, run_id,
-            payload["raw_json"], existing["id"],
+            existing["place_id"] or place_id,
+            existing["cid"] or cid,
+            existing["data_id"] or data_id,
+            merged_payload["title"], merged_payload["category"], merged_payload["address"],
+            merged_payload["latitude"], merged_payload["longitude"], merged_payload["phone"],
+            merged_payload["website"], merged_payload["review_rating"], merged_payload["review_count"],
+            merged_payload["status"], first_seen_at, last_seen_at, first_run_id, last_run_id,
+            raw_json, existing["id"],
         ),
     )
     return int(existing["id"]), False
@@ -327,15 +405,16 @@ def ingest_records(
     *,
     bbox: BoundingBox | None = None,
 ) -> IngestStats:
-    if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
+    run = conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if run is None:
         raise ValueError(f"run_id {run_id} does not exist")
+    run_started_at = str(run["started_at"])
 
     raw_records = 0
     accepted_records = 0
     out_of_bounds_records = 0
     unlocated_records = 0
     unidentified_records = 0
-    now = utc_now()
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -351,7 +430,12 @@ def ingest_records(
                     continue
 
             try:
-                business_id, _ = upsert_business(conn, run_id, record)
+                business_id, _ = upsert_business(
+                    conn,
+                    run_id,
+                    record,
+                    run_started_at=run_started_at,
+                )
             except UnidentifiableRecord:
                 unidentified_records += 1
                 continue
@@ -359,7 +443,7 @@ def ingest_records(
             accepted_records += 1
             conn.execute(
                 "INSERT OR IGNORE INTO run_businesses(run_id, business_id, first_observed_at) VALUES (?, ?, ?)",
-                (run_id, business_id, now),
+                (run_id, business_id, run_started_at),
             )
 
         conn.execute(
