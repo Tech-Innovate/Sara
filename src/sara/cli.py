@@ -157,9 +157,47 @@ def _mark_run(conn, run_id: str, *, status: str, exit_code: int | None, error: s
     conn.commit()
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive_windows(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    error_invalid_parameter = 87
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        # ERROR_INVALID_PARAMETER is the normal response for a PID that no longer
+        # exists. For access-denied/other errors, conservatively treat the process
+        # as alive so we never clear a potentially live writer lock.
+        return ctypes.get_last_error() != error_invalid_parameter
+
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == wait_object_0:
+            return False
+        if result == wait_timeout:
+            return True
+        return True
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid: int, *, platform: str | None = None) -> bool:
     if pid <= 0:
         return False
+    platform = os.name if platform is None else platform
+    if platform == "nt":
+        return _pid_alive_windows(pid)
     try:
         os.kill(pid, 0)
     except PermissionError:
