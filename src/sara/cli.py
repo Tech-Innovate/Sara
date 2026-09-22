@@ -10,9 +10,17 @@ import sys
 import uuid
 from pathlib import Path
 
-from .config import BoundingBox, load_area, load_queries, write_query_snapshot
+from .config import AreaConfig, BoundingBox, load_area, load_queries, write_query_snapshot
 from .grid import estimate_grid
-from .scraper import DEFAULT_IMAGE, ScrapeOptions, build_docker_command, command_for_display, run_scraper
+from .scraper import (
+    DEFAULT_IMAGE,
+    ScrapeOptions,
+    build_docker_command,
+    command_for_display,
+    expected_resume_input_ids,
+    load_resume_completed_input_ids,
+    run_scraper,
+)
 from .storage import connect, ingest_records, iter_jsonl, utc_now
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -176,9 +184,6 @@ def _pid_alive_windows(pid: int) -> bool:
 
     handle = kernel32.OpenProcess(synchronize, False, pid)
     if not handle:
-        # ERROR_INVALID_PARAMETER is the normal response for a PID that no longer
-        # exists. For access-denied/other errors, conservatively treat the process
-        # as alive so we never clear a potentially live writer lock.
         return ctypes.get_last_error() != error_invalid_parameter
 
     try:
@@ -274,6 +279,19 @@ def _print_stats(stats) -> None:
     )
 
 
+def _report_stats(stats, *, operation: str) -> int:
+    """Report committed results without letting presentation mutate lifecycle state."""
+    try:
+        _print_stats(stats)
+    except KeyboardInterrupt:
+        print(f"{operation} completed; reporting interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"{operation} completed but reporting failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_plan(args) -> int:
     area = load_area(args.area)
     queries = load_queries(args.queries)
@@ -310,10 +328,20 @@ def cmd_collect(args) -> int:
         proxy_file=Path(args.proxy_file).resolve() if args.proxy_file else None,
     )
     options.validate()
+    if not options.resume:
+        print(
+            "collection requires resume mode because upstream exit code 0 does not prove crawl completion",
+            file=sys.stderr,
+        )
+        return 2
+
     strict_bounds = not args.include_out_of_bounds
     config_json = _run_config_json(area=area, queries=queries, options=options, strict_bounds=strict_bounds)
     estimate = estimate_grid(area.bbox, args.cell_km, len(queries))
     print(f"run_id={run_id} cells={estimate.cells} planned_searches={estimate.searches}")
+    if estimate.cells == 0:
+        print("grid produced 0 cells; check bounding box and cell size", file=sys.stderr)
+        return 2
 
     if args.dry_run:
         command = build_docker_command(
@@ -325,6 +353,12 @@ def cmd_collect(args) -> int:
         )
         print(command_for_display(command))
         return 0
+
+    expected_inputs = expected_resume_input_ids(area, queries, options.cell_km)
+    if len(expected_inputs) != estimate.searches:
+        raise RuntimeError(
+            f"internal grid mismatch: planner expects {estimate.searches} searches but completion model expects {len(expected_inputs)}"
+        )
 
     lock = RunLock(output_dir / ".sara.lock")
     try:
@@ -365,6 +399,7 @@ def cmd_collect(args) -> int:
             print(str(exc), file=sys.stderr)
             return 2
 
+        scraper_exit_code: int | None = None
         try:
             write_query_snapshot(query_snapshot, queries)
             command = build_docker_command(
@@ -374,30 +409,66 @@ def cmd_collect(args) -> int:
                 options=options,
             )
             print(command_for_display(command))
-            exit_code = run_scraper(command)
-            if exit_code != 0:
-                error = f"scraper failed with exit code {exit_code}"
-                _mark_run(conn, run_id, status="failed", exit_code=exit_code, error=error)
+            scraper_exit_code = run_scraper(command)
+            if scraper_exit_code != 0:
+                error = f"scraper failed with exit code {scraper_exit_code}"
+                _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
-                return exit_code
+                return scraper_exit_code
+
+            try:
+                completed_inputs = load_resume_completed_input_ids(output_file, options.image)
+                comparison = expected_inputs.compare_completed(completed_inputs)
+            except Exception as exc:
+                error = f"completion verification failed after scraper exit 0: {exc}"
+                _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
+                print(error, file=sys.stderr)
+                return 1
+
+            if comparison.unexpected:
+                error = (
+                    "resume completion state does not match this run: "
+                    f"{comparison.unexpected} unexpected completed input(s)"
+                )
+                _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
+                print(error, file=sys.stderr)
+                return 1
+
+            if comparison.missing:
+                error = (
+                    "scraper exited before all planned searches completed: "
+                    f"completed {comparison.matched}/{len(expected_inputs)}"
+                )
+                _mark_run(conn, run_id, status="interrupted", exit_code=scraper_exit_code, error=error)
+                print(error, file=sys.stderr)
+                return 130
 
             stats = ingest_records(
                 conn,
                 run_id,
                 iter_jsonl(output_file),
                 bbox=area.bbox if strict_bounds else None,
+                finalize_run=("complete", scraper_exit_code, None),
             )
-            _mark_run(conn, run_id, status="complete", exit_code=0, error=None)
-            _print_stats(stats)
-            return 0
         except KeyboardInterrupt:
-            _mark_run(conn, run_id, status="interrupted", exit_code=130, error="interrupted")
+            status_row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if status_row is not None and status_row["status"] == "complete":
+                print("collection completed; reporting interrupted", file=sys.stderr)
+                return 130
+            recorded_exit = scraper_exit_code if scraper_exit_code is not None else 130
+            _mark_run(conn, run_id, status="interrupted", exit_code=recorded_exit, error="interrupted")
             print("collection interrupted", file=sys.stderr)
             return 130
         except Exception as exc:
-            _mark_run(conn, run_id, status="failed", exit_code=None, error=str(exc))
+            status_row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+            if status_row is not None and status_row["status"] == "complete":
+                print(f"collection completed but post-commit handling failed: {exc}", file=sys.stderr)
+                return 1
+            _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=str(exc))
             print(f"collection failed: {exc}", file=sys.stderr)
             return 1
+
+        return _report_stats(stats, operation="collection")
     finally:
         lock.release()
 
@@ -406,7 +477,11 @@ def cmd_ingest(args) -> int:
     run_id = _validate_run_id(args.run_id)
     conn = connect(args.db)
     row = conn.execute(
-        "SELECT id, raw_path, bbox_json, config_json FROM runs WHERE id = ?",
+        """
+        SELECT id, area_name, cell_km, queries_json, scraper_image, raw_path,
+               bbox_json, config_json, status, exit_code
+        FROM runs WHERE id = ?
+        """,
         (run_id,),
     ).fetchone()
     if row is None:
@@ -427,6 +502,15 @@ def cmd_ingest(args) -> int:
     bbox.validate()
     config = json.loads(row["config_json"]) if row["config_json"] else {}
     strict_bounds = bool(config.get("strict_bounds", True))
+    if not bool(config.get("resume", False)):
+        print("ingest requires a run with verifiable resume completion state", file=sys.stderr)
+        return 2
+
+    queries = json.loads(row["queries_json"])
+    if not isinstance(queries, list) or not queries or not all(isinstance(query, str) for query in queries):
+        print("run has invalid recorded query configuration", file=sys.stderr)
+        return 2
+    area = AreaConfig(str(row["area_name"]), bbox)
 
     lock = RunLock(expected.parent / ".sara.lock")
     try:
@@ -436,17 +520,35 @@ def cmd_ingest(args) -> int:
         return 2
     try:
         try:
+            expected_inputs = expected_resume_input_ids(area, queries, float(row["cell_km"]))
+            completed_inputs = load_resume_completed_input_ids(expected, str(row["scraper_image"]))
+            comparison = expected_inputs.compare_completed(completed_inputs)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"ingest completion verification failed: {exc}", file=sys.stderr)
+            return 2
+
+        if comparison.unexpected or comparison.missing:
+            print(
+                "ingest requires verified complete crawl evidence: "
+                f"completed {comparison.matched}/{len(expected_inputs)}, "
+                f"unexpected={comparison.unexpected}",
+                file=sys.stderr,
+            )
+            return 2
+
+        try:
             stats = ingest_records(
                 conn,
                 run_id,
                 iter_jsonl(supplied),
                 bbox=bbox if strict_bounds else None,
+                finalize_run=("complete", row["exit_code"], None) if row["status"] != "complete" else None,
             )
         except Exception as exc:
             print(f"ingest failed: {exc}", file=sys.stderr)
             return 1
-        _print_stats(stats)
-        return 0
+
+        return _report_stats(stats, operation="ingest")
     finally:
         lock.release()
 

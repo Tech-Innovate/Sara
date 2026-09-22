@@ -43,6 +43,26 @@ def test_docker_command_mounts_query_snapshot_and_disables_telemetry(tmp_path):
         assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
 
+def test_resume_state_without_results_is_rejected_before_precreation(tmp_path):
+    queries = tmp_path / "queries.txt"
+    queries.write_text("dentist\n", encoding="utf-8")
+    output = tmp_path / "out" / "results.jsonl"
+    output.parent.mkdir(parents=True)
+    Path(str(output) + ".resume.json").write_text(
+        '{"version":1,"completed_inputs":[]}', encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="resume state exists but results file is missing"):
+        build_docker_command(
+            area=area(),
+            queries_file=queries,
+            output_file=output,
+            options=ScrapeOptions(),
+        )
+
+    assert not output.exists()
+
+
 def test_dry_run_command_preparation_does_not_create_output(tmp_path):
     queries = tmp_path / "missing-run-snapshot.txt"
     output = tmp_path / "out" / "results.jsonl"

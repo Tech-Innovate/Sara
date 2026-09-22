@@ -404,6 +404,7 @@ def ingest_records(
     records: Iterable[dict[str, Any]],
     *,
     bbox: BoundingBox | None = None,
+    finalize_run: tuple[str, int | None, str | None] | None = None,
 ) -> IngestStats:
     run = conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,)).fetchone()
     if run is None:
@@ -416,8 +417,8 @@ def ingest_records(
     unlocated_records = 0
     unidentified_records = 0
 
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("BEGIN IMMEDIATE")
         for record in records:
             raw_records += 1
             if bbox is not None:
@@ -459,28 +460,36 @@ def ingest_records(
             ),
         )
         _refresh_canonical_counts(conn)
+
+        if finalize_run is not None:
+            status, exit_code, error = finalize_run
+            conn.execute(
+                "UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, error = ? WHERE id = ?",
+                (status, utc_now(), exit_code, error, run_id),
+            )
+
+        row = conn.execute(
+            """
+            SELECT raw_records, accepted_records, out_of_bounds_records, unlocated_records,
+                   unidentified_records, unique_seen, new_businesses
+            FROM runs WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        stats = IngestStats(
+            raw_records=int(row["raw_records"]),
+            accepted_records=int(row["accepted_records"]),
+            out_of_bounds_records=int(row["out_of_bounds_records"]),
+            unlocated_records=int(row["unlocated_records"]),
+            unidentified_records=int(row["unidentified_records"]),
+            unique_seen=int(row["unique_seen"]),
+            new_businesses=int(row["new_businesses"]),
+        )
         conn.commit()
-    except Exception:
+        return stats
+    except BaseException:
         conn.rollback()
         raise
-
-    row = conn.execute(
-        """
-        SELECT raw_records, accepted_records, out_of_bounds_records, unlocated_records,
-               unidentified_records, unique_seen, new_businesses
-        FROM runs WHERE id = ?
-        """,
-        (run_id,),
-    ).fetchone()
-    return IngestStats(
-        raw_records=int(row["raw_records"]),
-        accepted_records=int(row["accepted_records"]),
-        out_of_bounds_records=int(row["out_of_bounds_records"]),
-        unlocated_records=int(row["unlocated_records"]),
-        unidentified_records=int(row["unidentified_records"]),
-        unique_seen=int(row["unique_seen"]),
-        new_businesses=int(row["new_businesses"]),
-    )
 
 
 def iter_jsonl(path: str | Path):
