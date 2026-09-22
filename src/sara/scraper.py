@@ -60,6 +60,12 @@ def build_docker_command(
         output_file.parent.mkdir(parents=True, exist_ok=True)
         if not queries_file.is_file():
             raise FileNotFoundError(queries_file)
+        # The upstream container runs as root and resume mode creates new result
+        # files with mode 0600. Pre-creating the bind-mounted result as the host
+        # user preserves host ownership when the container appends or truncates it,
+        # so Sara can ingest it immediately after Docker exits on rootful Linux.
+        if not output_file.exists():
+            output_file.touch(mode=0o600)
 
     command = [
         "docker", "run", "--rm",
