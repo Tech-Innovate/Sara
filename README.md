@@ -127,7 +127,7 @@ Sara fingerprints the complete crawl configuration used for resume safety, inclu
 - strict-bounds mode;
 - SHA-256 fingerprint of the proxy file when one is used.
 
-A successful Docker exit is not treated as proof that a crawl finished. The pinned upstream scraper can terminate gracefully with exit code `0` after receiving a signal. In resume mode, however, upstream persists deterministic IDs only for query/cell inputs whose discovery and discovered-result persistence have fully completed. Sara independently reproduces the expected deterministic input IDs for the planned grid and requires the resume sidecar's `completed_inputs` set to match exactly before canonical ingestion begins.
+A successful Docker exit is not treated as proof that a crawl finished. The pinned upstream scraper can terminate gracefully with exit code `0` after receiving a signal. In resume mode, however, upstream persists deterministic IDs only for query/cell inputs whose discovery and discovered-result persistence have fully completed. Sara independently reproduces the expected deterministic input IDs for the planned grid and verifies that every expected ID is present and that no unexpected ID remains in the resume sidecar before canonical ingestion begins.
 
 If Docker exits `0` but completion evidence is missing or incomplete, Sara preserves the raw JSONL and upstream resume state, marks the run `interrupted`, skips canonical ingestion, and returns an interruption result. Reuse the same ID with exactly the same configuration to continue:
 
