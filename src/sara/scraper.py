@@ -10,10 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AreaConfig
+from .grid import iter_grid_origins
 
 DEFAULT_IMAGE = "gosom/google-maps-scraper:v1.18.1"
-_MIN_COS_LATITUDE = 1e-6
-_KM_PER_DEGREE_LAT = 111.32
 _RESUME_STATE_VERSION = 1
 
 
@@ -121,28 +120,12 @@ def run_scraper(command: list[str], *, env: dict[str, str] | None = None) -> int
 
 def expected_resume_input_ids(area: AreaConfig, queries: list[str], cell_km: float) -> set[str]:
     """Reproduce v1.18.1 grid seed IDs so completion can be proven exactly."""
-    if not math.isfinite(cell_km) or cell_km <= 0:
-        raise ValueError("cell_km must be a finite value greater than zero")
     if not queries:
         raise ValueError("queries cannot be empty")
 
-    bbox = area.bbox
-    bbox.validate()
-    lat_step = cell_km / _KM_PER_DEGREE_LAT
-    midpoint = math.radians((bbox.min_lat + bbox.max_lat) / 2)
-    cos_midpoint = math.cos(midpoint)
-    if abs(cos_midpoint) < _MIN_COS_LATITUDE:
-        cos_midpoint = -_MIN_COS_LATITUDE if cos_midpoint < 0 else _MIN_COS_LATITUDE
-    lon_step = cell_km / (_KM_PER_DEGREE_LAT * cos_midpoint)
-
-    cells: list[str] = []
-    lat = bbox.min_lat + lat_step / 2
-    while lat < bbox.max_lat:
-        lon = bbox.min_lon + lon_step / 2
-        while lon < bbox.max_lon:
-            cells.append(f"{lat:.6f},{lon:.6f}")
-            lon += lon_step
-        lat += lat_step
+    cells = [f"{lat:.6f},{lon:.6f}" for lat, lon in iter_grid_origins(area.bbox, cell_km)]
+    if not cells:
+        raise ValueError("grid produced 0 cells; check bounding box and cell size")
 
     expected: list[str] = []
     for query_line in queries:
