@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import subprocess
@@ -25,16 +26,22 @@ class ScrapeOptions:
     proxy_file: Path | None = None
 
     def validate(self) -> None:
-        if self.cell_km <= 0:
-            raise ValueError("cell_km must be greater than zero")
+        if not math.isfinite(self.cell_km) or self.cell_km <= 0:
+            raise ValueError("cell_km must be a finite value greater than zero")
         if not (1 <= self.depth <= 10):
             raise ValueError("depth must be between 1 and 10")
         if self.concurrency <= 0:
             raise ValueError("concurrency must be greater than zero")
         if self.browser_pool_size <= 0 or self.pages_per_browser <= 0:
             raise ValueError("browser pool and page counts must be greater than zero")
-        if not (0 <= self.zoom <= 21):
-            raise ValueError("zoom must be between 0 and 21")
+        if not (1 <= self.zoom <= 21):
+            raise ValueError("grid zoom must be between 1 and 21")
+        if not self.lang.strip():
+            raise ValueError("language code cannot be empty")
+        if not self.image.strip():
+            raise ValueError("scraper image cannot be empty")
+        if self.proxy_file is not None and not self.proxy_file.is_file():
+            raise FileNotFoundError(self.proxy_file)
 
 
 def build_docker_command(
@@ -51,8 +58,6 @@ def build_docker_command(
 
     if not queries_file.is_file():
         raise FileNotFoundError(queries_file)
-    if options.proxy_file is not None and not options.proxy_file.is_file():
-        raise FileNotFoundError(options.proxy_file)
 
     command = [
         "docker", "run", "--rm",
