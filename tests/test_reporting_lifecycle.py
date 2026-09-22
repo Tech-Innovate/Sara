@@ -1,6 +1,5 @@
 import argparse
 import json
-from types import SimpleNamespace
 
 import sara.cli as cli
 from sara.cli import cmd_collect
@@ -46,18 +45,6 @@ def _args(tmp_path):
     )
 
 
-def _stats():
-    return SimpleNamespace(
-        raw_records=1,
-        accepted_records=1,
-        out_of_bounds_records=0,
-        unlocated_records=0,
-        unidentified_records=0,
-        unique_seen=1,
-        new_businesses=1,
-    )
-
-
 def test_stdout_reporting_failure_does_not_downgrade_complete_run(tmp_path, monkeypatch):
     args = _args(tmp_path)
     area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
@@ -65,16 +52,16 @@ def test_stdout_reporting_failure_does_not_downgrade_complete_run(tmp_path, monk
 
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
     monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
-    monkeypatch.setattr(cli, "ingest_records", lambda *_args, **_kwargs: _stats())
     monkeypatch.setattr(cli, "_print_stats", lambda _stats: (_ for _ in ()).throw(BrokenPipeError("closed")))
 
     assert cmd_collect(args) == 1
     row = connect(args.db).execute(
-        "SELECT status, exit_code, error FROM runs WHERE id = 'reporting'"
+        "SELECT status, exit_code, error, raw_records FROM runs WHERE id = 'reporting'"
     ).fetchone()
     assert row["status"] == "complete"
     assert row["exit_code"] == 0
     assert row["error"] is None
+    assert row["raw_records"] == 0
 
 
 def test_reporting_interrupt_does_not_reclassify_complete_run(tmp_path, monkeypatch):
@@ -84,7 +71,6 @@ def test_reporting_interrupt_does_not_reclassify_complete_run(tmp_path, monkeypa
 
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
     monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
-    monkeypatch.setattr(cli, "ingest_records", lambda *_args, **_kwargs: _stats())
 
     def interrupt(_stats):
         raise KeyboardInterrupt
@@ -92,6 +78,10 @@ def test_reporting_interrupt_does_not_reclassify_complete_run(tmp_path, monkeypa
     monkeypatch.setattr(cli, "_print_stats", interrupt)
 
     assert cmd_collect(args) == 130
-    row = connect(args.db).execute("SELECT status, exit_code FROM runs WHERE id = 'reporting'").fetchone()
+    row = connect(args.db).execute(
+        "SELECT status, exit_code, error, raw_records FROM runs WHERE id = 'reporting'"
+    ).fetchone()
     assert row["status"] == "complete"
     assert row["exit_code"] == 0
+    assert row["error"] is None
+    assert row["raw_records"] == 0
