@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import shlex
@@ -10,6 +12,9 @@ from pathlib import Path
 from .config import AreaConfig
 
 DEFAULT_IMAGE = "gosom/google-maps-scraper:v1.18.1"
+_MIN_COS_LATITUDE = 1e-6
+_KM_PER_DEGREE_LAT = 111.32
+_RESUME_STATE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -112,6 +117,112 @@ def run_scraper(command: list[str], *, env: dict[str, str] | None = None) -> int
         merged_env.update(env)
     completed = subprocess.run(command, env=merged_env, check=False)
     return completed.returncode
+
+
+def expected_resume_input_ids(area: AreaConfig, queries: list[str], cell_km: float) -> set[str]:
+    """Reproduce v1.18.1 grid seed IDs so completion can be proven exactly."""
+    if not math.isfinite(cell_km) or cell_km <= 0:
+        raise ValueError("cell_km must be a finite value greater than zero")
+    if not queries:
+        raise ValueError("queries cannot be empty")
+
+    bbox = area.bbox
+    bbox.validate()
+    lat_step = cell_km / _KM_PER_DEGREE_LAT
+    midpoint = math.radians((bbox.min_lat + bbox.max_lat) / 2)
+    cos_midpoint = math.cos(midpoint)
+    if abs(cos_midpoint) < _MIN_COS_LATITUDE:
+        cos_midpoint = -_MIN_COS_LATITUDE if cos_midpoint < 0 else _MIN_COS_LATITUDE
+    lon_step = cell_km / (_KM_PER_DEGREE_LAT * cos_midpoint)
+
+    cells: list[str] = []
+    lat = bbox.min_lat + lat_step / 2
+    while lat < bbox.max_lat:
+        lon = bbox.min_lon + lon_step / 2
+        while lon < bbox.max_lon:
+            cells.append(f"{lat:.6f},{lon:.6f}")
+            lon += lon_step
+        lat += lat_step
+
+    expected: list[str] = []
+    for query_line in queries:
+        query_text, query_id = _parse_upstream_query_identity(query_line)
+        identity = query_id or query_text
+        for coordinates in cells:
+            expected.append(_deterministic_seed_id(identity, coordinates))
+
+    expected_set = set(expected)
+    if len(expected_set) != len(expected):
+        raise ValueError("query IDs produce duplicate resume identities; use unique query IDs")
+    return expected_set
+
+
+def load_resume_completed_input_ids(output_file: Path, image: str) -> set[str]:
+    """Load upstream completion evidence, including root-owned sidecars on Linux."""
+    state_path = Path(str(output_file) + ".resume.json")
+    try:
+        text = state_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    except PermissionError:
+        text = _read_file_via_container(state_path, image)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid resume state JSON: {state_path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("resume state must be a JSON object")
+    if payload.get("version") != _RESUME_STATE_VERSION:
+        raise RuntimeError(f"unsupported resume state version: {payload.get('version')!r}")
+
+    completed = payload.get("completed_inputs")
+    if not isinstance(completed, list) or not all(isinstance(item, str) and item for item in completed):
+        raise RuntimeError("resume state completed_inputs must be a list of non-empty strings")
+    completed_set = set(completed)
+    if len(completed_set) != len(completed):
+        raise RuntimeError("resume state completed_inputs contains duplicate IDs")
+    return completed_set
+
+
+def _read_file_via_container(path: Path, image: str) -> str:
+    if not shutil_which("docker"):
+        raise RuntimeError("Docker is required to read the root-owned resume state")
+    command = [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--entrypoint", "/bin/cat",
+        "-v", f"{path.parent.resolve()}:/out:ro",
+        image,
+        f"/out/{path.name}",
+    ]
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise RuntimeError(f"could not read resume state through container: {detail}")
+    return completed.stdout
+
+
+def _parse_upstream_query_identity(line: str) -> tuple[str, str]:
+    value = line.strip()
+    if "#!#" in value:
+        before, after = value.split("#!#", 1)
+        query_text = before.strip()
+        query_id = after.strip()
+    else:
+        query_text = value
+        query_id = ""
+    if not query_text:
+        raise ValueError(f"invalid query line {line!r}: empty query text")
+    return query_text, query_id
+
+
+def _deterministic_seed_id(*parts: str) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\x00")
+    return f"resume:{digest.hexdigest()}"
 
 
 def shutil_which(binary: str) -> str | None:
