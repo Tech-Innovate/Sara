@@ -190,7 +190,7 @@ def test_unexpected_resume_identity_fails_closed(tmp_path, monkeypatch):
     assert "unexpected completed input" in row["error"]
 
 
-def test_complete_resume_state_allows_ingest(tmp_path, monkeypatch):
+def test_complete_resume_state_allows_ingest_with_atomic_finalization(tmp_path, monkeypatch):
     args = _collect_args(tmp_path)
     area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
     expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
@@ -199,16 +199,24 @@ def test_complete_resume_state_allows_ingest(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
     monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
 
-    def fake_ingest(*_args, **_kwargs):
-        calls.append(True)
+    def fake_ingest(conn, run_id, *_args, finalize_run=None, **_kwargs):
+        calls.append(finalize_run)
+        assert finalize_run == ("complete", 0, None)
+        status, exit_code, error = finalize_run
+        conn.execute(
+            "UPDATE runs SET status = ?, exit_code = ?, error = ? WHERE id = ?",
+            (status, exit_code, error, run_id),
+        )
+        conn.commit()
         return _stats()
 
     monkeypatch.setattr(cli, "ingest_records", fake_ingest)
 
     assert cmd_collect(args) == 0
-    assert calls == [True]
-    row = connect(args.db).execute("SELECT status, error FROM runs WHERE id = 'guard'").fetchone()
+    assert calls == [("complete", 0, None)]
+    row = connect(args.db).execute("SELECT status, exit_code, error FROM runs WHERE id = 'guard'").fetchone()
     assert row["status"] == "complete"
+    assert row["exit_code"] == 0
     assert row["error"] is None
 
 
