@@ -1,0 +1,4 @@
+# Use business types only; geography is supplied by the grid.
+dentist
+restaurant
+pharmacy
