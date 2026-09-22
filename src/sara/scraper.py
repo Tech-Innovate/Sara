@@ -55,6 +55,13 @@ class ScrapeOptions:
             raise FileNotFoundError(self.proxy_file)
 
 
+@dataclass(frozen=True)
+class CompletionComparison:
+    matched: int
+    missing: int
+    unexpected: int
+
+
 def build_docker_command(
     *,
     area: AreaConfig,
@@ -148,11 +155,10 @@ def validate_resume_query_identities(queries: list[str]) -> None:
 
 
 class ExpectedResumeInputs:
-    """Set-like completion model that materializes only when comparison is needed.
+    """Lazy model of the deterministic v1.18.1 grid completion identities.
 
-    Collection uses only ``len()`` before Docker starts, keeping the Python parent
-    from retaining one large hash set while the scraper container is running.
-    Exact IDs are materialized after acquisition, when set comparison begins.
+    Production comparison streams expected IDs through the one set already loaded
+    from the upstream sidecar instead of allocating a second full expected-ID set.
     """
 
     def __init__(self, area: AreaConfig, queries: list[str], cell_km: float):
@@ -164,34 +170,48 @@ class ExpectedResumeInputs:
         self._queries = tuple(queries)
         self._cell_km = cell_km
         self._count = estimate.searches
-        self._materialized: set[str] | None = None
 
     def __len__(self) -> int:
         return self._count
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._get_set())
-
-    def __sub__(self, other) -> set[str]:
-        return self._get_set() - other
-
-    def __rsub__(self, other) -> set[str]:
-        return other - self._get_set()
+        return _iter_expected_resume_input_ids(self._area, self._queries, self._cell_km)
 
     def __eq__(self, other) -> bool:
         if isinstance(other, ExpectedResumeInputs):
-            return self._get_set() == other._get_set()
-        return self._get_set() == other
+            return set(self) == set(other) and len(self) == len(other)
+        if isinstance(other, set):
+            return len(other) == self._count and set(self) == other
+        return NotImplemented
 
-    def _get_set(self) -> set[str]:
-        if self._materialized is None:
-            materialized = set(_iter_expected_resume_input_ids(self._area, self._queries, self._cell_km))
-            if len(materialized) != self._count:
-                raise ValueError(
-                    "grid/query configuration produces duplicate resume identities at six-decimal coordinate precision"
-                )
-            self._materialized = materialized
-        return self._materialized
+    def compare_completed(self, completed: set[str]) -> CompletionComparison:
+        """Compare exact completion evidence while consuming ``completed`` in place.
+
+        The sidecar set is no longer needed after verification. Removing matches as
+        expected IDs stream past keeps peak memory to one large ID set instead of
+        materializing a second expected set for broad runs.
+        """
+        matched = 0
+        missing = 0
+        generated = 0
+
+        for expected_id in self:
+            generated += 1
+            if expected_id in completed:
+                completed.remove(expected_id)
+                matched += 1
+            else:
+                missing += 1
+
+        if generated != self._count:
+            raise RuntimeError(
+                f"internal completion model mismatch: generated {generated} IDs for {self._count} planned searches"
+            )
+
+        # If expected IDs collide at six-decimal coordinate precision, only one
+        # sidecar ID can match them; the later duplicate is counted as missing and
+        # the run therefore fails closed instead of being falsely accepted.
+        return CompletionComparison(matched=matched, missing=missing, unexpected=len(completed))
 
 
 def expected_resume_input_ids(
@@ -199,7 +219,7 @@ def expected_resume_input_ids(
     queries: list[str],
     cell_km: float,
 ) -> ExpectedResumeInputs:
-    """Return the exact v1.18.1 grid completion model as a lazy set-like value."""
+    """Return the exact v1.18.1 grid completion model as a lazy iterable."""
     return ExpectedResumeInputs(area, queries, cell_km)
 
 
