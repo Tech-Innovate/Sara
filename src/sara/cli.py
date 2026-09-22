@@ -184,9 +184,6 @@ def _pid_alive_windows(pid: int) -> bool:
 
     handle = kernel32.OpenProcess(synchronize, False, pid)
     if not handle:
-        # ERROR_INVALID_PARAMETER is the normal response for a PID that no longer
-        # exists. For access-denied/other errors, conservatively treat the process
-        # as alive so we never clear a potentially live writer lock.
         return ctypes.get_last_error() != error_invalid_parameter
 
     try:
@@ -421,27 +418,26 @@ def cmd_collect(args) -> int:
 
             try:
                 completed_inputs = load_resume_completed_input_ids(output_file, options.image)
+                comparison = expected_inputs.compare_completed(completed_inputs)
             except Exception as exc:
                 error = f"completion verification failed after scraper exit 0: {exc}"
                 _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
                 return 1
 
-            unexpected_inputs = completed_inputs - expected_inputs
-            if unexpected_inputs:
+            if comparison.unexpected:
                 error = (
                     "resume completion state does not match this run: "
-                    f"{len(unexpected_inputs)} unexpected completed input(s)"
+                    f"{comparison.unexpected} unexpected completed input(s)"
                 )
                 _mark_run(conn, run_id, status="failed", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
                 return 1
 
-            missing_inputs = expected_inputs - completed_inputs
-            if missing_inputs:
+            if comparison.missing:
                 error = (
                     "scraper exited before all planned searches completed: "
-                    f"completed {len(completed_inputs)}/{len(expected_inputs)}"
+                    f"completed {comparison.matched}/{len(expected_inputs)}"
                 )
                 _mark_run(conn, run_id, status="interrupted", exit_code=scraper_exit_code, error=error)
                 print(error, file=sys.stderr)
@@ -526,17 +522,16 @@ def cmd_ingest(args) -> int:
         try:
             expected_inputs = expected_resume_input_ids(area, queries, float(row["cell_km"]))
             completed_inputs = load_resume_completed_input_ids(expected, str(row["scraper_image"]))
+            comparison = expected_inputs.compare_completed(completed_inputs)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"ingest completion verification failed: {exc}", file=sys.stderr)
             return 2
 
-        unexpected_inputs = completed_inputs - expected_inputs
-        missing_inputs = expected_inputs - completed_inputs
-        if unexpected_inputs or missing_inputs:
+        if comparison.unexpected or comparison.missing:
             print(
                 "ingest requires verified complete crawl evidence: "
-                f"completed {len(completed_inputs)}/{len(expected_inputs)}, "
-                f"unexpected={len(unexpected_inputs)}",
+                f"completed {comparison.matched}/{len(expected_inputs)}, "
+                f"unexpected={comparison.unexpected}",
                 file=sys.stderr,
             )
             return 2
