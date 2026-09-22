@@ -193,11 +193,11 @@ def test_unexpected_resume_identity_fails_closed(tmp_path, monkeypatch):
 def test_complete_resume_state_allows_ingest_with_atomic_finalization(tmp_path, monkeypatch):
     args = _collect_args(tmp_path)
     area = AreaConfig("smoke", BoundingBox(21.52, 39.17, 21.535, 39.185))
-    expected = expected_resume_input_ids(area, ["restaurant"], 2.0)
+    completed = set(expected_resume_input_ids(area, ["restaurant"], 2.0))
     calls = []
 
     monkeypatch.setattr(cli, "run_scraper", lambda _command: 0)
-    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: expected)
+    monkeypatch.setattr(cli, "load_resume_completed_input_ids", lambda _output, _image: set(completed))
 
     def fake_ingest(conn, run_id, *_args, finalize_run=None, **_kwargs):
         calls.append(finalize_run)
