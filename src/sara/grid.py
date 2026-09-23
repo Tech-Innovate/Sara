@@ -46,6 +46,11 @@ def iter_grid_origins(bbox: BoundingBox, cell_km: float) -> Iterator[tuple[float
         lat += lat_step
 
 
+def grid_steps(bbox: BoundingBox, cell_km: float) -> tuple[float, float]:
+    """Public accessor for the authoritative per-axis grid step sizes."""
+    return _grid_steps(bbox, cell_km)
+
+
 def _grid_steps(bbox: BoundingBox, cell_km: float) -> tuple[float, float]:
     if not math.isfinite(cell_km) or cell_km <= 0:
         raise ValueError("cell_km must be a finite value greater than zero")

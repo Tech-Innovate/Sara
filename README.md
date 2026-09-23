@@ -181,6 +181,33 @@ Boundaries of this feature:
 - The generated plan is deterministic for a given database snapshot and arguments (no timestamps, absolute paths, host or PID in the payload) and is written exclusively, never overwritten. Retain it as frozen evidence; the printed SHA-256 identifies the exact bytes.
 - Exact search cost comes from the real per-bin grid estimator; adjacent selected bins are never merged because merging changes half-cell origins and search counts. `search_delta_vs_uniform` is signed: it can be positive when independent per-bin anchoring plans more searches than one uniform pass.
 
+## Executing a recovery plan (recovery-run)
+
+`recovery-plan` produces a frozen, read-only artifact. `recovery-run` is the separate authority layer that may consume it:
+
+```bash
+sara --db data/sara.db recovery-run \
+  --plan recovery-plan.json \
+  --plan-sha256 <exact 64-hex sha256 of the plan bytes> \
+  --expected-searches <exact plan search count> \
+  --output-dir output/recovery
+```
+
+Boundaries of this command:
+
+- Planner and executor are separate authority layers. A visible plan file is not by itself permission to execute; the exact plan-byte execution key (SHA-256) and the exact modeled search count must both be acknowledged by the operator.
+- The expected-search count acknowledges modeled grid/query inputs. It is not an HTTP/request/cost bound.
+- Plans generated from tag-based scraper images (such as `gosom/google-maps-scraper:v1.18.1`) are evidence-only. Executable plans require a digest-pinned source run (`name@sha256:...`); collect future baselines with a digest-pinned `--image`.
+- `--dry-run` validates everything read-only and prints the deterministic execution preview, but does not check execution history (`execution_history=not_checked`) and creates no schema, directories, locks, snapshots, runs, or Docker.
+- The same exact plan bytes execute at most once per database. Completed executions reject duplicate replay with exit 2 and reprint the stored result; interrupted or failed executions resume, skipping already-complete children.
+- Each selected bin runs as an independent child Sara run with its own bbox, query snapshot, output directory, and lock. Bins are never merged. Child `runs.started_at` is the earliest possible acquisition-observation ordering proxy for the logical child, not an exact per-record observation time.
+- Child containers get deterministic names (`sara-rr-<child run id>`) and ownership labels. Before any launch, the executor reconciles container liveness: a matching container still running blocks a relaunch; a wrong-label container is rejected untouched.
+- A crash between acquisition and ingestion is recoverable: on retry, complete resume evidence for a child is ingested directly without launching Docker again.
+- Proxy support is hash-bound: the plan records only `proxy_sha256`; a supplied proxy file must match it exactly and is re-hashed before every launch. The local path remains a trust boundary against any concurrent actor with write/rename access.
+- The completion result separates `source_increment_businesses` (recovery membership beyond the source run's *current* canonical membership) from `globally_new_businesses` (canonical first-discovery). Adjacent bins share inclusive boundaries, so union metrics use `DISTINCT` counts, never summed child counts.
+- If final reporting fails after completion, the stored `result_json` remains recoverable and a later invocation reprints it.
+- Recovery execution does not prove completeness, policy optimality, or calibration generalization.
+
 ## Inspect coverage
 
 ```bash

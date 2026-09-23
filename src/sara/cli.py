@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import sqlite3
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -21,16 +22,41 @@ from .scraper import (
     command_for_display,
     expected_resume_input_ids,
     load_resume_completed_input_ids,
+    recovery_query_snapshot_bytes,
     run_scraper,
+    validate_resume_query_identities,
+    validate_recovery_queries,
 )
 from .recovery import (
     COMPLETION_CLAIM,
+    PlanRejected,
     RecoveryPolicy,
     build_recovery_plan,
+    parse_execution_plan,
     project_source_config,
     serialize_recovery_plan,
+    validate_child_coordinate_precision,
+    validate_digest_pinned_image,
 )
-from .storage import connect, connect_readonly, ingest_records, iter_jsonl, utc_now
+from .storage import (
+    RecoverySchemaError,
+    SourceRunRejected,
+    bind_plan_to_source,
+    connect,
+    connect_existing,
+    connect_readonly,
+    create_recovery_child_run,
+    ensure_recovery_schema,
+    finalize_recovery_execution,
+    ingest_records,
+    iter_jsonl,
+    load_recovery_source_run,
+    register_recovery_execution,
+    resume_recovery_parent,
+    set_recovery_parent_status,
+    utc_now,
+    verify_recovery_schema,
+)
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -91,6 +117,17 @@ def _parser() -> argparse.ArgumentParser:
     recovery_plan.add_argument("--tier-b-min", type=int, required=True)
     recovery_plan.add_argument("--policy-id", required=True)
     recovery_plan.add_argument("--output", required=True)
+
+    recovery_run = sub.add_parser(
+        "recovery-run",
+        help="Execute one frozen recovery plan as independent resumable child runs",
+    )
+    recovery_run.add_argument("--plan", required=True)
+    recovery_run.add_argument("--plan-sha256", required=True)
+    recovery_run.add_argument("--expected-searches", type=int, required=True)
+    recovery_run.add_argument("--output-dir", required=True)
+    recovery_run.add_argument("--proxy-file")
+    recovery_run.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -684,147 +721,18 @@ def cmd_recovery_plan(args) -> int:
     try:
         # One read snapshot covers the source row and business membership.
         conn.execute("BEGIN")
-        row = conn.execute(
-            """
-            SELECT id, area_name, bbox_json, cell_km, depth, queries_json,
-                   scraper_image, config_json, status, started_at, finished_at,
-                   exit_code, unique_seen
-            FROM runs WHERE id = ?
-            """,
-            (run_id,),
-        ).fetchone()
-        if row is None:
-            return reject(f"run_id {run_id} does not exist")
-        if row["status"] != "complete":
-            return reject(f"run_id {run_id} is not complete (status={row['status']!r})")
-        if not isinstance(row["finished_at"], str) or not row["finished_at"].strip():
-            return reject("complete run has an invalid finished_at timestamp")
-        if not isinstance(row["started_at"], str) or not row["started_at"].strip():
-            return reject("run has an invalid started_at timestamp")
-        if row["exit_code"] is not None and (
-            isinstance(row["exit_code"], bool) or not isinstance(row["exit_code"], int)
-        ):
-            return reject("run has an invalid recorded exit_code")
-
-        if not isinstance(row["bbox_json"], str):
-            return reject("run bbox_json is not stored as text")
         try:
-            bbox_raw = json.loads(row["bbox_json"], parse_constant=_reject_json_constant)
-        except (TypeError, ValueError) as exc:
-            return reject(f"run has invalid recorded bbox: {exc}")
-        # Validate the intermediate object explicitly: booleans compare
-        # equal to 0.0/1.0 in Python, so range checks alone would accept
-        # JSON true/false as corrupted-but-usable coordinates.
-        if not isinstance(bbox_raw, dict):
-            return reject("run has invalid recorded bbox: expected a JSON object")
-        bbox_keys = ("min_lat", "min_lon", "max_lat", "max_lon")
-        for key in bbox_keys:
-            if key not in bbox_raw:
-                return reject(f"run has invalid recorded bbox: missing {key}")
-        for key, value in bbox_raw.items():
-            if key not in bbox_keys:
-                return reject(f"run has invalid recorded bbox: unexpected key {key!r}")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                return reject(f"run has invalid recorded bbox: {key} must be a number")
-        try:
-            bbox = BoundingBox(
-                min_lat=bbox_raw["min_lat"],
-                min_lon=bbox_raw["min_lon"],
-                max_lat=bbox_raw["max_lat"],
-                max_lon=bbox_raw["max_lon"],
-            )
-            bbox.validate()
+            record = load_recovery_source_run(conn, run_id)
         except ValueError as exc:
-            return reject(f"run has invalid recorded bbox: {exc}")
-
-        if not isinstance(row["queries_json"], str):
-            return reject("run queries_json is not stored as text")
-        try:
-            queries = json.loads(row["queries_json"], parse_constant=_reject_json_constant)
-        except (TypeError, ValueError) as exc:
-            return reject(f"run has invalid recorded queries: {exc}")
-        if (
-            not isinstance(queries, list)
-            or not queries
-            or not all(isinstance(query, str) and query for query in queries)
-        ):
-            return reject("run has invalid recorded query configuration")
-
-        config_raw = row["config_json"]
-        if not isinstance(config_raw, str) or not config_raw:
-            return reject("run has no recorded configuration text")
-        try:
-            config = json.loads(config_raw, parse_constant=_reject_json_constant)
-        except (TypeError, ValueError) as exc:
-            return reject(f"run has invalid recorded configuration: {exc}")
-        if not isinstance(config, dict):
-            return reject("run configuration is not a JSON object")
-        if config.get("resume") is not True:
-            return reject("recovery planning requires a run recorded with resume=true")
-        if config.get("strict_bounds") is not True:
-            return reject("recovery planning requires a run recorded with strict_bounds=true")
-
-        source_cell_km = row["cell_km"]
-        if (
-            isinstance(source_cell_km, bool)
-            or not isinstance(source_cell_km, (int, float))
-            or not math.isfinite(source_cell_km)
-            or source_cell_km <= 0
-        ):
-            return reject("run has an invalid recorded cell size")
+            return reject(str(exc))
+        row = record["row"]
+        bbox = record["bbox"]
+        queries = record["queries"]
+        config = record["config"]
+        config_raw = record["config_raw"]
+        source_cell_km = record["source_cell_km"]
         if args.recovery_cell_km >= source_cell_km:
             return reject("recovery_cell_km must be strictly finer than the source cell size")
-
-        # Cross-check the denormalized run columns against the recorded
-        # configuration so a contradictory or corrupted run row cannot
-        # produce a plan whose visible fields and configuration hash refer
-        # to different crawl configurations.
-        def config_mismatch(field: str) -> int:
-            return reject(
-                f"run {field} disagrees with the recorded configuration; "
-                "the run row is internally inconsistent"
-            )
-
-        if not isinstance(config.get("area_name"), str) or config["area_name"] != row["area_name"]:
-            return config_mismatch("area_name")
-        if not isinstance(config.get("image"), str) or config["image"] != row["scraper_image"]:
-            return config_mismatch("scraper_image")
-        recorded_bbox = config.get("bbox")
-        if not isinstance(recorded_bbox, dict):
-            return config_mismatch("bbox")
-        for key, value in (
-            ("min_lat", bbox.min_lat),
-            ("min_lon", bbox.min_lon),
-            ("max_lat", bbox.max_lat),
-            ("max_lon", bbox.max_lon),
-        ):
-            recorded = recorded_bbox.get(key)
-            # Plain numeric equality: no float() coercion, so arbitrarily
-            # large JSON integers cannot raise OverflowError, and NaN or
-            # infinity simply compare unequal and are rejected here.
-            if (
-                isinstance(recorded, bool)
-                or not isinstance(recorded, (int, float))
-                or recorded != value
-            ):
-                return config_mismatch("bbox")
-        if config.get("queries") != queries:
-            return config_mismatch("queries")
-        recorded_cell = config.get("cell_km")
-        if (
-            isinstance(recorded_cell, bool)
-            or not isinstance(recorded_cell, (int, float))
-            or recorded_cell != source_cell_km
-        ):
-            return config_mismatch("cell_km")
-        recorded_depth = config.get("depth")
-        if (
-            isinstance(recorded_depth, bool)
-            or not isinstance(recorded_depth, int)
-            or not isinstance(row["depth"], int)
-            or recorded_depth != row["depth"]
-        ):
-            return config_mismatch("depth")
 
         member_count = conn.execute(
             "SELECT COUNT(*) AS n FROM run_businesses WHERE run_id = ?", (run_id,)
@@ -958,6 +866,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_stats(args)
         if args.command == "recovery-plan":
             return cmd_recovery_plan(args)
+        if args.command == "recovery-run":
+            return cmd_recovery_run(args)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -966,3 +876,668 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+# ---------------------------------------------------------------------------
+# recovery-run: plan-consuming execution layer
+# ---------------------------------------------------------------------------
+
+_RECOVERY_LABEL_PLAN = "sara.recovery.plan_sha256"
+_RECOVERY_LABEL_RUN = "sara.recovery.run_id"
+
+
+class _ChildFailure(Exception):
+    def __init__(self, *, status: str, process_exit: int, error: str):
+        super().__init__(error)
+        self.status = status
+        self.process_exit = process_exit
+        self.error = error
+
+
+def _recovery_child_run_id(plan_sha256: str, row: int, column: int) -> str:
+    digest = hashlib.sha256()
+    digest.update(plan_sha256.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(str(row).encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(str(column).encode("utf-8"))
+    return f"rr-{digest.hexdigest()[:40]}"
+
+
+def _recovery_container_name(run_id: str) -> str:
+    return f"sara-rr-{run_id}"
+
+
+def _docker_inspect_container(name: str) -> dict | None:
+    """Inspect a deterministic container name; fail closed on ambiguity."""
+    completed = subprocess.run(
+        ["docker", "inspect", name], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr or ""
+        if "no such object" in stderr.lower():
+            return None
+        raise RuntimeError(
+            f"docker inspect failed for {name}: {stderr.strip() or completed.returncode}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"docker inspect returned ambiguous output for {name}") from exc
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise RuntimeError(f"docker inspect returned ambiguous output for {name}")
+    info = payload[0]
+    labels = (info.get("Config") or {}).get("Labels") or {}
+    state = info.get("State") or {}
+    return {"running": state.get("Running") is True, "labels": dict(labels)}
+
+
+def _recovery_child_config_json(plan, bin_record, proxy_sha256, plan_sha256) -> str:
+    config = plan.config
+    payload = {
+        "area_name": f"{plan.area_name}-rr-r{bin_record.row}-c{bin_record.column}",
+        "bbox": {
+            "min_lat": bin_record.bbox.min_lat,
+            "min_lon": bin_record.bbox.min_lon,
+            "max_lat": bin_record.bbox.max_lat,
+            "max_lon": bin_record.bbox.max_lon,
+        },
+        "queries": list(plan.queries),
+        "cell_km": plan.recovery_cell_km,
+        "depth": plan.depth,
+        "concurrency": config["concurrency"],
+        "browser_pool_size": config["browser_pool_size"],
+        "pages_per_browser": config["pages_per_browser"],
+        "lang": config["lang"],
+        "zoom": config["zoom"],
+        "resume": True,
+        "image": plan.scraper_image,
+        "proxy_sha256": proxy_sha256,
+        "strict_bounds": True,
+        "recovery": {
+            "plan_sha256": plan_sha256,
+            "plan_schema_version": 1,
+            "source_run_id": plan.source_run_id,
+            "policy_id": plan.policy.policy_id,
+            "row": bin_record.row,
+            "column": bin_record.column,
+            "tier": bin_record.tier,
+            "planned_searches": bin_record.planned_searches,
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _write_plan_snapshot(snapshot_path: Path, data: bytes) -> None:
+    created = False
+    try:
+        fd = os.open(
+            snapshot_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        created = True
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("snapshot write made no progress")
+                view = view[written:]
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if created:
+            try:
+                snapshot_path.unlink()
+            except OSError:
+                pass
+        raise
+    except BaseException:
+        if created:
+            try:
+                snapshot_path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _guard_child_progress_report(plan_sha256, conn, bin_record, run_id, completed, total) -> int:
+    """Report one committed child; a reporting failure stops scheduling."""
+    try:
+        print(
+            f"recovery child complete: r{bin_record.row}-c{bin_record.column} "
+            f"run_id={run_id} ({completed}/{total})"
+        )
+        return 0
+    except KeyboardInterrupt:
+        set_recovery_parent_status(
+            conn, plan_sha256, "interrupted",
+            f"child r{bin_record.row}-c{bin_record.column} completed; "
+            "reporting interrupted; no further bins scheduled",
+        )
+        conn.commit()
+        return 130
+    except Exception as exc:
+        set_recovery_parent_status(
+            conn, plan_sha256, "interrupted",
+            f"child r{bin_record.row}-c{bin_record.column} completed; "
+            f"reporting failed ({exc}); no further bins scheduled",
+        )
+        conn.commit()
+        return 1
+
+
+def _guard_final_report(plan_sha256, report) -> int:
+    try:
+        report()
+        return 0
+    except KeyboardInterrupt:
+        print("recovery execution complete; reporting interrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"recovery execution complete but reporting failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_recovery_run(args) -> int:
+    def reject(message: str) -> int:
+        print(message, file=sys.stderr)
+        return 2
+
+    plan_path = Path(args.plan)
+    try:
+        data = plan_path.read_bytes()
+    except OSError as exc:
+        return reject(f"cannot read plan file: {exc}")
+    plan_sha256 = hashlib.sha256(data).hexdigest()
+
+    supplied_sha = str(args.plan_sha256 or "").strip().lower()
+    if supplied_sha != plan_sha256:
+        return reject(
+            "plan SHA-256 mismatch: the exact plan-byte execution key does not match --plan-sha256"
+        )
+
+    try:
+        plan = parse_execution_plan(data)
+    except PlanRejected as exc:
+        return reject(f"plan rejected: {exc}")
+
+    if args.expected_searches != plan.targeted_searches:
+        return reject(
+            f"--expected-searches ({args.expected_searches}) does not equal the plan's "
+            f"recomputed targeted searches ({plan.targeted_searches})"
+        )
+
+    try:
+        validate_recovery_queries(list(plan.queries))
+        for bin_record in plan.selected_bins:
+            validate_child_coordinate_precision(bin_record.bbox, plan.recovery_cell_km)
+        validate_digest_pinned_image(plan.scraper_image)
+    except (PlanRejected, ValueError) as exc:
+        return reject(f"plan rejected: {exc}")
+
+    proxy_path: Path | None = None
+    plan_proxy_sha = plan.config.get("proxy_sha256")
+    if plan_proxy_sha is None:
+        if args.proxy_file:
+            return reject("plan records no proxy but --proxy-file was supplied")
+    else:
+        if not args.proxy_file:
+            return reject("plan requires a proxy file but --proxy-file was not supplied")
+        proxy_path = Path(args.proxy_file)
+        try:
+            proxy_bytes = proxy_path.read_bytes()
+        except OSError as exc:
+            return reject(f"cannot read proxy file: {exc}")
+        if hashlib.sha256(proxy_bytes).hexdigest() != plan_proxy_sha:
+            return reject("proxy file SHA-256 does not match the plan's recorded proxy hash")
+
+    try:
+        conn = connect_readonly(args.db)
+    except FileNotFoundError as exc:
+        return reject(str(exc))
+    try:
+        conn.execute("BEGIN")
+        bind_plan_to_source(conn, plan)
+    except (SourceRunRejected, ValueError) as exc:
+        return reject(str(exc))
+    except sqlite3.Error as exc:
+        print(f"recovery-run failed during source binding: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    output_root = Path(args.output_dir).resolve()
+    execution_root = output_root / plan_sha256
+
+    container_names = {
+        (b.row, b.column): _recovery_container_name(_recovery_child_run_id(plan_sha256, b.row, b.column))
+        for b in plan.selected_bins
+    }
+
+    if args.dry_run:
+        print(f"plan_sha256={plan_sha256}")
+        print(f"selected_bins={len(plan.selected_bins)} planned_searches={plan.targeted_searches}")
+        print("execution_history=not_checked")
+        for bin_record in sorted(plan.selected_bins, key=lambda b: (b.row, b.column)):
+            run_id = _recovery_child_run_id(plan_sha256, bin_record.row, bin_record.column)
+            bin_dir = execution_root / "bins" / f"r{bin_record.row}-c{bin_record.column}"
+            area = AreaConfig(f"{plan.area_name}-rr-r{bin_record.row}-c{bin_record.column}", bin_record.bbox)
+            options = ScrapeOptions(
+                cell_km=plan.recovery_cell_km, depth=plan.depth,
+                concurrency=plan.config["concurrency"],
+                browser_pool_size=plan.config["browser_pool_size"],
+                pages_per_browser=plan.config["pages_per_browser"],
+                lang=plan.config["lang"], zoom=plan.config["zoom"],
+                resume=True, image=plan.scraper_image, proxy_file=proxy_path,
+            )
+            command = build_docker_command(
+                area=area, queries_file=bin_dir / "queries.txt",
+                output_file=bin_dir / "results.jsonl", options=options,
+                prepare_paths=False,
+                container_name=container_names[(bin_record.row, bin_record.column)],
+                labels={
+                    _RECOVERY_LABEL_PLAN: plan_sha256,
+                    _RECOVERY_LABEL_RUN: run_id,
+                },
+            )
+            print(
+                f"bin r{bin_record.row}-c{bin_record.column} tier={bin_record.tier} "
+                f"searches={bin_record.planned_searches} run_id={run_id} "
+                f"container={container_names[(bin_record.row, bin_record.column)]}"
+            )
+            print(f"  {command_for_display(command)}")
+        return 0
+
+    if not plan.selected_bins:
+        print("no selected recovery bins; nothing to execute")
+        return 0
+
+    parent_lock = RunLock(execution_root / ".sara-recovery.lock")
+    try:
+        parent_lock.acquire()
+    except RuntimeError as exc:
+        return reject(f"recovery execution is already active: {exc}")
+
+    try:
+        conn = None
+        try:
+            conn = connect_existing(args.db)
+        except FileNotFoundError as exc:
+            return reject(str(exc))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            bind_plan_to_source(conn, plan)
+            ensure_recovery_schema(conn)
+            verify_recovery_schema(conn)
+            snapshot_path = execution_root / "recovery-plan.json"
+            state = register_recovery_execution(
+                conn, plan=plan, plan_sha256=plan_sha256,
+                output_root=str(execution_root), plan_snapshot_path=str(snapshot_path),
+                container_names=container_names,
+            )
+            conn.commit()
+        except (SourceRunRejected, RecoverySchemaError, PlanRejected) as exc:
+            conn.rollback()
+            return reject(str(exc))
+        except (sqlite3.Error, Exception) as exc:  # noqa: BLE001 - registration must fail closed
+            conn.rollback()
+            print(f"recovery-run registration failed: {exc}", file=sys.stderr)
+            return 1
+
+        if state == "complete":
+            row = conn.execute(
+                "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?",
+                (plan_sha256,),
+            ).fetchone()
+            print("recovery-run already complete")
+            if row and row["result_json"]:
+                print(row["result_json"])
+            return 2
+        if state == "resumed":
+            conn.execute("BEGIN IMMEDIATE")
+            resume_recovery_parent(conn, plan_sha256)
+            conn.commit()
+
+        execution_root.mkdir(parents=True, exist_ok=True)
+        snapshot_path = execution_root / "recovery-plan.json"
+        if snapshot_path.exists():
+            import hashlib as _hashlib
+            existing_digest = _hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+            if existing_digest != plan_sha256:
+                started = conn.execute(
+                    "SELECT COUNT(*) AS n FROM recovery_execution_bins "
+                    "WHERE plan_sha256 = ? AND run_id IS NOT NULL",
+                    (plan_sha256,),
+                ).fetchone()["n"]
+                if started:
+                    return reject(
+                        "existing plan snapshot does not match the authorized plan bytes "
+                        "and at least one child has started; failing closed"
+                    )
+                snapshot_path.unlink()
+                _write_plan_snapshot(snapshot_path, data)
+        else:
+            try:
+                _write_plan_snapshot(snapshot_path, data)
+            except OSError as exc:
+                conn.execute("BEGIN IMMEDIATE")
+                set_recovery_parent_status(
+                    conn, plan_sha256, "failed", f"plan snapshot write failed: {exc}"
+                )
+                conn.commit()
+                print(f"recovery-run failed to write plan snapshot: {exc}", file=sys.stderr)
+                return 1
+
+        mappings = {
+            (m["row"], m["column"]): m
+            for m in conn.execute(
+                "SELECT row, column, tier, run_id, container_name FROM recovery_execution_bins "
+                "WHERE plan_sha256 = ? ORDER BY row, column",
+                (plan_sha256,),
+            )
+        }
+        ordered_bins = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))
+        total = len(ordered_bins)
+        completed_count = 0
+        for bin_record in ordered_bins:
+            mapping = mappings[(bin_record.row, bin_record.column)]
+            if mapping["run_id"] is not None:
+                child_row = conn.execute(
+                    "SELECT status FROM runs WHERE id = ?", (mapping["run_id"],)
+                ).fetchone()
+                if child_row is not None and child_row["status"] == "complete":
+                    completed_count += 1
+                    continue
+            try:
+                outcome = _execute_recovery_child(
+                    conn, plan, plan_sha256, execution_root, bin_record,
+                    mapping, proxy_path, container_names[(bin_record.row, bin_record.column)],
+                )
+            except _ChildFailure as failure:
+                conn.execute("BEGIN IMMEDIATE")
+                set_recovery_parent_status(conn, plan_sha256, failure.status, failure.error)
+                conn.commit()
+                print(failure.error, file=sys.stderr)
+                return failure.process_exit
+            except KeyboardInterrupt:
+                conn.execute("BEGIN IMMEDIATE")
+                set_recovery_parent_status(
+                    conn, plan_sha256, "interrupted", "recovery-run interrupted"
+                )
+                conn.commit()
+                print("recovery-run interrupted", file=sys.stderr)
+                return 130
+            if outcome == "complete":
+                completed_count += 1
+                report_rc = _guard_child_progress_report(
+                    plan_sha256, conn, bin_record,
+                    mapping["run_id"] or _recovery_child_run_id(
+                        plan_sha256, bin_record.row, bin_record.column
+                    ),
+                    completed_count, total,
+                )
+                if report_rc != 0:
+                    return report_rc
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            metrics = finalize_recovery_execution(
+                conn, plan_sha256, plan.source_run_id, plan.associated_businesses
+            )
+            conn.commit()
+        except (RecoverySchemaError, sqlite3.Error) as exc:
+            conn.rollback()
+            print(f"recovery-run finalization failed: {exc}", file=sys.stderr)
+            return 1
+
+        result_json = conn.execute(
+            "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?",
+            (plan_sha256,),
+        ).fetchone()["result_json"]
+        return _guard_final_report(
+            plan_sha256,
+            lambda: (
+                print(f"recovery complete: {json.dumps(metrics, ensure_ascii=False, sort_keys=True)}"),
+                print(f"result_json={result_json}"),
+            ),
+        )
+    finally:
+        parent_lock.release()
+
+
+def _execute_recovery_child(
+    conn, plan, plan_sha256, execution_root, bin_record, mapping, proxy_path, container_name
+) -> str:
+    row, column = bin_record.row, bin_record.column
+    run_id = _recovery_child_run_id(plan_sha256, row, column)
+    bin_dir = execution_root / "bins" / f"r{row}-c{column}"
+    output_file = bin_dir / "results.jsonl"
+    area = AreaConfig(f"{plan.area_name}-rr-r{row}-c{column}", bin_record.bbox)
+
+    child_lock = RunLock(bin_dir / ".sara.lock")
+    try:
+        child_lock.acquire()
+    except RuntimeError as exc:
+        raise _ChildFailure(status="failed", process_exit=1, error=str(exc)) from exc
+
+    def child_mark(status: str, exit_code: int | None, error: str | None) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, error = ? WHERE id = ?",
+            (status, utc_now(), exit_code, error, run_id),
+        )
+        conn.commit()
+
+    try:
+        inspect = _docker_inspect_container(container_name)
+        if inspect is not None:
+            labels = inspect["labels"]
+            if labels.get(_RECOVERY_LABEL_PLAN) != plan_sha256 or labels.get(
+                _RECOVERY_LABEL_RUN
+            ) != run_id:
+                raise _ChildFailure(
+                    status="failed", process_exit=2,
+                    error=(
+                        f"container name {container_name} exists with wrong ownership labels; "
+                        "refusing to touch an unrelated container"
+                    ),
+                )
+            if inspect["running"]:
+                raise _ChildFailure(
+                    status="failed", process_exit=2,
+                    error=(
+                        f"matching recovery container {container_name} is still active; "
+                        "refusing to launch a second acquisition"
+                    ),
+                )
+
+        options = ScrapeOptions(
+            cell_km=plan.recovery_cell_km, depth=plan.depth,
+            concurrency=plan.config["concurrency"],
+            browser_pool_size=plan.config["browser_pool_size"],
+            pages_per_browser=plan.config["pages_per_browser"],
+            lang=plan.config["lang"], zoom=plan.config["zoom"],
+            resume=True, image=plan.scraper_image, proxy_file=proxy_path,
+        )
+        options.validate()
+        expected_inputs = expected_resume_input_ids(area, list(plan.queries), plan.recovery_cell_km)
+        if len(expected_inputs) != (bin_record.planned_searches or 0):
+            raise _ChildFailure(
+                status="failed", process_exit=2,
+                error=(
+                    "live completion model disagrees with the plan's recorded per-bin "
+                    "search count; plan/coder compatibility broken"
+                ),
+            )
+        proxy_sha = plan.config.get("proxy_sha256")
+        if proxy_path is not None:
+            current = hashlib.sha256(proxy_path.read_bytes()).hexdigest()
+            if current != proxy_sha:
+                raise _ChildFailure(
+                    status="failed", process_exit=2,
+                    error="proxy file changed since verification; refusing to launch",
+                )
+        child_config = _recovery_child_config_json(plan, bin_record, proxy_sha, plan_sha256)
+        bbox_json = json.dumps(bin_record.bbox.__dict__, sort_keys=True)
+        queries_json = json.dumps(list(plan.queries), ensure_ascii=False)
+
+        existing_run = None
+        if mapping["run_id"] is not None:
+            existing_run = conn.execute(
+                "SELECT * FROM runs WHERE id = ?", (mapping["run_id"],)
+            ).fetchone()
+            if existing_run is None:
+                raise _ChildFailure(
+                    status="failed", process_exit=2,
+                    error=f"mapped child run {mapping['run_id']} does not exist",
+                )
+            if (
+                existing_run["config_json"] != child_config
+                or existing_run["bbox_json"] != bbox_json
+                or existing_run["raw_path"] != str(output_file)
+            ):
+                raise _ChildFailure(
+                    status="failed", process_exit=2,
+                    error="existing child run does not match the plan-derived configuration",
+                )
+            if existing_run["status"] == "complete":
+                return "already_complete"
+
+            if inspect is None:
+                try:
+                    completed_ids = load_resume_completed_input_ids(
+                        output_file, plan.scraper_image
+                    )
+                except RuntimeError as exc:
+                    raise _ChildFailure(
+                        status="failed", process_exit=1,
+                        error=f"existing resume evidence is invalid: {exc}",
+                    ) from exc
+                comparison = expected_inputs.compare_completed(completed_ids)
+                if comparison.unexpected:
+                    raise _ChildFailure(
+                        status="failed", process_exit=1,
+                        error="existing resume evidence contains unexpected input IDs",
+                    )
+                if comparison.missing == 0:
+                    stats = ingest_records(
+                        conn, mapping["run_id"], iter_jsonl(output_file),
+                        bbox=bin_record.bbox, finalize_run=("complete", 0, None),
+                    )
+                    print(
+                        "recovery child ingested from existing completion evidence: "
+                        f"r{row}-c{column} unique_seen={stats.unique_seen}"
+                    )
+                    return "complete"
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE runs SET status = 'running', finished_at = NULL, error = NULL, "
+                "exit_code = NULL WHERE id = ?",
+                (mapping["run_id"],),
+            )
+            conn.commit()
+        else:
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            query_snapshot = bin_dir / "queries.txt"
+            snapshot_bytes = recovery_query_snapshot_bytes(list(plan.queries))
+            if query_snapshot.exists():
+                if query_snapshot.read_bytes() != snapshot_bytes:
+                    raise _ChildFailure(
+                        status="failed", process_exit=2,
+                        error="existing child query snapshot does not match the plan queries",
+                    )
+            else:
+                with open(query_snapshot, "wb") as handle:
+                    handle.write(snapshot_bytes)
+            collision = conn.execute(
+                "SELECT id FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if collision is not None:
+                raise _ChildFailure(
+                    status="failed", process_exit=2,
+                    error=f"derived child run ID {run_id} collides with an unrelated run",
+                )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                create_recovery_child_run(
+                    conn,
+                    run_id=run_id,
+                    area_name=area.name,
+                    bbox_json=bbox_json,
+                    cell_km=plan.recovery_cell_km,
+                    depth=plan.depth,
+                    queries_json=queries_json,
+                    scraper_image=plan.scraper_image,
+                    config_json=child_config,
+                    raw_path=str(output_file),
+                    plan_sha256=plan_sha256,
+                    row=row,
+                    column=column,
+                )
+                conn.commit()
+            except (RecoverySchemaError, sqlite3.Error) as exc:
+                conn.rollback()
+                raise _ChildFailure(
+                    status="failed", process_exit=1,
+                    error=f"child run registration failed: {exc}",
+                ) from exc
+
+        try:
+            command = build_docker_command(
+                area=area, queries_file=bin_dir / "queries.txt",
+                output_file=output_file, options=options,
+                container_name=container_name,
+                labels={_RECOVERY_LABEL_PLAN: plan_sha256, _RECOVERY_LABEL_RUN: run_id},
+            )
+        except (OSError, RuntimeError) as exc:
+            child_mark("failed", None, f"child preparation failed: {exc}")
+            raise _ChildFailure(
+                status="failed", process_exit=1, error=f"child preparation failed: {exc}"
+            ) from exc
+
+        print(command_for_display(command))
+        scraper_exit = run_scraper(command)
+        if scraper_exit != 0:
+            error = f"scraper failed with exit code {scraper_exit}"
+            child_mark("failed", scraper_exit, error)
+            raise _ChildFailure(status="failed", process_exit=1, error=error)
+
+        try:
+            completed_ids = load_resume_completed_input_ids(output_file, plan.scraper_image)
+            comparison = expected_inputs.compare_completed(completed_ids)
+        except RuntimeError as exc:
+            error = f"completion verification failed after scraper exit 0: {exc}"
+            child_mark("failed", 0, error)
+            raise _ChildFailure(status="failed", process_exit=1, error=error) from exc
+
+        if comparison.unexpected:
+            error = (
+                f"resume completion state does not match this child: "
+                f"{comparison.unexpected} unexpected completed input(s)"
+            )
+            child_mark("failed", 0, error)
+            raise _ChildFailure(status="failed", process_exit=1, error=error)
+        if comparison.missing:
+            error = (
+                "scraper exited before all planned child searches completed: "
+                f"completed {comparison.matched}/{len(expected_inputs)}"
+            )
+            child_mark("interrupted", 0, error)
+            raise _ChildFailure(status="interrupted", process_exit=130, error=error)
+
+        try:
+            ingest_records(
+                conn, run_id, iter_jsonl(output_file),
+                bbox=bin_record.bbox, finalize_run=("complete", 0, None),
+            )
+        except Exception as exc:
+            error = f"recovery child ingestion failed: {exc}"
+            child_mark("failed", 0, error)
+            raise _ChildFailure(status="failed", process_exit=1, error=error) from exc
+        return "complete"
+    finally:
+        child_lock.release()
