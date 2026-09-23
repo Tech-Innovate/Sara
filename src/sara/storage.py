@@ -129,6 +129,35 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_readonly(path: str | Path) -> sqlite3.Connection:
+    """Open an existing Sara database strictly read-only.
+
+    A nonexistent database is rejected, never created. No schema, migration
+    or journal-mode statement runs here. Read-only is enforced at SQLite
+    open time via a URI-escaped ``mode=ro`` connection plus
+    ``PRAGMA query_only`` where supported.
+
+    The guarantee is logical (no data/schema mutation); depending on
+    platform, SQLite version and journal state the driver may still touch
+    auxiliary lock/SHM files. ``immutable=1`` is deliberately not used.
+    """
+    db_path = Path(path)
+    if not db_path.is_file():
+        raise FileNotFoundError(f"database does not exist: {db_path}")
+    # Path.as_uri() percent-encodes spaces, '?', '#', '%' and non-ASCII and
+    # yields an absolute file: URI for POSIX and Windows drive layouts, so
+    # appending the query parameter is unambiguous.
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        # mode=ro already enforces read-only at the driver level.
+        pass
+    return conn
+
+
 def _text(value: Any) -> str | None:
     if value is None:
         return None

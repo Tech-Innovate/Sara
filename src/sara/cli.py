@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import socket
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -21,7 +23,8 @@ from .scraper import (
     load_resume_completed_input_ids,
     run_scraper,
 )
-from .storage import connect, ingest_records, iter_jsonl, utc_now
+from .recovery import RecoveryPolicy, build_recovery_plan, serialize_recovery_plan
+from .storage import connect, connect_readonly, ingest_records, iter_jsonl, utc_now
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -71,6 +74,17 @@ def _parser() -> argparse.ArgumentParser:
 
     stats = sub.add_parser("stats", help="Show run and canonical business counts")
     stats.add_argument("--limit", type=_positive_int, default=20)
+
+    recovery_plan = sub.add_parser(
+        "recovery-plan",
+        help="Plan finer-grid recovery from a completed run without executing anything",
+    )
+    recovery_plan.add_argument("--run-id", required=True)
+    recovery_plan.add_argument("--recovery-cell-km", type=float, required=True)
+    recovery_plan.add_argument("--tier-a-min", type=int, required=True)
+    recovery_plan.add_argument("--tier-b-min", type=int, required=True)
+    recovery_plan.add_argument("--policy-id", required=True)
+    recovery_plan.add_argument("--output", required=True)
     return parser
 
 
@@ -571,6 +585,209 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def cmd_recovery_plan(args) -> int:
+    run_id = _validate_run_id(args.run_id)
+    policy = RecoveryPolicy(
+        policy_id=args.policy_id,
+        tier_a_min=args.tier_a_min,
+        tier_b_min=args.tier_b_min,
+        recovery_cell_km=args.recovery_cell_km,
+    )
+    try:
+        policy.validate()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    output_path = Path(args.output)
+    if output_path.exists():
+        print(f"output path already exists; refusing to overwrite: {output_path}", file=sys.stderr)
+        return 2
+
+    def reject(message: str) -> int:
+        print(message, file=sys.stderr)
+        return 2
+
+    try:
+        conn = connect_readonly(args.db)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    try:
+        # One read snapshot covers the source row and business membership.
+        conn.execute("BEGIN")
+        row = conn.execute(
+            """
+            SELECT id, area_name, bbox_json, cell_km, depth, queries_json,
+                   scraper_image, config_json, status, started_at, finished_at,
+                   exit_code, unique_seen
+            FROM runs WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return reject(f"run_id {run_id} does not exist")
+        if row["status"] != "complete":
+            return reject(f"run_id {run_id} is not complete (status={row['status']!r})")
+        if not row["finished_at"]:
+            return reject("complete run has no finished_at timestamp")
+
+        try:
+            bbox = BoundingBox(**json.loads(row["bbox_json"]))
+            bbox.validate()
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return reject(f"run has invalid recorded bbox: {exc}")
+
+        try:
+            queries = json.loads(row["queries_json"])
+        except json.JSONDecodeError as exc:
+            return reject(f"run has invalid recorded queries: {exc}")
+        if (
+            not isinstance(queries, list)
+            or not queries
+            or not all(isinstance(query, str) and query for query in queries)
+        ):
+            return reject("run has invalid recorded query configuration")
+
+        config_raw = row["config_json"]
+        if not config_raw:
+            return reject("run has no recorded configuration")
+        try:
+            config = json.loads(config_raw)
+        except json.JSONDecodeError as exc:
+            return reject(f"run has invalid recorded configuration: {exc}")
+        if not isinstance(config, dict):
+            return reject("run configuration is not a JSON object")
+        if config.get("resume") is not True:
+            return reject("recovery planning requires a run recorded with resume=true")
+        if config.get("strict_bounds") is not True:
+            return reject("recovery planning requires a run recorded with strict_bounds=true")
+
+        source_cell_km = row["cell_km"]
+        if (
+            isinstance(source_cell_km, bool)
+            or not isinstance(source_cell_km, (int, float))
+            or not math.isfinite(source_cell_km)
+            or source_cell_km <= 0
+        ):
+            return reject("run has an invalid recorded cell size")
+        if args.recovery_cell_km >= source_cell_km:
+            return reject("recovery_cell_km must be strictly finer than the source cell size")
+
+        member_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM run_businesses WHERE run_id = ?", (run_id,)
+        ).fetchone()["n"]
+        if member_count != row["unique_seen"]:
+            return reject(
+                f"run membership count ({member_count}) does not match recorded "
+                f"unique_seen ({row['unique_seen']}); canonical state has changed"
+            )
+
+        coordinates: list[tuple[float, float]] = []
+        for business in conn.execute(
+            """
+            SELECT b.id, b.latitude, b.longitude, b.last_run_id
+            FROM run_businesses rb
+            JOIN businesses b ON b.id = rb.business_id
+            WHERE rb.run_id = ?
+            ORDER BY b.id
+            """,
+            (run_id,),
+        ):
+            if business["last_run_id"] != run_id:
+                return reject(
+                    f"business {business['id']} was last observed by a later run "
+                    f"({business['last_run_id']!r}); current coordinates are not "
+                    "safe evidence for this source run"
+                )
+            latitude = business["latitude"]
+            longitude = business["longitude"]
+            if latitude is None or longitude is None:
+                return reject(f"business {business['id']} has no recorded coordinates")
+            if not (
+                isinstance(latitude, (int, float))
+                and isinstance(longitude, (int, float))
+                and math.isfinite(latitude)
+                and math.isfinite(longitude)
+            ):
+                return reject(f"business {business['id']} has nonfinite coordinates")
+            coordinates.append((float(latitude), float(longitude)))
+
+        source_run = {
+            "id": row["id"],
+            "area_name": row["area_name"],
+            "bbox": {
+                "min_lat": bbox.min_lat,
+                "min_lon": bbox.min_lon,
+                "max_lat": bbox.max_lat,
+                "max_lon": bbox.max_lon,
+            },
+            "cell_km": source_cell_km,
+            "depth": row["depth"],
+            "queries": queries,
+            "query_count": len(queries),
+            "scraper_image": row["scraper_image"],
+            "status": row["status"],
+            "exit_code": row["exit_code"],
+            "strict_bounds": True,
+            "resume": True,
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "config_sha256": hashlib.sha256(config_raw.encode("utf-8")).hexdigest(),
+            "completion_claim": "recorded_complete_not_reverified_by_recovery_plan",
+        }
+
+        try:
+            plan = build_recovery_plan(
+                policy=policy,
+                source_run=source_run,
+                source_bbox=bbox,
+                source_cell_km=float(source_cell_km),
+                query_count=len(queries),
+                coordinates=coordinates,
+            )
+        except ValueError as exc:
+            return reject(str(exc))
+    except sqlite3.Error as exc:
+        print(f"recovery plan failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    data = serialize_recovery_plan(plan).encode("utf-8")
+    try:
+        fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return reject(f"output path already exists; refusing to overwrite: {output_path}")
+    except OSError as exc:
+        print(f"recovery plan failed to write output: {exc}", file=sys.stderr)
+        return 1
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+    finally:
+        os.close(fd)
+
+    digest = hashlib.sha256(data).hexdigest()
+    summary = plan.summary
+    print(f"recovery_plan written: {output_path}")
+    print(f"sha256={digest}")
+    print(
+        " ".join(
+            (
+                f"selected_bins={summary['selected_bins']}",
+                f"estimated_recovery_searches={summary['estimated_recovery_searches']}",
+                f"full_uniform_recovery_searches={summary['full_uniform_recovery_searches']}",
+                f"search_delta_vs_uniform={summary['search_delta_vs_uniform']}",
+            )
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -582,6 +799,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_ingest(args)
         if args.command == "stats":
             return cmd_stats(args)
+        if args.command == "recovery-plan":
+            return cmd_recovery_plan(args)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
