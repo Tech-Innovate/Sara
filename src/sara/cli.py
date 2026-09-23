@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import socket
+import sqlite3
 import sys
 import uuid
 from pathlib import Path
@@ -21,7 +23,14 @@ from .scraper import (
     load_resume_completed_input_ids,
     run_scraper,
 )
-from .storage import connect, ingest_records, iter_jsonl, utc_now
+from .recovery import (
+    COMPLETION_CLAIM,
+    RecoveryPolicy,
+    build_recovery_plan,
+    project_source_config,
+    serialize_recovery_plan,
+)
+from .storage import connect, connect_readonly, ingest_records, iter_jsonl, utc_now
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -71,7 +80,24 @@ def _parser() -> argparse.ArgumentParser:
 
     stats = sub.add_parser("stats", help="Show run and canonical business counts")
     stats.add_argument("--limit", type=_positive_int, default=20)
+
+    recovery_plan = sub.add_parser(
+        "recovery-plan",
+        help="Plan finer-grid recovery from a completed run without executing anything",
+    )
+    recovery_plan.add_argument("--run-id", required=True)
+    recovery_plan.add_argument("--recovery-cell-km", type=float, required=True)
+    recovery_plan.add_argument("--tier-a-min", type=int, required=True)
+    recovery_plan.add_argument("--tier-b-min", type=int, required=True)
+    recovery_plan.add_argument("--policy-id", required=True)
+    recovery_plan.add_argument("--output", required=True)
     return parser
+
+
+def _reject_json_constant(token: str):
+    # NaN/Infinity/-Infinity are accepted by Python's json.loads by default
+    # but are not standard JSON; source state containing them is rejected.
+    raise ValueError(f"non-standard JSON constant {token!r} in recorded run state")
 
 
 def _validate_run_id(run_id: str) -> str:
@@ -571,6 +597,354 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def _best_effort_cleanup(output_path: Path, created: bool) -> None:
+    """Remove a partially written output this invocation created.
+
+    Best effort: if removal itself fails the partial file may remain, so the
+    caller reports the write failure and the exclusive-create guard refuses
+    to overwrite the leftover on a later attempt.
+    """
+    if not created:
+        return
+    try:
+        output_path.unlink()
+    except OSError as exc:
+        print(f"warning: could not remove partial output {output_path}: {exc}", file=sys.stderr)
+
+
+def _report_recovery_plan(output_path: Path, data: bytes, summary) -> int:
+    """Report a finished plan without letting presentation failure misstate it.
+
+    The plan file is already complete when this runs. A reporting failure
+    must not delete, rewrite, or retroactively fail the finished artifact:
+    the operator gets a bounded lifecycle message and a non-success status
+    while the valid plan stays on disk.
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        print(f"recovery_plan written: {output_path}")
+        print(f"sha256={digest}")
+        print(
+            " ".join(
+                (
+                    f"selected_bins={summary['selected_bins']}",
+                    f"estimated_recovery_searches={summary['estimated_recovery_searches']}",
+                    f"full_uniform_recovery_searches={summary['full_uniform_recovery_searches']}",
+                    f"search_delta_vs_uniform={summary['search_delta_vs_uniform']}",
+                )
+            )
+        )
+    except KeyboardInterrupt:
+        try:
+            print("recovery plan written; reporting interrupted", file=sys.stderr)
+        except Exception:
+            pass
+        return 130
+    except Exception as exc:
+        try:
+            print(f"recovery plan written but reporting failed: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+        return 1
+    return 0
+
+
+def cmd_recovery_plan(args) -> int:
+    run_id = _validate_run_id(args.run_id)
+    policy = RecoveryPolicy(
+        policy_id=args.policy_id,
+        tier_a_min=args.tier_a_min,
+        tier_b_min=args.tier_b_min,
+        recovery_cell_km=args.recovery_cell_km,
+    )
+    try:
+        policy.validate()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    output_path = Path(args.output)
+    if output_path.exists():
+        print(f"output path already exists; refusing to overwrite: {output_path}", file=sys.stderr)
+        return 2
+
+    def reject(message: str) -> int:
+        print(message, file=sys.stderr)
+        return 2
+
+    try:
+        conn = connect_readonly(args.db)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except sqlite3.Error as exc:
+        print(f"recovery plan failed to open database: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        # One read snapshot covers the source row and business membership.
+        conn.execute("BEGIN")
+        row = conn.execute(
+            """
+            SELECT id, area_name, bbox_json, cell_km, depth, queries_json,
+                   scraper_image, config_json, status, started_at, finished_at,
+                   exit_code, unique_seen
+            FROM runs WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return reject(f"run_id {run_id} does not exist")
+        if row["status"] != "complete":
+            return reject(f"run_id {run_id} is not complete (status={row['status']!r})")
+        if not isinstance(row["finished_at"], str) or not row["finished_at"].strip():
+            return reject("complete run has an invalid finished_at timestamp")
+        if not isinstance(row["started_at"], str) or not row["started_at"].strip():
+            return reject("run has an invalid started_at timestamp")
+        if row["exit_code"] is not None and (
+            isinstance(row["exit_code"], bool) or not isinstance(row["exit_code"], int)
+        ):
+            return reject("run has an invalid recorded exit_code")
+
+        if not isinstance(row["bbox_json"], str):
+            return reject("run bbox_json is not stored as text")
+        try:
+            bbox_raw = json.loads(row["bbox_json"], parse_constant=_reject_json_constant)
+        except (TypeError, ValueError) as exc:
+            return reject(f"run has invalid recorded bbox: {exc}")
+        # Validate the intermediate object explicitly: booleans compare
+        # equal to 0.0/1.0 in Python, so range checks alone would accept
+        # JSON true/false as corrupted-but-usable coordinates.
+        if not isinstance(bbox_raw, dict):
+            return reject("run has invalid recorded bbox: expected a JSON object")
+        bbox_keys = ("min_lat", "min_lon", "max_lat", "max_lon")
+        for key in bbox_keys:
+            if key not in bbox_raw:
+                return reject(f"run has invalid recorded bbox: missing {key}")
+        for key, value in bbox_raw.items():
+            if key not in bbox_keys:
+                return reject(f"run has invalid recorded bbox: unexpected key {key!r}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return reject(f"run has invalid recorded bbox: {key} must be a number")
+        try:
+            bbox = BoundingBox(
+                min_lat=bbox_raw["min_lat"],
+                min_lon=bbox_raw["min_lon"],
+                max_lat=bbox_raw["max_lat"],
+                max_lon=bbox_raw["max_lon"],
+            )
+            bbox.validate()
+        except ValueError as exc:
+            return reject(f"run has invalid recorded bbox: {exc}")
+
+        if not isinstance(row["queries_json"], str):
+            return reject("run queries_json is not stored as text")
+        try:
+            queries = json.loads(row["queries_json"], parse_constant=_reject_json_constant)
+        except (TypeError, ValueError) as exc:
+            return reject(f"run has invalid recorded queries: {exc}")
+        if (
+            not isinstance(queries, list)
+            or not queries
+            or not all(isinstance(query, str) and query for query in queries)
+        ):
+            return reject("run has invalid recorded query configuration")
+
+        config_raw = row["config_json"]
+        if not isinstance(config_raw, str) or not config_raw:
+            return reject("run has no recorded configuration text")
+        try:
+            config = json.loads(config_raw, parse_constant=_reject_json_constant)
+        except (TypeError, ValueError) as exc:
+            return reject(f"run has invalid recorded configuration: {exc}")
+        if not isinstance(config, dict):
+            return reject("run configuration is not a JSON object")
+        if config.get("resume") is not True:
+            return reject("recovery planning requires a run recorded with resume=true")
+        if config.get("strict_bounds") is not True:
+            return reject("recovery planning requires a run recorded with strict_bounds=true")
+
+        source_cell_km = row["cell_km"]
+        if (
+            isinstance(source_cell_km, bool)
+            or not isinstance(source_cell_km, (int, float))
+            or not math.isfinite(source_cell_km)
+            or source_cell_km <= 0
+        ):
+            return reject("run has an invalid recorded cell size")
+        if args.recovery_cell_km >= source_cell_km:
+            return reject("recovery_cell_km must be strictly finer than the source cell size")
+
+        # Cross-check the denormalized run columns against the recorded
+        # configuration so a contradictory or corrupted run row cannot
+        # produce a plan whose visible fields and configuration hash refer
+        # to different crawl configurations.
+        def config_mismatch(field: str) -> int:
+            return reject(
+                f"run {field} disagrees with the recorded configuration; "
+                "the run row is internally inconsistent"
+            )
+
+        if not isinstance(config.get("area_name"), str) or config["area_name"] != row["area_name"]:
+            return config_mismatch("area_name")
+        if not isinstance(config.get("image"), str) or config["image"] != row["scraper_image"]:
+            return config_mismatch("scraper_image")
+        recorded_bbox = config.get("bbox")
+        if not isinstance(recorded_bbox, dict):
+            return config_mismatch("bbox")
+        for key, value in (
+            ("min_lat", bbox.min_lat),
+            ("min_lon", bbox.min_lon),
+            ("max_lat", bbox.max_lat),
+            ("max_lon", bbox.max_lon),
+        ):
+            recorded = recorded_bbox.get(key)
+            # Plain numeric equality: no float() coercion, so arbitrarily
+            # large JSON integers cannot raise OverflowError, and NaN or
+            # infinity simply compare unequal and are rejected here.
+            if (
+                isinstance(recorded, bool)
+                or not isinstance(recorded, (int, float))
+                or recorded != value
+            ):
+                return config_mismatch("bbox")
+        if config.get("queries") != queries:
+            return config_mismatch("queries")
+        recorded_cell = config.get("cell_km")
+        if (
+            isinstance(recorded_cell, bool)
+            or not isinstance(recorded_cell, (int, float))
+            or recorded_cell != source_cell_km
+        ):
+            return config_mismatch("cell_km")
+        recorded_depth = config.get("depth")
+        if (
+            isinstance(recorded_depth, bool)
+            or not isinstance(recorded_depth, int)
+            or not isinstance(row["depth"], int)
+            or recorded_depth != row["depth"]
+        ):
+            return config_mismatch("depth")
+
+        member_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM run_businesses WHERE run_id = ?", (run_id,)
+        ).fetchone()["n"]
+        if member_count != row["unique_seen"]:
+            return reject(
+                f"run membership count ({member_count}) does not match recorded "
+                f"unique_seen ({row['unique_seen']}); canonical state has changed"
+            )
+
+        coordinates: list[tuple[float, float]] = []
+        for business in conn.execute(
+            """
+            SELECT b.id, b.latitude, b.longitude, b.last_run_id
+            FROM run_businesses rb
+            JOIN businesses b ON b.id = rb.business_id
+            WHERE rb.run_id = ?
+            ORDER BY b.id
+            """,
+            (run_id,),
+        ):
+            if business["last_run_id"] != run_id:
+                return reject(
+                    f"business {business['id']} was last observed by a later run "
+                    f"({business['last_run_id']!r}); current coordinates are not "
+                    "safe evidence for this source run"
+                )
+            latitude = business["latitude"]
+            longitude = business["longitude"]
+            if latitude is None or longitude is None:
+                return reject(f"business {business['id']} has no recorded coordinates")
+            if not (
+                isinstance(latitude, (int, float))
+                and isinstance(longitude, (int, float))
+                and math.isfinite(latitude)
+                and math.isfinite(longitude)
+            ):
+                return reject(f"business {business['id']} has nonfinite coordinates")
+            coordinates.append((float(latitude), float(longitude)))
+
+        source_run = {
+            "id": row["id"],
+            "area_name": row["area_name"],
+            "bbox": {
+                "min_lat": bbox.min_lat,
+                "min_lon": bbox.min_lon,
+                "max_lat": bbox.max_lat,
+                "max_lon": bbox.max_lon,
+            },
+            "cell_km": source_cell_km,
+            "depth": row["depth"],
+            "queries": queries,
+            "query_count": len(queries),
+            "scraper_image": row["scraper_image"],
+            "status": row["status"],
+            "exit_code": row["exit_code"],
+            "strict_bounds": True,
+            "resume": True,
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "config_sha256": hashlib.sha256(config_raw.encode("utf-8")).hexdigest(),
+            "config": project_source_config(config),
+            "completion_claim": COMPLETION_CLAIM,
+        }
+
+        try:
+            plan = build_recovery_plan(
+                policy=policy,
+                source_run=source_run,
+                source_bbox=bbox,
+                source_cell_km=float(source_cell_km),
+                query_count=len(queries),
+                coordinates=coordinates,
+            )
+        except ValueError as exc:
+            return reject(str(exc))
+    except sqlite3.Error as exc:
+        print(f"recovery plan failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
+
+    try:
+        data = serialize_recovery_plan(plan).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        return reject(f"plan payload failed strict JSON serialization: {exc}")
+    created = False
+    try:
+        # O_BINARY is required on Windows so LF bytes are not translated to
+        # CRLF; it is a no-op flag where the platform does not define it.
+        fd = os.open(
+            output_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        created = True
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("plan write made no progress")
+                view = view[written:]
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        return reject(f"output path already exists; refusing to overwrite: {output_path}")
+    except OSError as exc:
+        _best_effort_cleanup(output_path, created)
+        print(f"recovery plan failed to write output: {exc}", file=sys.stderr)
+        return 1
+    except BaseException:
+        # Interruption: best-effort removal of the partial file this
+        # invocation created before propagating.
+        _best_effort_cleanup(output_path, created)
+        raise
+
+    return _report_recovery_plan(output_path, data, plan.summary)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -582,6 +956,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_ingest(args)
         if args.command == "stats":
             return cmd_stats(args)
+        if args.command == "recovery-plan":
+            return cmd_recovery_plan(args)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

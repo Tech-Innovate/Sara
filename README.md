@@ -145,18 +145,41 @@ If a run ID has scraper output on disk but no corresponding database row, `colle
 
 ## Coverage strategy
 
-Use progressive passes instead of assuming one crawl is exhaustive:
+Sara supports two operator strategies instead of assuming one crawl is exhaustive:
 
-1. 2 km cells for broad discovery.
-2. 1 km cells as the normal comprehensive pass.
-3. 0.5 km cells in dense areas if the additional unique-business yield remains worthwhile.
-4. Add relevant category/query variants and measure their marginal gain.
+- **Uniform refinement:** after a 2 km broad-discovery pass, re-crawl the same bounding box at 1 km (or finer) everywhere and measure the marginal `new_businesses` yield of each pass.
+- **Adaptive recovery planning:** after a 2 km pass, generate a read-only recovery plan that partitions the recorded bbox into density bins and proposes finer-grid recovery only for bins whose recorded business count meets explicit operator thresholds.
+
+When refining uniformly, stop tightening the grid once additional searches produce very few new canonical businesses, and add category/query variants only after measuring their marginal gain.
 
 Partition broad geographic work into bounded area/run tiles rather than one very large resume run. This limits the upstream resume-state rewrite cost and gives each tile an independently auditable completion receipt.
 
 The important metric is `new_businesses`, not raw result count. Stop tightening the grid when additional searches produce very few new canonical businesses.
 
 Identity convergence is handled retroactively: if two provisional rows later prove to be the same business through strong identifiers, Sara merges them and refreshes historical `unique_seen` / `new_businesses` counts so the coverage history remains canonical. Conflicting non-empty strong identifiers are treated as an ingestion error rather than silently replacing canonical identity.
+
+## Adaptive recovery planning (read-only)
+
+After a completed strict-bounds resume run, Sara can produce a recovery plan without executing anything:
+
+```bash
+sara --db data/sara.db recovery-plan \
+  --run-id baseline-run \
+  --recovery-cell-km 1.0 \
+  --tier-a-min 15 \
+  --tier-b-min 11 \
+  --policy-id pilot-jeddah-restaurant-v1 \
+  --output recovery-plan.json
+```
+
+Boundaries of this feature:
+
+- Planning is read-only and non-executing. It opens the database through a read-only connection, performs no schema/data mutation, and never launches Docker or contacts Google Maps.
+- All thresholds are explicit inputs on every invocation. `--tier-b-min 11` and `--tier-a-min 15` are the pilot values calibrated on three bounded Jeddah `restaurant` tiles; they are not defaults and are not universally validated. Candidate 11 formally failed the incremental-capture criterion on the sparse third tile.
+- Density bins are equal partitions of the recorded bbox for summarizing spatial density. They are not upstream scraper cells and do not claim which search origin discovered a business.
+- The planner only accepts a source run whose associated businesses still carry `last_run_id` equal to that run. If a later overlapping run has updated any associated business, current coordinates are no longer safe evidence for the older run and planning fails closed. Generate and preserve the plan before later overlapping runs when historical reproducibility matters.
+- The generated plan is deterministic for a given database snapshot and arguments (no timestamps, absolute paths, host or PID in the payload) and is written exclusively, never overwritten. Retain it as frozen evidence; the printed SHA-256 identifies the exact bytes.
+- Exact search cost comes from the real per-bin grid estimator; adjacent selected bins are never merged because merging changes half-cell origins and search counts. `search_delta_vs_uniform` is signed: it can be positive when independent per-bin anchoring plans more searches than one uniform pass.
 
 ## Inspect coverage
 
