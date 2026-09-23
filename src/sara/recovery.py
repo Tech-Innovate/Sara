@@ -20,6 +20,32 @@ TIER_A = "A"
 TIER_B = "B"
 TIER_UNSELECTED = "unselected"
 
+# The only configuration fields ever copied into a plan artifact. Unknown
+# fields are omitted so legacy, manual, or future configurations can never
+# leak credentials, proxy URLs, tokens, or local paths into the export; the
+# raw configuration remains auditable through config_sha256.
+CONFIG_PROJECTION_FIELDS = (
+    "area_name",
+    "bbox",
+    "queries",
+    "cell_km",
+    "depth",
+    "concurrency",
+    "browser_pool_size",
+    "pages_per_browser",
+    "lang",
+    "zoom",
+    "resume",
+    "image",
+    "proxy_sha256",
+    "strict_bounds",
+)
+
+
+def project_source_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Allowlisted projection of the parsed source configuration."""
+    return {key: config[key] for key in CONFIG_PROJECTION_FIELDS if key in config}
+
 
 @dataclass(frozen=True)
 class RecoveryPolicy:
@@ -328,4 +354,6 @@ def serialize_recovery_plan(plan: RecoveryPlan) -> str:
         ],
         "summary": plan.summary,
     }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False
+    ) + "\n"

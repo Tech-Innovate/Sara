@@ -23,7 +23,13 @@ from .scraper import (
     load_resume_completed_input_ids,
     run_scraper,
 )
-from .recovery import COMPLETION_CLAIM, RecoveryPolicy, build_recovery_plan, serialize_recovery_plan
+from .recovery import (
+    COMPLETION_CLAIM,
+    RecoveryPolicy,
+    build_recovery_plan,
+    project_source_config,
+    serialize_recovery_plan,
+)
 from .storage import connect, connect_readonly, ingest_records, iter_jsonl, utc_now
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -86,6 +92,12 @@ def _parser() -> argparse.ArgumentParser:
     recovery_plan.add_argument("--policy-id", required=True)
     recovery_plan.add_argument("--output", required=True)
     return parser
+
+
+def _reject_json_constant(token: str):
+    # NaN/Infinity/-Infinity are accepted by Python's json.loads by default
+    # but are not standard JSON; source state containing them is rejected.
+    raise ValueError(f"non-standard JSON constant {token!r} in recorded run state")
 
 
 def _validate_run_id(run_id: str) -> str:
@@ -585,6 +597,21 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def _best_effort_cleanup(output_path: Path, created: bool) -> None:
+    """Remove a partially written output this invocation created.
+
+    Best effort: if removal itself fails the partial file may remain, so the
+    caller reports the write failure and the exclusive-create guard refuses
+    to overwrite the leftover on a later attempt.
+    """
+    if not created:
+        return
+    try:
+        output_path.unlink()
+    except OSError as exc:
+        print(f"warning: could not remove partial output {output_path}: {exc}", file=sys.stderr)
+
+
 def cmd_recovery_plan(args) -> int:
     run_id = _validate_run_id(args.run_id)
     policy = RecoveryPolicy(
@@ -633,13 +660,19 @@ def cmd_recovery_plan(args) -> int:
             return reject(f"run_id {run_id} does not exist")
         if row["status"] != "complete":
             return reject(f"run_id {run_id} is not complete (status={row['status']!r})")
-        if not row["finished_at"]:
-            return reject("complete run has no finished_at timestamp")
+        if not isinstance(row["finished_at"], str) or not row["finished_at"].strip():
+            return reject("complete run has an invalid finished_at timestamp")
+        if not isinstance(row["started_at"], str) or not row["started_at"].strip():
+            return reject("run has an invalid started_at timestamp")
+        if row["exit_code"] is not None and (
+            isinstance(row["exit_code"], bool) or not isinstance(row["exit_code"], int)
+        ):
+            return reject("run has an invalid recorded exit_code")
 
         if not isinstance(row["bbox_json"], str):
             return reject("run bbox_json is not stored as text")
         try:
-            bbox = BoundingBox(**json.loads(row["bbox_json"]))
+            bbox = BoundingBox(**json.loads(row["bbox_json"], parse_constant=_reject_json_constant))
             bbox.validate()
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return reject(f"run has invalid recorded bbox: {exc}")
@@ -647,7 +680,7 @@ def cmd_recovery_plan(args) -> int:
         if not isinstance(row["queries_json"], str):
             return reject("run queries_json is not stored as text")
         try:
-            queries = json.loads(row["queries_json"])
+            queries = json.loads(row["queries_json"], parse_constant=_reject_json_constant)
         except (TypeError, ValueError) as exc:
             return reject(f"run has invalid recorded queries: {exc}")
         if (
@@ -661,7 +694,7 @@ def cmd_recovery_plan(args) -> int:
         if not isinstance(config_raw, str) or not config_raw:
             return reject("run has no recorded configuration text")
         try:
-            config = json.loads(config_raw)
+            config = json.loads(config_raw, parse_constant=_reject_json_constant)
         except (TypeError, ValueError) as exc:
             return reject(f"run has invalid recorded configuration: {exc}")
         if not isinstance(config, dict):
@@ -706,10 +739,13 @@ def cmd_recovery_plan(args) -> int:
             ("max_lon", bbox.max_lon),
         ):
             recorded = recorded_bbox.get(key)
+            # Plain numeric equality: no float() coercion, so arbitrarily
+            # large JSON integers cannot raise OverflowError, and NaN or
+            # infinity simply compare unequal and are rejected here.
             if (
                 isinstance(recorded, bool)
                 or not isinstance(recorded, (int, float))
-                or float(recorded) != value
+                or recorded != value
             ):
                 return config_mismatch("bbox")
         if config.get("queries") != queries:
@@ -718,7 +754,7 @@ def cmd_recovery_plan(args) -> int:
         if (
             isinstance(recorded_cell, bool)
             or not isinstance(recorded_cell, (int, float))
-            or float(recorded_cell) != float(source_cell_km)
+            or recorded_cell != source_cell_km
         ):
             return config_mismatch("cell_km")
         recorded_depth = config.get("depth")
@@ -790,7 +826,7 @@ def cmd_recovery_plan(args) -> int:
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "config_sha256": hashlib.sha256(config_raw.encode("utf-8")).hexdigest(),
-            "config": config,
+            "config": project_source_config(config),
             "completion_claim": COMPLETION_CLAIM,
         }
 
@@ -811,7 +847,10 @@ def cmd_recovery_plan(args) -> int:
     finally:
         conn.close()
 
-    data = serialize_recovery_plan(plan).encode("utf-8")
+    try:
+        data = serialize_recovery_plan(plan).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        return reject(f"plan payload failed strict JSON serialization: {exc}")
     created = False
     try:
         # O_BINARY is required on Windows so LF bytes are not translated to
@@ -834,20 +873,13 @@ def cmd_recovery_plan(args) -> int:
     except FileExistsError:
         return reject(f"output path already exists; refusing to overwrite: {output_path}")
     except OSError as exc:
-        if created:
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
+        _best_effort_cleanup(output_path, created)
         print(f"recovery plan failed to write output: {exc}", file=sys.stderr)
         return 1
     except BaseException:
-        # Interruption: never leave a partial file masquerading as a plan.
-        if created:
-            try:
-                output_path.unlink()
-            except OSError:
-                pass
+        # Interruption: best-effort removal of the partial file this
+        # invocation created before propagating.
+        _best_effort_cleanup(output_path, created)
         raise
 
     digest = hashlib.sha256(data).hexdigest()

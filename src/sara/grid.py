@@ -57,7 +57,21 @@ def _grid_steps(bbox: BoundingBox, cell_km: float) -> tuple[float, float]:
     if abs(cos_midpoint) < MIN_COS_LATITUDE:
         cos_midpoint = -MIN_COS_LATITUDE if cos_midpoint < 0 else MIN_COS_LATITUDE
     lon_step = cell_km / (KM_PER_DEGREE_LAT * cos_midpoint)
+    # A step below the floating-point resolution at this coordinate magnitude
+    # makes the half-step/full-step additions stop advancing, which would
+    # loop forever in counting and origin iteration. Fail closed instead.
+    _assert_step_progress(bbox.min_lat, lat_step, "latitude")
+    _assert_step_progress(bbox.max_lat, lat_step, "latitude")
+    _assert_step_progress(bbox.min_lon, lon_step, "longitude")
+    _assert_step_progress(bbox.max_lon, lon_step, "longitude")
     return lat_step, lon_step
+
+
+def _assert_step_progress(value: float, step: float, axis: str) -> None:
+    if value + step / 2 <= value:
+        raise ValueError(
+            f"cell size is too small to advance the {axis} grid at this coordinate magnitude"
+        )
 
 
 def _count_origins(minimum: float, maximum: float, step: float) -> int:

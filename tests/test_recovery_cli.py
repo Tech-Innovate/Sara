@@ -462,3 +462,99 @@ def test_completion_claim_constant_used_not_duplicated():
     source = Path(cli.__file__).read_text(encoding="utf-8")
     assert "recorded_complete_not_reverified" not in source
     assert "COMPLETION_CLAIM" in source
+
+
+# ---- v3 review regressions (V2-F01..F04, V2-SR01) ----
+
+
+def test_unknown_config_fields_omitted_from_artifact(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    _rewrite_config(
+        db,
+        lambda config: config.update(
+            {"secret_token": "hunter2", "proxy_url": "http://user:pass@host:8080"}
+        ),
+    )
+    output = tmp_path / "plan.json"
+    assert cli.cmd_recovery_plan(plan_args(db, output)) == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    config = payload["source_run"]["config"]
+    assert "secret_token" not in config
+    assert "proxy_url" not in config
+    assert set(config) <= set(
+        payload["source_run"]["config"]
+    )
+    assert payload["source_run"]["config_sha256"]
+    known = {
+        "area_name", "bbox", "queries", "cell_km", "depth", "concurrency",
+        "browser_pool_size", "pages_per_browser", "lang", "zoom", "resume",
+        "image", "proxy_sha256", "strict_bounds",
+    }
+    assert set(config) <= known
+
+
+def test_huge_json_integer_in_config_is_rejected_not_traceback(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    _rewrite_config(db, lambda config: config.update({"cell_km": 10 ** 400}))
+    rc = cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json"))
+    assert rc == 2
+
+
+def test_huge_json_integer_in_bbox_config_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    _rewrite_config(
+        db,
+        lambda config: config.update(
+            {"bbox": {"min_lat": 10 ** 400, "min_lon": 0.0, "max_lat": 0.05, "max_lon": 0.05}}
+        ),
+    )
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_nan_config_constant_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    raw = conn.execute("SELECT config_json FROM runs").fetchone()[0]
+    poisoned = raw.replace('"en"', "NaN", 1)
+    assert poisoned != raw
+    conn.execute("UPDATE runs SET config_json = ?", (poisoned,))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_nan_bbox_constant_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    poisoned = json.dumps(BBOX).replace("0.05", "NaN", 1)
+    conn.execute("UPDATE runs SET bbox_json = ?", (poisoned,))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+@pytest.mark.parametrize("column,value", [
+    ("started_at", b"t"),
+    ("finished_at", b"t"),
+    ("exit_code", b"1"),
+    ("exit_code", "zero"),
+    ("started_at", ""),
+])
+def test_malformed_source_scalars_are_rejected(tmp_path, column, value):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    conn.execute(f"UPDATE runs SET {column} = ?", (value,))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_plan_output_contains_no_nonstandard_json_constants(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+    assert cli.cmd_recovery_plan(plan_args(db, output)) == 0
+
+    def reject(token):
+        raise AssertionError(f"non-standard JSON constant in output: {token}")
+
+    json.loads(output.read_text(encoding="utf-8"), parse_constant=reject)
