@@ -709,9 +709,32 @@ def cmd_recovery_plan(args) -> int:
         if not isinstance(row["bbox_json"], str):
             return reject("run bbox_json is not stored as text")
         try:
-            bbox = BoundingBox(**json.loads(row["bbox_json"], parse_constant=_reject_json_constant))
+            bbox_raw = json.loads(row["bbox_json"], parse_constant=_reject_json_constant)
+        except (TypeError, ValueError) as exc:
+            return reject(f"run has invalid recorded bbox: {exc}")
+        # Validate the intermediate object explicitly: booleans compare
+        # equal to 0.0/1.0 in Python, so range checks alone would accept
+        # JSON true/false as corrupted-but-usable coordinates.
+        if not isinstance(bbox_raw, dict):
+            return reject("run has invalid recorded bbox: expected a JSON object")
+        bbox_keys = ("min_lat", "min_lon", "max_lat", "max_lon")
+        for key in bbox_keys:
+            if key not in bbox_raw:
+                return reject(f"run has invalid recorded bbox: missing {key}")
+        for key, value in bbox_raw.items():
+            if key not in bbox_keys:
+                return reject(f"run has invalid recorded bbox: unexpected key {key!r}")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return reject(f"run has invalid recorded bbox: {key} must be a number")
+        try:
+            bbox = BoundingBox(
+                min_lat=bbox_raw["min_lat"],
+                min_lon=bbox_raw["min_lon"],
+                max_lat=bbox_raw["max_lat"],
+                max_lon=bbox_raw["max_lon"],
+            )
             bbox.validate()
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        except ValueError as exc:
             return reject(f"run has invalid recorded bbox: {exc}")
 
         if not isinstance(row["queries_json"], str):

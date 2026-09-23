@@ -611,3 +611,82 @@ def test_reporting_interrupt_returns_130_and_preserves_plan(tmp_path, monkeypatc
     second = tmp_path / "plan-2.json"
     assert cli.cmd_recovery_plan(plan_args(db, second)) == 0
     assert output.read_bytes() == second.read_bytes()
+
+
+# ---- PR3-F01: boolean bbox coordinates bypass the corruption guard ----
+
+
+@pytest.mark.parametrize("key", ["min_lat", "min_lon", "max_lat", "max_lon"])
+def test_boolean_bbox_coordinate_is_rejected(tmp_path, key):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    raw = json.loads(conn.execute("SELECT bbox_json FROM runs").fetchone()[0])
+    # False compares equal to 0.0 and True to 1.0, so range checks alone
+    # would accept these; only the explicit boolean guard rejects them.
+    raw[key] = False
+    conn.execute("UPDATE runs SET bbox_json = ?", (json.dumps(raw),))
+    conn.commit()
+    conn.close()
+    output = tmp_path / "plan.json"
+    assert cli.cmd_recovery_plan(plan_args(db, output)) == 2
+    assert not output.exists()
+
+
+def test_boolean_bbox_true_also_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    raw = json.loads(conn.execute("SELECT bbox_json FROM runs").fetchone()[0])
+    raw["max_lat"] = True  # True == 1.0 is inside the valid latitude range
+    conn.execute("UPDATE runs SET bbox_json = ?", (json.dumps(raw),))
+    conn.commit()
+    conn.close()
+    output = tmp_path / "plan.json"
+    assert cli.cmd_recovery_plan(plan_args(db, output)) == 2
+    assert not output.exists()
+
+
+def test_bbox_extra_key_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    raw = json.loads(conn.execute("SELECT bbox_json FROM runs").fetchone()[0])
+    raw["min_lattitude"] = 0.0
+    conn.execute("UPDATE runs SET bbox_json = ?", (json.dumps(raw),))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_bbox_string_coordinate_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    raw = json.loads(conn.execute("SELECT bbox_json FROM runs").fetchone()[0])
+    raw["min_lat"] = "0.0"
+    conn.execute("UPDATE runs SET bbox_json = ?", (json.dumps(raw),))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_bbox_non_object_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    conn.execute("UPDATE runs SET bbox_json = ?", ("[0.0, 0.0, 0.05, 0.05]",))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_integer_bbox_coordinates_remain_accepted(tmp_path):
+    # JSON integers are legitimate numbers and must keep planning.
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    raw = json.loads(conn.execute("SELECT bbox_json FROM runs").fetchone()[0])
+    raw["min_lat"] = 0
+    raw["min_lon"] = 0
+    conn.execute("UPDATE runs SET bbox_json = ?", (json.dumps(raw),))
+    cfg = json.loads(conn.execute("SELECT config_json FROM runs").fetchone()[0])
+    cfg["bbox"] = raw
+    conn.execute("UPDATE runs SET config_json = ?", (json.dumps(cfg),))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 0
