@@ -558,3 +558,56 @@ def test_plan_output_contains_no_nonstandard_json_constants(tmp_path):
         raise AssertionError(f"non-standard JSON constant in output: {token}")
 
     json.loads(output.read_text(encoding="utf-8"), parse_constant=reject)
+
+
+# ---- V3-F01: post-write reporting lifecycle ----
+
+
+class _BrokenStdout:
+    def write(self, _data):
+        raise OSError("simulated broken stdout pipe")
+
+    def flush(self):
+        raise OSError("simulated broken stdout pipe")
+
+
+class _InterruptedStdout:
+    def write(self, _data):
+        raise KeyboardInterrupt
+
+    def flush(self):
+        pass
+
+
+def test_reporting_failure_preserves_completed_plan(tmp_path, monkeypatch):
+    import sys
+
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+    monkeypatch.setattr(sys, "stdout", _BrokenStdout())
+    rc = cli.cmd_recovery_plan(plan_args(db, output))
+    monkeypatch.undo()
+    assert rc == 1
+    assert output.exists()
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["summary"]["selected_bins"] >= 0
+    # The preserved file is byte-identical to a freshly generated plan.
+    second = tmp_path / "plan-2.json"
+    assert cli.cmd_recovery_plan(plan_args(db, second)) == 0
+    assert output.read_bytes() == second.read_bytes()
+
+
+def test_reporting_interrupt_returns_130_and_preserves_plan(tmp_path, monkeypatch):
+    import sys
+
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+    monkeypatch.setattr(sys, "stdout", _InterruptedStdout())
+    rc = cli.cmd_recovery_plan(plan_args(db, output))
+    monkeypatch.undo()
+    assert rc == 130
+    assert output.exists()
+    json.loads(output.read_text(encoding="utf-8"))
+    second = tmp_path / "plan-2.json"
+    assert cli.cmd_recovery_plan(plan_args(db, second)) == 0
+    assert output.read_bytes() == second.read_bytes()

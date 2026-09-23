@@ -612,6 +612,43 @@ def _best_effort_cleanup(output_path: Path, created: bool) -> None:
         print(f"warning: could not remove partial output {output_path}: {exc}", file=sys.stderr)
 
 
+def _report_recovery_plan(output_path: Path, data: bytes, summary) -> int:
+    """Report a finished plan without letting presentation failure misstate it.
+
+    The plan file is already complete when this runs. A reporting failure
+    must not delete, rewrite, or retroactively fail the finished artifact:
+    the operator gets a bounded lifecycle message and a non-success status
+    while the valid plan stays on disk.
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        print(f"recovery_plan written: {output_path}")
+        print(f"sha256={digest}")
+        print(
+            " ".join(
+                (
+                    f"selected_bins={summary['selected_bins']}",
+                    f"estimated_recovery_searches={summary['estimated_recovery_searches']}",
+                    f"full_uniform_recovery_searches={summary['full_uniform_recovery_searches']}",
+                    f"search_delta_vs_uniform={summary['search_delta_vs_uniform']}",
+                )
+            )
+        )
+    except KeyboardInterrupt:
+        try:
+            print("recovery plan written; reporting interrupted", file=sys.stderr)
+        except Exception:
+            pass
+        return 130
+    except Exception as exc:
+        try:
+            print(f"recovery plan written but reporting failed: {exc}", file=sys.stderr)
+        except Exception:
+            pass
+        return 1
+    return 0
+
+
 def cmd_recovery_plan(args) -> int:
     run_id = _validate_run_id(args.run_id)
     policy = RecoveryPolicy(
@@ -882,21 +919,7 @@ def cmd_recovery_plan(args) -> int:
         _best_effort_cleanup(output_path, created)
         raise
 
-    digest = hashlib.sha256(data).hexdigest()
-    summary = plan.summary
-    print(f"recovery_plan written: {output_path}")
-    print(f"sha256={digest}")
-    print(
-        " ".join(
-            (
-                f"selected_bins={summary['selected_bins']}",
-                f"estimated_recovery_searches={summary['estimated_recovery_searches']}",
-                f"full_uniform_recovery_searches={summary['full_uniform_recovery_searches']}",
-                f"search_delta_vs_uniform={summary['search_delta_vs_uniform']}",
-            )
-        )
-    )
-    return 0
+    return _report_recovery_plan(output_path, data, plan.summary)
 
 
 def main(argv: list[str] | None = None) -> int:
