@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -20,7 +21,7 @@ def build_db(path, *, run_id="base-run", status="complete",
              queries='["restaurant"]', cell_km=2.0):
     conn = connect(path)
     if config is None:
-        config = {"resume": True, "strict_bounds": True}
+        config = dict(DEFAULT_CONFIG)
     if coords is None:
         coords = DEFAULT_COORDS
     conn.execute(
@@ -317,3 +318,147 @@ def test_main_dispatch_exit_codes(tmp_path):
         "--output", str(tmp_path / "plan2.json"),
     ])
     assert rc == 2
+
+
+DEFAULT_CONFIG = {
+    "resume": True,
+    "strict_bounds": True,
+    "area_name": "x",
+    "bbox": BBOX,
+    "queries": ["restaurant"],
+    "cell_km": 2.0,
+    "depth": 5,
+    "image": "img",
+    "lang": "en",
+    "zoom": 15,
+}
+
+
+def _rewrite_config(db_path, mutate):
+    conn = connect(db_path)
+    config = json.loads(conn.execute("SELECT config_json FROM runs").fetchone()[0])
+    mutate(config)
+    conn.execute("UPDATE runs SET config_json = ?", (json.dumps(config),))
+    conn.commit()
+    conn.close()
+
+
+def test_output_opened_in_binary_mode_when_platform_supports_it(tmp_path, monkeypatch):
+    import os as os_mod
+
+    db = build_db(tmp_path / "sara.db")
+    captured = {}
+    real_open = os_mod.open
+
+    def spy_open(path, flags, mode=0o777, *args, **kwargs):
+        captured["flags"] = flags
+        return real_open(path, flags, mode, *args, **kwargs)
+
+    monkeypatch.setattr(cli.os, "open", spy_open)
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 0
+    if hasattr(os_mod, "O_BINARY"):
+        assert captured["flags"] & os_mod.O_BINARY
+
+
+def test_write_failure_cleans_up_partial_output(tmp_path, monkeypatch):
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+
+    def failing_write(_fd, _view):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(cli.os, "write", failing_write)
+    rc = cli.cmd_recovery_plan(plan_args(db, output))
+    assert rc == 1
+    assert not output.exists()
+
+
+def test_zero_progress_write_is_an_error_not_a_loop(tmp_path, monkeypatch):
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+    monkeypatch.setattr(cli.os, "write", lambda _fd, _view: 0)
+    rc = cli.cmd_recovery_plan(plan_args(db, output))
+    assert rc == 1
+    assert not output.exists()
+
+
+def test_close_failure_cleans_up_partial_output(tmp_path, monkeypatch):
+    import os as os_mod
+
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+    real_close = os_mod.close
+
+    def failing_close(fd):
+        real_close(fd)
+        raise OSError("simulated close failure")
+
+    monkeypatch.setattr(cli.os, "close", failing_close)
+    rc = cli.cmd_recovery_plan(plan_args(db, output))
+    assert rc == 1
+    assert not output.exists()
+
+
+def test_connection_open_failure_returns_one(tmp_path, monkeypatch, capsys):
+    db = build_db(tmp_path / "sara.db")
+
+    def broken(_path):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(cli, "connect_readonly", broken)
+    rc = cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json"))
+    assert rc == 1
+    assert "failed to open database" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("column", ["bbox_json", "queries_json", "config_json"])
+def test_blob_typed_columns_are_rejected(tmp_path, column):
+    db = build_db(tmp_path / "sara.db")
+    conn = connect(db)
+    conn.execute(f"UPDATE runs SET {column} = ?", (b'{"x": 1}',))
+    conn.commit()
+    conn.close()
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+@pytest.mark.parametrize("changes", [
+    {"cell_km": 9.9},
+    {"depth": 3},
+    {"image": "other-image"},
+    {"area_name": "elsewhere"},
+    {"queries": ["cafe"]},
+    {"bbox": {"min_lat": 0.0, "min_lon": 0.0, "max_lat": 9.0, "max_lon": 9.0}},
+])
+def test_config_column_disagreement_is_rejected(tmp_path, changes):
+    db = build_db(tmp_path / "sara.db")
+    _rewrite_config(db, lambda config: config.update(changes))
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_config_missing_duplicated_field_is_rejected(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+
+    def drop(config):
+        del config["cell_km"]
+
+    _rewrite_config(db, drop)
+    assert cli.cmd_recovery_plan(plan_args(db, tmp_path / "plan.json")) == 2
+
+
+def test_source_config_preserved_in_artifact(tmp_path):
+    db = build_db(tmp_path / "sara.db")
+    output = tmp_path / "plan.json"
+    assert cli.cmd_recovery_plan(plan_args(db, output)) == 0
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    config = payload["source_run"]["config"]
+    assert config["lang"] == "en"
+    assert config["zoom"] == 15
+    assert config["cell_km"] == 2.0
+    assert config["bbox"] == BBOX
+    assert config["queries"] == ["restaurant"]
+
+
+def test_completion_claim_constant_used_not_duplicated():
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    assert "recorded_complete_not_reverified" not in source
+    assert "COMPLETION_CLAIM" in source

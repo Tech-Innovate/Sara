@@ -23,7 +23,7 @@ from .scraper import (
     load_resume_completed_input_ids,
     run_scraper,
 )
-from .recovery import RecoveryPolicy, build_recovery_plan, serialize_recovery_plan
+from .recovery import COMPLETION_CLAIM, RecoveryPolicy, build_recovery_plan, serialize_recovery_plan
 from .storage import connect, connect_readonly, ingest_records, iter_jsonl, utc_now
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -613,6 +613,9 @@ def cmd_recovery_plan(args) -> int:
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    except sqlite3.Error as exc:
+        print(f"recovery plan failed to open database: {exc}", file=sys.stderr)
+        return 1
 
     try:
         # One read snapshot covers the source row and business membership.
@@ -633,15 +636,19 @@ def cmd_recovery_plan(args) -> int:
         if not row["finished_at"]:
             return reject("complete run has no finished_at timestamp")
 
+        if not isinstance(row["bbox_json"], str):
+            return reject("run bbox_json is not stored as text")
         try:
             bbox = BoundingBox(**json.loads(row["bbox_json"]))
             bbox.validate()
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return reject(f"run has invalid recorded bbox: {exc}")
 
+        if not isinstance(row["queries_json"], str):
+            return reject("run queries_json is not stored as text")
         try:
             queries = json.loads(row["queries_json"])
-        except json.JSONDecodeError as exc:
+        except (TypeError, ValueError) as exc:
             return reject(f"run has invalid recorded queries: {exc}")
         if (
             not isinstance(queries, list)
@@ -651,11 +658,11 @@ def cmd_recovery_plan(args) -> int:
             return reject("run has invalid recorded query configuration")
 
         config_raw = row["config_json"]
-        if not config_raw:
-            return reject("run has no recorded configuration")
+        if not isinstance(config_raw, str) or not config_raw:
+            return reject("run has no recorded configuration text")
         try:
             config = json.loads(config_raw)
-        except json.JSONDecodeError as exc:
+        except (TypeError, ValueError) as exc:
             return reject(f"run has invalid recorded configuration: {exc}")
         if not isinstance(config, dict):
             return reject("run configuration is not a JSON object")
@@ -674,6 +681,54 @@ def cmd_recovery_plan(args) -> int:
             return reject("run has an invalid recorded cell size")
         if args.recovery_cell_km >= source_cell_km:
             return reject("recovery_cell_km must be strictly finer than the source cell size")
+
+        # Cross-check the denormalized run columns against the recorded
+        # configuration so a contradictory or corrupted run row cannot
+        # produce a plan whose visible fields and configuration hash refer
+        # to different crawl configurations.
+        def config_mismatch(field: str) -> int:
+            return reject(
+                f"run {field} disagrees with the recorded configuration; "
+                "the run row is internally inconsistent"
+            )
+
+        if not isinstance(config.get("area_name"), str) or config["area_name"] != row["area_name"]:
+            return config_mismatch("area_name")
+        if not isinstance(config.get("image"), str) or config["image"] != row["scraper_image"]:
+            return config_mismatch("scraper_image")
+        recorded_bbox = config.get("bbox")
+        if not isinstance(recorded_bbox, dict):
+            return config_mismatch("bbox")
+        for key, value in (
+            ("min_lat", bbox.min_lat),
+            ("min_lon", bbox.min_lon),
+            ("max_lat", bbox.max_lat),
+            ("max_lon", bbox.max_lon),
+        ):
+            recorded = recorded_bbox.get(key)
+            if (
+                isinstance(recorded, bool)
+                or not isinstance(recorded, (int, float))
+                or float(recorded) != value
+            ):
+                return config_mismatch("bbox")
+        if config.get("queries") != queries:
+            return config_mismatch("queries")
+        recorded_cell = config.get("cell_km")
+        if (
+            isinstance(recorded_cell, bool)
+            or not isinstance(recorded_cell, (int, float))
+            or float(recorded_cell) != float(source_cell_km)
+        ):
+            return config_mismatch("cell_km")
+        recorded_depth = config.get("depth")
+        if (
+            isinstance(recorded_depth, bool)
+            or not isinstance(recorded_depth, int)
+            or not isinstance(row["depth"], int)
+            or recorded_depth != row["depth"]
+        ):
+            return config_mismatch("depth")
 
         member_count = conn.execute(
             "SELECT COUNT(*) AS n FROM run_businesses WHERE run_id = ?", (run_id,)
@@ -735,7 +790,8 @@ def cmd_recovery_plan(args) -> int:
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "config_sha256": hashlib.sha256(config_raw.encode("utf-8")).hexdigest(),
-            "completion_claim": "recorded_complete_not_reverified_by_recovery_plan",
+            "config": config,
+            "completion_claim": COMPLETION_CLAIM,
         }
 
         try:
@@ -756,20 +812,43 @@ def cmd_recovery_plan(args) -> int:
         conn.close()
 
     data = serialize_recovery_plan(plan).encode("utf-8")
+    created = False
     try:
-        fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # O_BINARY is required on Windows so LF bytes are not translated to
+        # CRLF; it is a no-op flag where the platform does not define it.
+        fd = os.open(
+            output_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        created = True
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("plan write made no progress")
+                view = view[written:]
+        finally:
+            os.close(fd)
     except FileExistsError:
         return reject(f"output path already exists; refusing to overwrite: {output_path}")
     except OSError as exc:
+        if created:
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
         print(f"recovery plan failed to write output: {exc}", file=sys.stderr)
         return 1
-    try:
-        view = memoryview(data)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-    finally:
-        os.close(fd)
+    except BaseException:
+        # Interruption: never leave a partial file masquerading as a plan.
+        if created:
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+        raise
 
     digest = hashlib.sha256(data).hexdigest()
     summary = plan.summary

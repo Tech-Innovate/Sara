@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+from bisect import bisect_right
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from .config import BoundingBox
 from .grid import GridEstimate, estimate_grid, grid_dimensions
@@ -92,16 +93,36 @@ class RecoveryPlan:
         }
 
 
+def build_bin_edges(minimum: float, maximum: float, count: int) -> list[float]:
+    """Explicit partition edges with first and last pinned to the exact bounds.
+
+    Internal edges are computed as minimum + index * height; the final edge is
+    replaced with the exact maximum so accumulated floating error can never
+    push an emitted bin edge past (or short of) the source bounding box.
+    """
+    if count < 1:
+        raise ValueError("edge count must be at least 1")
+    height = (maximum - minimum) / count
+    edges = [minimum + index * height for index in range(count)]
+    edges.append(maximum)
+    return edges
+
+
 def assign_density_bin(
     latitude: float,
     longitude: float,
     bbox: BoundingBox,
     rows: int,
     columns: int,
+    *,
+    lat_edges: Sequence[float] | None = None,
+    lon_edges: Sequence[float] | None = None,
 ) -> tuple[int, int]:
-    """Map a coordinate to its density bin.
+    """Map a coordinate to its density bin using explicit edge arrays.
 
-    Rows run south to north, columns west to east. The exact north/east
+    Rows run south to north, columns west to east. ``bisect_right`` places an
+    exact internal boundary into the higher bin without the floating-point
+    instability of normalizing and flooring a ratio. The exact north/east
     maximum belongs to the final row/column. Nonfinite and out-of-bounds
     coordinates are errors; they are never silently clamped.
     """
@@ -109,34 +130,51 @@ def assign_density_bin(
         raise ValueError(f"nonfinite coordinate: ({latitude!r}, {longitude!r})")
     if not bbox.contains(latitude, longitude):
         raise ValueError(f"coordinate ({latitude!r}, {longitude!r}) lies outside the source bounding box")
-    row = math.floor((latitude - bbox.min_lat) / (bbox.max_lat - bbox.min_lat) * rows)
-    column = math.floor((longitude - bbox.min_lon) / (bbox.max_lon - bbox.min_lon) * columns)
+    if lat_edges is None:
+        lat_edges = build_bin_edges(bbox.min_lat, bbox.max_lat, rows)
+    if lon_edges is None:
+        lon_edges = build_bin_edges(bbox.min_lon, bbox.max_lon, columns)
+    row = bisect_right(lat_edges, latitude) - 1
+    column = bisect_right(lon_edges, longitude) - 1
+    if row < 0 or column < 0:
+        raise ValueError(f"coordinate ({latitude!r}, {longitude!r}) lies outside the source bounding box")
     if row >= rows:
         row = rows - 1
     if column >= columns:
         column = columns - 1
-    return int(row), int(column)
+    return row, column
 
 
-def build_density_bins(bbox: BoundingBox, rows: int, columns: int) -> list[BoundingBox]:
+def build_density_bins(
+    bbox: BoundingBox,
+    rows: int,
+    columns: int,
+    *,
+    lat_edges: Sequence[float] | None = None,
+    lon_edges: Sequence[float] | None = None,
+) -> list[BoundingBox]:
     """Evenly partition the bbox into rows x columns bin bboxes.
 
-    Order is deterministic: row ascending (south to north), then column
-    ascending (west to east).
+    The partition uses the same explicit edge arrays as bin assignment, so an
+    emitted bin boundary and the assignment of a coordinate sitting exactly on
+    that boundary can never disagree. Order is deterministic: row ascending
+    (south to north), then column ascending (west to east).
     """
     if rows < 1 or columns < 1:
         raise ValueError("density grid must have at least one row and one column")
-    lat_height = (bbox.max_lat - bbox.min_lat) / rows
-    lon_width = (bbox.max_lon - bbox.min_lon) / columns
+    if lat_edges is None:
+        lat_edges = build_bin_edges(bbox.min_lat, bbox.max_lat, rows)
+    if lon_edges is None:
+        lon_edges = build_bin_edges(bbox.min_lon, bbox.max_lon, columns)
     bins: list[BoundingBox] = []
     for row in range(rows):
         for column in range(columns):
             bins.append(
                 BoundingBox(
-                    min_lat=bbox.min_lat + row * lat_height,
-                    min_lon=bbox.min_lon + column * lon_width,
-                    max_lat=bbox.min_lat + (row + 1) * lat_height,
-                    max_lon=bbox.min_lon + (column + 1) * lon_width,
+                    min_lat=lat_edges[row],
+                    min_lon=lon_edges[column],
+                    max_lat=lat_edges[row + 1],
+                    max_lon=lon_edges[column + 1],
                 )
             )
     return bins
@@ -178,13 +216,21 @@ def build_recovery_plan(
     if rows < 1 or columns < 1:
         raise ValueError("source grid has zero rows or columns for the recorded cell size")
 
+    lat_edges = build_bin_edges(source_bbox.min_lat, source_bbox.max_lat, rows)
+    lon_edges = build_bin_edges(source_bbox.min_lon, source_bbox.max_lon, columns)
+
     source_grid_estimate = estimate_grid(source_bbox, source_cell_km, query_count)
-    bin_bboxes = build_density_bins(source_bbox, rows, columns)
+    bin_bboxes = build_density_bins(
+        source_bbox, rows, columns, lat_edges=lat_edges, lon_edges=lon_edges
+    )
 
     counts = [0] * (rows * columns)
     associated = 0
     for latitude, longitude in coordinates:
-        row, column = assign_density_bin(latitude, longitude, source_bbox, rows, columns)
+        row, column = assign_density_bin(
+            latitude, longitude, source_bbox, rows, columns,
+            lat_edges=lat_edges, lon_edges=lon_edges,
+        )
         counts[row * columns + column] += 1
         associated += 1
 

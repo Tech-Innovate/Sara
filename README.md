@@ -175,7 +175,7 @@ sara --db data/sara.db recovery-plan \
 Boundaries of this feature:
 
 - Planning is read-only and non-executing. It opens the database through a read-only connection, performs no schema/data mutation, and never launches Docker or contacts Google Maps.
-- All thresholds are explicit inputs on every invocation. `tier_b_min >= 11` / `tier_a_min >= 15` are pilot values calibrated on three bounded Jeddah `restaurant` tiles; they are not defaults and are not universally validated. Candidate 11 formally failed the incremental-capture criterion on the sparse third tile.
+- All thresholds are explicit inputs on every invocation. `--tier-b-min 11` and `--tier-a-min 15` are the pilot values calibrated on three bounded Jeddah `restaurant` tiles; they are not defaults and are not universally validated. Candidate 11 formally failed the incremental-capture criterion on the sparse third tile.
 - Density bins are equal partitions of the recorded bbox for summarizing spatial density. They are not upstream scraper cells and do not claim which search origin discovered a business.
 - The planner only accepts a source run whose associated businesses still carry `last_run_id` equal to that run. If a later overlapping run has updated any associated business, current coordinates are no longer safe evidence for the older run and planning fails closed. Generate and preserve the plan before later overlapping runs when historical reproducibility matters.
 - The generated plan is deterministic for a given database snapshot and arguments (no timestamps, absolute paths, host or PID in the payload) and is written exclusively, never overwritten. Retain it as frozen evidence; the printed SHA-256 identifies the exact bytes.

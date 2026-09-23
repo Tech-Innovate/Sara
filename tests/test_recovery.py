@@ -6,6 +6,7 @@ from sara.grid import estimate_grid
 from sara.recovery import (
     RecoveryPolicy,
     assign_density_bin,
+    build_bin_edges,
     build_density_bins,
     build_recovery_plan,
     classify_density,
@@ -257,3 +258,52 @@ class TestSerialize:
         text = serialize_recovery_plan(self._plan())
         for banned in ("timestamp", "generated_at", "hostname", " pid", "db_path", "output_path", "uuid"):
             assert banned not in text.lower()
+
+
+class TestExplicitBinEdges:
+    def test_reviewer_boundary_regression_ir_f03(self):
+        # The exact internal edge generated for bbox 0.1..0.13 with 7 rows
+        # normalizes to 0.9999999999999991 and floors to bin 0 under the old
+        # ratio/floor assignment. bisect over explicit edges must return 1.
+        import math
+
+        edges = build_bin_edges(0.1, 0.13, 7)
+        assert edges[1] == 0.1 + (0.13 - 0.1) / 7
+        assert math.floor((edges[1] - 0.1) / (0.13 - 0.1) * 7) == 0  # old defect
+        bbox = BoundingBox(0.1, 0.1, 0.13, 0.13)
+        row, _column = assign_density_bin(edges[1], 0.11, bbox, 7, 7)
+        assert row == 1
+
+    def test_every_internal_edge_belongs_to_its_upper_bin(self):
+        bbox = BoundingBox(0.1, 39.16, 0.13, 39.26)
+        lat_edges = build_bin_edges(0.1, 0.13, 7)
+        for index in range(1, 7):
+            row, _column = assign_density_bin(lat_edges[index], 39.20, bbox, 7, 7)
+            assert row == index
+
+    def test_final_edge_is_pinned_to_exact_maximum(self):
+        edges = build_bin_edges(0.1, 0.13, 7)
+        assert edges[0] == 0.1
+        assert edges[-1] == 0.13
+
+    def test_emitted_bin_edges_equal_source_bounds_exactly(self):
+        bbox = BoundingBox(0.1, 39.16, 0.13, 39.26)
+        bins = build_density_bins(bbox, 7, 5)
+        assert bins[0].min_lat == bbox.min_lat
+        assert bins[0].min_lon == bbox.min_lon
+        assert bins[-1].max_lat == bbox.max_lat
+        assert bins[-1].max_lon == bbox.max_lon
+
+    def test_assignment_and_emitted_bins_share_edges(self):
+        source_bbox = BoundingBox(0.1, 0.1, 0.13, 0.13)
+        lat_edges = build_bin_edges(0.1, 0.13, 7)
+        lon_edges = build_bin_edges(0.1, 0.13, 7)
+        bins = build_density_bins(source_bbox, 7, 7, lat_edges=lat_edges, lon_edges=lon_edges)
+        # A coordinate exactly on bin (2,3)'s minimum edges lands in bin (2,3).
+        row, column = assign_density_bin(
+            lat_edges[2], lon_edges[3], source_bbox, 7, 7,
+            lat_edges=lat_edges, lon_edges=lon_edges,
+        )
+        assert (row, column) == (2, 3)
+        assert bins[row * 7 + column].min_lat == lat_edges[2]
+        assert bins[row * 7 + column].min_lon == lon_edges[3]
