@@ -21,6 +21,14 @@ def _fake_scraper_ok(command, *, area_of, results_writer):
 class FakeScraper:
     """Simulates the pinned scraper: writes sidecar + results, returns 0."""
 
+    @staticmethod
+    def _mount_from_command(command):
+        """Find the /out bind mount; host paths may be POSIX or Windows."""
+        for arg in command:
+            if arg.endswith(":/out") and arg != "gmaps-playwright-cache:/opt":
+                return arg[: -len(":/out")]
+        raise AssertionError("no /out bind mount found in command")
+
     def __init__(self, plans_by_container, records_by_run):
         self.launches = []
         self.plans_by_container = plans_by_container  # container -> (bin, run_id, plan)
@@ -34,9 +42,7 @@ class FakeScraper:
         expected = expected_resume_input_ids(
             type("Area", (), {"bbox": bin_record.bbox})(), list(plan.queries), plan.recovery_cell_km
         )
-        # locate the output dir from the bind mount argument
-        mount = next(arg for arg in command if arg.startswith("/") and arg.endswith(":/out"))
-        out_dir = mount[: -len(":/out")]
+        out_dir = self._mount_from_command(command)
         from pathlib import Path
         results = Path(out_dir) / "results.jsonl"
         with open(results, "w", encoding="utf-8") as handle:
@@ -183,9 +189,8 @@ class TestExecutionLifecycle:
                 list(plan_obj.queries), plan_obj.recovery_cell_km,
             )
             half = sorted(expected)[: len(expected) // 2]
-            mount = next(a for a in command if a.startswith("/") and a.endswith(":/out"))
             from pathlib import Path
-            results = Path(mount[: -len(":/out")]) / "results.jsonl"
+            results = Path(FakeScraper._mount_from_command(command)) / "results.jsonl"
             with open(results, "w", encoding="utf-8") as handle:
                 handle.write(json.dumps({"place_id": "x", "latitude": 0.01, "longitude": 0.01}) + "\n")
             Path(str(results) + ".resume.json").write_text(
@@ -216,9 +221,8 @@ class TestExecutionLifecycle:
                 list(plan_obj.queries), plan_obj.recovery_cell_km,
             )
             ids = sorted(expected) + ["resume:" + "f" * 64]
-            mount = next(a for a in command if a.startswith("/") and a.endswith(":/out"))
             from pathlib import Path
-            results = Path(mount[: -len(":/out")]) / "results.jsonl"
+            results = Path(FakeScraper._mount_from_command(command)) / "results.jsonl"
             results.write_text("", encoding="utf-8")
             Path(str(results) + ".resume.json").write_text(
                 json.dumps({"version": 1, "completed_inputs": ids}), encoding="utf-8"
@@ -419,20 +423,42 @@ class TestSourceDrift:
         data, sha, db, plan, fake = _install(
             monkeypatch, tmp_path, records_for=_records_for_bin
         )
-        # A later overlapping run adds a recovery-discovered business to the
-        # SOURCE run's membership after planning but before metrics.
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
         conn = connect(db)
+        result_before = json.loads(conn.execute(
+            "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()["result_json"])
+        assert result_before["source_membership_at_plan_count"] == 5
+        assert result_before["source_membership_current_count"] == 5
 
-        def records_with_drift(bin_record, run_id):
-            records = _records_for_bin(bin_record, run_id)
-            return records
-
+        # Post-execution convergence: a later observation adds one recovery
+        # child's business to the source run's membership. Metrics are
+        # recomputed at re-finalization from CURRENT membership.
+        child_id = conn.execute(
+            "SELECT run_id FROM recovery_execution_bins WHERE plan_sha256 = ? "
+            "ORDER BY row, column LIMIT 1", (sha,)
+        ).fetchone()["run_id"]
+        biz = conn.execute(
+            "SELECT b.id FROM businesses b JOIN run_businesses rb ON rb.business_id = b.id "
+            "WHERE rb.run_id = ? LIMIT 1", (child_id,)
+        ).fetchone()
+        conn.execute(
+            "INSERT OR IGNORE INTO run_businesses(run_id, business_id, first_observed_at) "
+            "VALUES ('src-run', ?, 'later')", (biz["id"],)
+        )
+        conn.execute(
+            "UPDATE recovery_executions SET status = 'failed', result_json = NULL WHERE plan_sha256 = ?",
+            (sha,),
+        )
+        conn.commit()
+        monkeypatch.setattr(cli, "_docker_inspect_container", lambda name: None)
         rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
         assert rc == 0
-        parent = conn.execute(
+        result_after = json.loads(conn.execute(
             "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
-        ).fetchone()
-        result = json.loads(parent["result_json"])
-        assert result["source_membership_at_plan_count"] == 5
-        assert result["source_membership_current_count"] == 5
+        ).fetchone()["result_json"])
+        assert result_after["source_membership_at_plan_count"] == 5
+        assert result_after["source_membership_current_count"] == 6
+        assert result_after["source_increment_businesses"] == result_before["source_increment_businesses"] - 1
+        assert result_after["unique_recovery_seen"] == result_before["unique_recovery_seen"]
         conn.close()

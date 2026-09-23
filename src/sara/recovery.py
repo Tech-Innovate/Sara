@@ -367,7 +367,7 @@ import re as _re
 
 _RUN_ID_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _PLAN_SHA_RE = _re.compile(r"^[0-9a-f]{64}$")
-_IMAGE_DIGEST_RE = _re.compile(r"^[^-\s]+@sha256:[0-9a-f]{64}$")
+_IMAGE_DIGEST_RE = _re.compile(r"^(?!-)[^\s]+@sha256:[0-9a-f]{64}$")
 
 SIX_DECIMAL_MIN_STEP_DEG = 1e-6
 
@@ -487,7 +487,13 @@ def _require_int(value: Any, where: str) -> int:
 def _require_number(value: Any, where: str) -> float | int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _reject(f"{where} must be a number")
-    if not math.isfinite(value):
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        # An integer too large for float representation is finite as an
+        # integer but cannot be a usable plan number; reject cleanly.
+        _reject(f"{where} is an integer too large to represent as a plan number")
+    if not finite:
         _reject(f"{where} must be finite")
     return value
 
@@ -703,6 +709,10 @@ def parse_execution_plan(data: bytes) -> ExecutionPlan:
         count = _require_int(bin_raw["business_count"], f"{where}.business_count")
         if count < 0:
             _reject(f"{where}.business_count must be nonnegative")
+        if not (0 <= row < expected_rows):
+            _reject(f"{where}.row is outside the plan grid (0..{expected_rows - 1})")
+        if not (0 <= column < expected_columns):
+            _reject(f"{where}.column is outside the plan grid (0..{expected_columns - 1})")
         if index != row * expected_columns + column:
             _reject("plan.bins order must be row-major south-to-north west-to-east")
         expected_bbox = BoundingBox(

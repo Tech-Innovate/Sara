@@ -614,7 +614,11 @@ def connect_existing(path: str | Path) -> sqlite3.Connection:
     db_path = Path(path)
     if not db_path.is_file():
         raise FileNotFoundError(f"database does not exist: {db_path}")
-    conn = sqlite3.connect(db_path, timeout=5.0)
+    # mode=rw makes SQLite itself refuse to create the file if it disappears
+    # between the is_file() check and the open (a disappearance race would
+    # otherwise silently produce an empty database).
+    uri = f"{db_path.resolve().as_uri()}?mode=rw"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -632,23 +636,23 @@ def verify_recovery_schema(conn: sqlite3.Connection) -> None:
     _verify_table_columns(
         conn, "recovery_executions",
         [
-            ("plan_sha256", "TEXT", 1), ("source_run_id", "TEXT", 0),
-            ("plan_schema_version", "INTEGER", 0), ("plan_kind", "TEXT", 0),
-            ("policy_id", "TEXT", 0), ("output_root", "TEXT", 0),
-            ("plan_snapshot_path", "TEXT", 0), ("selected_bins", "INTEGER", 0),
-            ("planned_searches", "INTEGER", 0), ("status", "TEXT", 0),
-            ("started_at", "TEXT", 0), ("finished_at", "TEXT", 0),
-            ("error", "TEXT", 0), ("result_json", "TEXT", 0),
+            ("plan_sha256", "TEXT", 1, False), ("source_run_id", "TEXT", 0, False),
+            ("plan_schema_version", "INTEGER", 0, False), ("plan_kind", "TEXT", 0, False),
+            ("policy_id", "TEXT", 0, False), ("output_root", "TEXT", 0, False),
+            ("plan_snapshot_path", "TEXT", 0, False), ("selected_bins", "INTEGER", 0, False),
+            ("planned_searches", "INTEGER", 0, False), ("status", "TEXT", 0, False),
+            ("started_at", "TEXT", 0, False), ("finished_at", "TEXT", 0, True),
+            ("error", "TEXT", 0, True), ("result_json", "TEXT", 0, True),
         ],
         expected_pk=["plan_sha256"],
     )
     _verify_table_columns(
         conn, "recovery_execution_bins",
         [
-            ("plan_sha256", "TEXT", 1), ("row", "INTEGER", 2),
-            ("column", "INTEGER", 3), ("tier", "TEXT", 0),
-            ("bbox_json", "TEXT", 0), ("planned_searches", "INTEGER", 0),
-            ("run_id", "TEXT", 0), ("container_name", "TEXT", 0),
+            ("plan_sha256", "TEXT", 1, False), ("row", "INTEGER", 2, False),
+            ("column", "INTEGER", 3, False), ("tier", "TEXT", 0, False),
+            ("bbox_json", "TEXT", 0, False), ("planned_searches", "INTEGER", 0, False),
+            ("run_id", "TEXT", 0, True), ("container_name", "TEXT", 0, False),
         ],
         expected_pk=["plan_sha256", "row", "column"],
     )
@@ -675,14 +679,26 @@ def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     rows = list(conn.execute(f"PRAGMA table_info({table})"))
     if not rows:
         raise RecoverySchemaError(f"table {table} does not exist")
+    # expected rows carry (name, type, pk_ordinal); nullability is required
+    # for every non-PK column (SQLite reports TEXT PRIMARY KEY columns as
+    # nullable in table_info unless NOT NULL is declared, which is accepted
+    # for PK columns whose uniqueness already implies presence).
     actual = [(row["name"], row["type"], row["pk"]) for row in rows]
-    if actual != expected:
+    expected_layout = [(name, ctype, pk) for name, ctype, pk, _n in expected]
+    if actual != expected_layout:
         raise RecoverySchemaError(
             f"table {table} has an incompatible column layout: {actual!r}"
         )
     pk_columns = [row["name"] for row in sorted((r for r in rows if r["pk"]), key=lambda r: r["pk"])]
     if pk_columns != expected_pk:
         raise RecoverySchemaError(f"table {table} primary key does not match: {pk_columns!r}")
+    expected_by_name = {name: (ctype, pk, nullable) for name, ctype, pk, nullable in expected}
+    for row in rows:
+        ctype, pk, nullable = expected_by_name[row["name"]]
+        if pk == 0 and not nullable and row["notnull"] != 1:
+            raise RecoverySchemaError(
+                f"table {table} column {row['name']} must be declared NOT NULL"
+            )
 
 
 def _verify_unique_index(conn, table, column) -> None:
@@ -1124,12 +1140,20 @@ def finalize_recovery_execution(
         """
         SELECT COUNT(*) AS n FROM recovery_execution_bins rb
         LEFT JOIN runs r ON r.id = rb.run_id
-        WHERE rb.plan_sha256 = ? AND (rb.run_id IS NULL OR r.status != 'complete')
+        WHERE rb.plan_sha256 = ?
+          AND (rb.run_id IS NULL OR r.id IS NULL OR r.status != 'complete')
         """,
         (plan_sha256,),
     ).fetchone()["n"]
     if incomplete:
         raise RecoverySchemaError("cannot finalize: selected children are not all complete")
+    status_row = conn.execute(
+        "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (plan_sha256,)
+    ).fetchone()
+    if status_row is None or status_row["status"] not in (
+        "running", "interrupted", "failed", "complete"
+    ):
+        raise RecoverySchemaError("cannot finalize: parent status is invalid")
     metrics = compute_recovery_metrics(conn, plan_sha256, source_run_id, at_plan_count)
     result_json = json.dumps(
         metrics, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
