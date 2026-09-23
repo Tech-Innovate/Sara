@@ -951,6 +951,20 @@ def register_recovery_execution(
             raise RecoverySchemaError(
                 f"existing recovery execution has invalid status {existing['status']!r}"
             )
+        # SR-F5-04: parent terminal lifecycle fields must be consistent.
+        _ps = existing["status"]
+        _pf = existing["finished_at"]
+        _pe = existing["error"]
+        if _ps == "complete":
+            if not isinstance(_pf, str) or not _pf:
+                raise RecoverySchemaError("complete recovery execution has no finished_at")
+            if _pe is not None:
+                raise RecoverySchemaError("complete recovery execution carries an error")
+        elif _ps == "running":
+            if _pf is not None:
+                raise RecoverySchemaError("running recovery execution has a finished_at")
+        elif not isinstance(_pf, str) or not _pf:
+            raise RecoverySchemaError(f"{_ps} recovery execution has no finished_at")
         # V2-F03: the complete deterministic mapping set is validated for
         # every existing parent (complete or resumable) before any
         # status-specific behavior.
