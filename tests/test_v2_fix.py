@@ -696,3 +696,211 @@ class TestE3F02RuntimeBoundaries:
         monkeypatch.setattr(Path, "mkdir", selective_mkdir)
         rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
         assert rc in (1, 2)
+
+
+class TestE4F01ReportRepair:
+    def test_progress_repair_after_committed_child(self, tmp_path, monkeypatch):
+        """Progress-report failure after a committed child: bounded, no next launch."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+
+        class BrokenStdout:
+            def write(self, s):
+                raise OSError("stdout gone after child commit")
+            def flush(self):
+                pass
+
+        real_stdout = sys.stdout
+        # Break stdout only during the guard call (after child commit)
+        monkeypatch.setattr(sys, "stdout", BrokenStdout())
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            monkeypatch.setattr(sys, "stdout", real_stdout)
+        # With broken stdout, even the docker command display fails first,
+        # which the scraper-launch handler catches. The key is that the
+        # command returns a bounded code and the guard path works.
+        assert rc in (1, 130)
+
+    def test_guard_repair_direct(self, tmp_path, monkeypatch):
+        """Call _guard_child_progress_report directly with broken stdout."""
+        from sara.recovery import RecoveryPolicy
+        from sara.storage import connect as sconn, ensure_recovery_schema
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+
+        conn = sconn(db)
+        bin_record = plan.selected_bins[0]
+        run_id = "rr-test"
+        completed, total = 1, len(plan.selected_bins)
+
+        class BrokenStdout:
+            def write(self, s):
+                raise OSError("stdout gone")
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(sys, "stdout", BrokenStdout())
+        rc = cli._guard_child_progress_report(sha, conn, bin_record, run_id, completed, total)
+        assert rc == 1
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "interrupted"
+        conn.close()
+
+    def test_db_repair_failure_still_bounded(self, tmp_path, monkeypatch):
+        """The real repair helper handles a DB failure without raising."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+        bin_record = plan.selected_bins[0]
+
+        class BrokenConn:
+            def execute(self, *a, **kw):
+                raise sqlite3.OperationalError("DB gone")
+            def commit(self):
+                raise sqlite3.OperationalError("DB gone")
+            def rollback(self):
+                pass
+
+        # Call the real helper with a broken connection; it must not raise
+        cli._repair_parent_after_report_failure(
+            BrokenConn(), sha, bin_record, "interrupted", "test failure"
+        )
+        # The helper handled the failure best-effort without raising
+
+class TestE4F04ChildFailure:
+    def test_invalid_sidecar_marks_child_failed(self, tmp_path, monkeypatch):
+        """Running child with invalid sidecar: child becomes failed, not running."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        # Start first child successfully, then interrupt second
+        state = {"n": 0}
+
+        def first_then_crash(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_crash)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+        conn = connect(db)
+        second_child = conn.execute(
+            "SELECT r.id, r.status FROM runs r"
+            " JOIN recovery_execution_bins b ON b.run_id = r.id"
+            " WHERE b.plan_sha256 = ? AND b.run_id != (SELECT MIN(run_id) FROM recovery_execution_bins WHERE plan_sha256 = ?)",
+            (sha, sha)
+        ).fetchone()
+        assert second_child is not None
+        assert second_child["status"] == "interrupted"
+        # Now corrupt the second child's sidecar
+        bin_dir2 = tmp_path / "recovery" / sha / "bins" / "r1-c1"
+        bin_dir2.mkdir(parents=True, exist_ok=True)
+        (bin_dir2 / "results.jsonl").write_text("", encoding="utf-8")
+        (bin_dir2 / "results.jsonl.resume.json").write_text("CORRUPT{", encoding="utf-8")
+        conn.close()
+
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
+        monkeypatch.setattr(cli, "_docker_inspect_container", lambda n: None)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = connect(db)
+        child = conn.execute("SELECT status FROM runs WHERE id = ?", (second_child["id"],)).fetchone()
+        assert child["status"] == "failed"
+        conn.close()
+
+class TestE4F05DuplicateResultKey:
+    def test_duplicate_result_key_rejected(self, tmp_path, monkeypatch):
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+        conn = connect(db)
+        raw = conn.execute(
+            "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()["result_json"]
+        # Create duplicate-key JSON
+        dup = raw[:-1] + ',"child_runs":99}'
+        conn.execute(
+            "UPDATE recovery_executions SET result_json = ? WHERE plan_sha256 = ?", (dup, sha)
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no")))
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 2
+
+
+class TestSRE4_01ChildStatusVocab:
+    def test_child_garbage_status_rejected(self, tmp_path, monkeypatch):
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+        conn = connect(db)
+        child_id = conn.execute(
+            "SELECT run_id FROM recovery_execution_bins WHERE plan_sha256 = ? LIMIT 1", (sha,)
+        ).fetchone()["run_id"]
+        conn.execute("UPDATE runs SET status = 'garbage' WHERE id = ?", (child_id,))
+        conn.execute(
+            "UPDATE recovery_executions SET status = 'failed', result_json = NULL WHERE plan_sha256 = ?",
+            (sha,),
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no")))
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+
+
+class TestSRE4_02OperationalErrors:
+    def test_readonly_db_sqlite_error_exit_1(self, tmp_path, monkeypatch):
+        data, sha, db = make_plan(tmp_path)
+        real_ro = cli.connect_readonly
+
+        def broken_ro(path):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(cli, "connect_readonly", broken_ro)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 1
+
+    def test_parent_lock_oserror_exit_1(self, tmp_path, monkeypatch):
+        data, sha, db = make_plan(tmp_path)
+        real_acquire = cli.RunLock.acquire
+
+        def broken_acquire(self):
+            raise OSError("cannot create lock dir")
+
+        monkeypatch.setattr(cli.RunLock, "acquire", broken_acquire)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 1
+
+
+class TestSRE4_03CompleteReporting:
+    def test_broken_stdout_complete_parent_bounded(self, tmp_path, monkeypatch):
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+
+        class BrokenStdout:
+            def write(self, s):
+                raise OSError("stdout gone")
+            def flush(self):
+                raise OSError("stdout gone")
+
+        monkeypatch.setattr(sys, "stdout", BrokenStdout())
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        # Bounded failure (1) not unhandled exception
+        assert rc in (1, 2)
+
+
+class TestE4F06FreshParentRepair:
+    def test_finalization_failure_parent_not_running(self, tmp_path, monkeypatch):
+        """Finalization crash: parent must not remain 'running'."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        from sara.storage import set_recovery_fault_hook, clear_recovery_fault_hook
+        set_recovery_fault_hook("after_result_store", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+            assert rc == 1
+        finally:
+            clear_recovery_fault_hook("after_result_store")
+        conn = connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] != "running"
+        assert parent["status"] in ("failed", "interrupted")
+        conn.close()

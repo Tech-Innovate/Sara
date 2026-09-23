@@ -1037,6 +1037,44 @@ def _best_effort_stderr(message: str) -> None:
         pass
 
 
+def _best_effort_parent_failure(conn, plan_sha256, message):
+    """Best-effort transition of an active parent to failed (E4-F06)."""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            set_recovery_parent_status(conn, plan_sha256, "failed", message)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    except Exception as exc:
+        _best_effort_stderr(f"warning: parent failure repair failed: {exc}")
+
+
+def _repair_parent_after_report_failure(conn, plan_sha256, bin_record, status, detail):
+    """Rollback-safe parent repair after a committed child report failure.
+
+    Never alters the completed child. If the DB repair itself fails, emits
+    best-effort stderr and returns without raising (E4-F01).
+    """
+    message = (
+        f"child r{bin_record.row}-c{bin_record.column} completed; "
+        f"{detail}; no further bins scheduled"
+    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            set_recovery_parent_status(conn, plan_sha256, status, message)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    except Exception as db_exc:
+        _best_effort_stderr(
+            f"warning: parent status repair failed after child completion: {db_exc}"
+        )
+
+
 def _guard_final_report(plan_sha256, report) -> int:
     try:
         report()
@@ -1124,6 +1162,9 @@ def cmd_recovery_run(args) -> int:
         conn = connect_readonly(args.db)
     except FileNotFoundError as exc:
         return reject(str(exc))
+    except sqlite3.Error as exc:
+        print(f"recovery-run failed to open database read-only: {exc}", file=sys.stderr)
+        return 1
     try:
         conn.execute("BEGIN")
         bind_plan_to_source(conn, plan)
@@ -1186,6 +1227,9 @@ def cmd_recovery_run(args) -> int:
         parent_lock.acquire()
     except RuntimeError as exc:
         return reject(f"recovery execution is already active: {exc}")
+    except OSError as exc:
+        print(f"recovery-run failed to create parent lock: {exc}", file=sys.stderr)
+        return 1
 
     try:
         conn = None
@@ -1228,13 +1272,15 @@ def cmd_recovery_run(args) -> int:
                 )
             except PlanRejected as exc:
                 return reject(f"stored complete execution is inconsistent: {exc}")
-            print("recovery-run already complete")
             try:
+                print("recovery-run already complete")
                 print(stored_result)
+            except KeyboardInterrupt:
+                _best_effort_stderr("recovery-run already complete; reporting interrupted")
+                return 130
             except Exception as report_exc:
-                print(
-                    f"recovery-run already complete but result printing failed: {report_exc}",
-                    file=sys.stderr,
+                _best_effort_stderr(
+                    f"recovery-run already complete but reporting failed: {report_exc}"
                 )
                 return 1
             return 2
@@ -1272,6 +1318,7 @@ def cmd_recovery_run(args) -> int:
                     snapshot_path.unlink()
                 _write_plan_snapshot(snapshot_path, data)
             except OSError as exc:
+                _best_effort_parent_failure(conn, plan_sha256, f"plan snapshot write failed: {exc}")
                 print(f"recovery-run failed to write plan snapshot: {exc}", file=sys.stderr)
                 return 1
 
@@ -1360,6 +1407,9 @@ def cmd_recovery_run(args) -> int:
             if isinstance(finalize_exc, KeyboardInterrupt):
                 raise
 
+            _best_effort_parent_failure(
+                conn, plan_sha256, f"finalization failed: {finalize_exc}"
+            )
             print(
                 f"recovery-run finalization failed: {finalize_exc}",
                 file=sys.stderr,
@@ -1447,6 +1497,12 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
         raise PlanRejected(f"child {expected_run_id} config_json disagrees with the plan-derived configuration")
     if child["raw_path"] != expected_raw:
         raise PlanRejected(f"child {expected_run_id} raw_path disagrees with the deterministic bin path")
+    # SR-E4-01: child status must be a known lifecycle state; corrupted
+    # status is an inconsistent-state rejection, never silently normalized.
+    if child["status"] not in ("running", "interrupted", "failed", "complete"):
+        raise PlanRejected(
+            f"child {expected_run_id} has invalid status {child['status']!r}"
+        )
     return child
 
 
@@ -1476,10 +1532,19 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
     ).fetchone()["result_json"]
     if not isinstance(result_raw, str) or not result_raw:
         raise PlanRejected("complete parent has no stored result_json")
+    def _no_dup_result_keys(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise ValueError(f"duplicate result key: {key!r}")
+            seen.add(key)
+        return dict(pairs)
+
     try:
         result = json.loads(
             result_raw,
             parse_constant=lambda t: (_ for _ in ()).throw(ValueError(f"non-standard constant {t!r}")),
+            object_pairs_hook=_no_dup_result_keys,
         )
     except ValueError as exc:
         raise PlanRejected(f"complete parent result_json is not valid strict JSON: {exc}")
@@ -1681,13 +1746,17 @@ def _execute_recovery_child(
                     completed_ids = load_resume_completed_input_ids(
                         output_file, plan.scraper_image
                     )
-                except RuntimeError as exc:
+                except (RuntimeError, OSError) as exc:
+                    # E4-F04: invalid evidence is a child failure, not just
+                    # a parent failure; preserve the child's exit_code.
+                    child_mark_no_exit("failed", f"existing resume evidence is invalid: {exc}")
                     raise _ChildFailure(
                         status="failed", process_exit=1,
                         error=f"existing resume evidence is invalid: {exc}",
                     ) from exc
                 comparison = expected_inputs.compare_completed(completed_ids)
                 if comparison.unexpected:
+                    child_mark_no_exit("failed", "existing resume evidence contains unexpected input IDs")
                     raise _ChildFailure(
                         status="failed", process_exit=1,
                         error="existing resume evidence contains unexpected input IDs",
