@@ -542,7 +542,7 @@ def iter_jsonl(path: str | Path):
 
 RECOVERY_EXECUTIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS recovery_executions (
-    plan_sha256 TEXT PRIMARY KEY,
+    plan_sha256 TEXT PRIMARY KEY NOT NULL,
     source_run_id TEXT NOT NULL,
     plan_schema_version INTEGER NOT NULL,
     plan_kind TEXT NOT NULL,
@@ -699,16 +699,24 @@ def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
             raise RecoverySchemaError(
                 f"table {table} column {row['name']} must be declared NOT NULL"
             )
+        if pk == 0 and nullable and row["notnull"] == 1:
+            raise RecoverySchemaError(
+                f"table {table} column {row['name']} must be nullable (terminal column)"
+            )
 
 
 def _verify_unique_index(conn, table, column) -> None:
     for index in conn.execute(f"PRAGMA index_list({table})"):
         if not index["unique"]:
             continue
+        # A partial unique index does not enforce uniqueness for rows outside
+        # its WHERE clause; only a full unique constraint is acceptable.
+        if index["partial"]:
+            continue
         columns = [row["name"] for row in conn.execute(f"PRAGMA index_info({index['name']})")]
         if columns == [column]:
             return
-    raise RecoverySchemaError(f"table {table} is missing the UNIQUE constraint on {column}")
+    raise RecoverySchemaError(f"table {table} is missing a full UNIQUE constraint on {column}")
 
 
 _SOURCE_RUN_COLUMNS = (
@@ -934,8 +942,16 @@ def register_recovery_execution(
                     f"existing recovery execution for this plan hash has a different {field}; "
                     "refusing to resume an inconsistent execution"
                 )
-        if existing["status"] == "complete":
-            return "complete"
+        # SR-V2-03: parent status must be one of the known lifecycle states;
+        # corrupted status is an inconsistent-state rejection, never silently
+        # normalized to running.
+        if existing["status"] not in ("running", "interrupted", "failed", "complete"):
+            raise RecoverySchemaError(
+                f"existing recovery execution has invalid status {existing['status']!r}"
+            )
+        # V2-F03: the complete deterministic mapping set is validated for
+        # every existing parent (complete or resumable) before any
+        # status-specific behavior.
         registered = list(conn.execute(
             "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
             "FROM recovery_execution_bins WHERE plan_sha256 = ? ORDER BY row, column",
@@ -947,16 +963,26 @@ def register_recovery_execution(
                 "existing recovery execution has an inconsistent registered bin set"
             )
         for recorded, expected in zip(registered, expected_bins):
+            expected_bbox_json = json.dumps({
+                "min_lat": expected.bbox.min_lat,
+                "min_lon": expected.bbox.min_lon,
+                "max_lat": expected.bbox.max_lat,
+                "max_lon": expected.bbox.max_lon,
+            }, ensure_ascii=False, sort_keys=True)
             if (
                 recorded["row"] != expected.row
                 or recorded["column"] != expected.column
                 or recorded["tier"] != expected.tier
+                or recorded["bbox_json"] != expected_bbox_json
                 or recorded["planned_searches"] != (expected.planned_searches or 0)
                 or recorded["container_name"] != container_names[(expected.row, expected.column)]
             ):
                 raise RecoverySchemaError(
                     "existing recovery execution bin mapping does not match the plan"
                 )
+            expected_run_id = None  # unstarted is valid; started checked in CLI provenance
+        if existing["status"] == "complete":
+            return "complete"
         return "resumed"
 
     conn.execute(

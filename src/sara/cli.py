@@ -1027,6 +1027,14 @@ def _guard_child_progress_report(plan_sha256, conn, bin_record, run_id, complete
         return 1
 
 
+def _safe_release(lock) -> None:
+    """Release a RunLock without letting unlink failure overwrite committed state."""
+    try:
+        lock.release()
+    except Exception as exc:
+        _best_effort_stderr(f"warning: lock release failed for {lock.path}: {exc}")
+
+
 def _best_effort_stderr(message: str) -> None:
     """Print to stderr; a broken stderr cannot reclassify a completed effect."""
     try:
@@ -1294,20 +1302,23 @@ def cmd_recovery_run(args) -> int:
                 if child_row["status"] == "complete":
                     completed_count += 1
                     continue
-            if not progress_started:
-                progress_started = True
-                if state == "resumed":
-                    conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        resume_recovery_parent(conn, plan_sha256)
-                        conn.commit()
-                    except BaseException:
-                        conn.rollback()
-                        raise
+            def mark_parent_running():
+                nonlocal progress_started
+                if not progress_started:
+                    progress_started = True
+                    if state == "resumed":
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            resume_recovery_parent(conn, plan_sha256)
+                            conn.commit()
+                        except BaseException:
+                            conn.rollback()
+                            raise
             try:
                 outcome = _execute_recovery_child(
                     conn, plan, plan_sha256, execution_root, bin_record,
                     mapping, proxy_path, container_names[(bin_record.row, bin_record.column)],
+                    mark_parent_running=mark_parent_running,
                 )
             except _ChildFailure as failure:
                 if failure.status != "none":
@@ -1350,9 +1361,17 @@ def cmd_recovery_run(args) -> int:
                 conn, plan_sha256, plan.source_run_id, plan.associated_businesses
             )
             conn.commit()
-        except BaseException:
+        except BaseException as finalize_exc:
             conn.rollback()
-            raise
+            if isinstance(finalize_exc, KeyboardInterrupt):
+                raise
+            if isinstance(finalize_exc, KeyboardInterrupt):
+                raise
+            print(
+                f"recovery-run finalization failed: {finalize_exc}",
+                file=sys.stderr,
+            )
+            return 1
 
         result_json = conn.execute(
             "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?",
@@ -1366,7 +1385,12 @@ def cmd_recovery_run(args) -> int:
             ),
         )
     finally:
-        parent_lock.release()
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        _safe_release(parent_lock)
 
 
 _RESULT_V1_INT_FIELDS = (
@@ -1473,7 +1497,8 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
 
 
 def _execute_recovery_child(
-    conn, plan, plan_sha256, execution_root, bin_record, mapping, proxy_path, container_name
+    conn, plan, plan_sha256, execution_root, bin_record, mapping, proxy_path, container_name,
+    *, mark_parent_running=None,
 ) -> str:
     row, column = bin_record.row, bin_record.column
     run_id = _recovery_child_run_id(plan_sha256, row, column)
@@ -1549,17 +1574,33 @@ def _execute_recovery_child(
             # name: remove exactly this container after label ownership was
             # verified, then continue reconciliation.
             removed = subprocess.run(
-                ["docker", "rm", container_name],
+                ["docker", "rm", container_id],
                 capture_output=True, text=True, check=False,
             )
             if removed.returncode != 0:
-                raise _ChildFailure(
-                    status="failed", process_exit=1,
-                    error=(
-                        f"failed to remove stopped owned container {container_name}: "
-                        f"{removed.stderr.strip() or removed.returncode}"
-                    ),
-                )
+                stderr_text = removed.stderr or ""
+                if "no such container" in stderr_text.lower():
+                    # SR-V2-02: the inspected ID disappeared; re-inspect the
+                    # name to detect a replacement before acting further.
+                    recheck = _docker_inspect_container(container_name)
+                    if recheck is not None:
+                        raise _ChildFailure(
+                            status="none", process_exit=2,
+                            error=(
+                                f"container name {container_name} now holds a replacement "
+                                "after the inspected container disappeared; refusing to "
+                                "remove a replacement without fresh ownership verification"
+                            ),
+                        )
+                    # Name absent: the stopped container is gone; continue.
+                else:
+                    raise _ChildFailure(
+                        status="failed", process_exit=1,
+                        error=(
+                            f"failed to remove stopped owned container {container_id}: "
+                            f"{stderr_text.strip() or removed.returncode}"
+                        ),
+                    )
 
         options = ScrapeOptions(
             cell_km=plan.recovery_cell_km, depth=plan.depth,
@@ -1630,6 +1671,9 @@ def _execute_recovery_child(
                         error="existing resume evidence contains unexpected input IDs",
                     )
                 if comparison.missing == 0:
+                    # V2-F05: actual progress (direct ingestion) begins now.
+                    if mark_parent_running is not None:
+                        mark_parent_running()
                     recorded_exit = conn.execute(
                         "SELECT exit_code FROM runs WHERE id = ?",
                         (mapping["run_id"],),
@@ -1644,6 +1688,10 @@ def _execute_recovery_child(
                         f"r{row}-c{column} unique_seen={stats.unique_seen}"
                     )
                     return "complete"
+            # V2-F05: parent transitions to running only now, after lock/
+            # container no-new-effect checks passed and real progress begins.
+            if mark_parent_running is not None:
+                mark_parent_running()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 # SR-I03: exit_code is the last observed scraper exit; it is
@@ -1705,12 +1753,15 @@ def _execute_recovery_child(
                     container_name=container_name,
                     labels={_RECOVERY_LABEL_PLAN: plan_sha256, _RECOVERY_LABEL_RUN: run_id},
                 )
-                output_file.touch(mode=0o600, exist_ok=True)
             except (OSError, RuntimeError, ValueError) as exc:
                 raise _ChildFailure(
                     status="failed", process_exit=1,
                     error=f"child preparation failed: {exc}",
                 ) from exc
+            # V2-F05: parent transitions to running only now, after
+            # lock/container/option/precision no-new-effect checks passed.
+            if mark_parent_running is not None:
+                mark_parent_running()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 create_recovery_child_run(
@@ -1732,6 +1783,33 @@ def _execute_recovery_child(
             except BaseException:
                 conn.rollback()
                 raise
+
+            # V2-F01: the child row is durable; exclusively create the
+            # host-owned results file. Failure leaves the row in place and
+            # truthfully marks the child failed without fabricating an exit.
+            try:
+                fd = os.open(
+                    output_file,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                    0o600,
+                )
+                os.close(fd)
+            except FileExistsError:
+                if output_file.stat().st_size != 0:
+                    child_mark_no_exit(
+                        "failed",
+                        f"child output file exists non-empty before first launch: {output_file}",
+                    )
+                    raise _ChildFailure(
+                        status="failed", process_exit=1,
+                        error="child output file exists non-empty before first launch",
+                    )
+            except OSError as open_exc:
+                child_mark_no_exit("failed", f"child output creation failed: {open_exc}")
+                raise _ChildFailure(
+                    status="failed", process_exit=1,
+                    error=f"child output creation failed: {open_exc}",
+                ) from open_exc
 
         try:
             command = build_docker_command(
@@ -1759,9 +1837,13 @@ def _execute_recovery_child(
             raise _ChildFailure(
                 status="failed", process_exit=1, error=f"scraper launch failed: {exc}"
             ) from exc
+        # V2-F02: record every normally observed scraper exit (including
+        # zero) before any completion evaluation, so runs.exit_code is
+        # always the last observed scraper process exit code.
+        record_child_exit(scraper_exit)
+
         if scraper_exit != 0:
             error = f"scraper failed with exit code {scraper_exit}"
-            record_child_exit(scraper_exit)
             child_mark_no_exit("failed", error)
             raise _ChildFailure(status="failed", process_exit=1, error=error)
 
@@ -1803,7 +1885,7 @@ def _execute_recovery_child(
             raise _ChildFailure(status="failed", process_exit=1, error=error) from exc
         return "complete"
     finally:
-        child_lock.release()
+        _safe_release(child_lock)
 
 if __name__ == "__main__":
     raise SystemExit(main())
