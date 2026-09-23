@@ -46,8 +46,9 @@ class TestV2F01OutputOrdering:
 
         monkeypatch.setattr(os, "open", spy_open)
         assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
-        if "db_row" in order and "output_file" in order:
-            assert order.index("db_row") < order.index("output_file")
+        assert "db_row" in order, "instrumentation must observe the DB row creation"
+        assert "output_file" in order, "instrumentation must observe the output file creation"
+        assert order.index("db_row") < order.index("output_file")
 
     def test_output_creation_failure_marks_child_failed(self, tmp_path, monkeypatch):
         data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
@@ -235,23 +236,81 @@ class TestV2F04FaultInjection:
 
 class TestV2F05ParentRunningTiming:
     def test_active_container_preserves_prior_status(self, tmp_path, monkeypatch, capsys):
-        """Parent status is unchanged when container reconciliation rejects (V2-F05)."""
-        import inspect
-        source = inspect.getsource(cli._execute_recovery_child)
-        # The mark_parent_running callback is only called at progress points,
-        # not before container reconciliation
-        assert "mark_parent_running" in source
-        # Container checks happen before any mark_parent_running call
-        idx_container = source.index("_docker_inspect_container")
-        idx_running = source.index("mark_parent_running()")
-        assert idx_container < idx_running, "container checks must precede parent running"
+        """Active matching container: exit 2, prior parent status unchanged."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        # Run first child only, then interrupt (creates an incomplete child)
+        state = {"launches": 0}
+
+        def crash_after_first(command):
+            state["launches"] += 1
+            if state["launches"] == 1:
+                fake(command)
+                raise KeyboardInterrupt
+            return fake(command)
+
+        monkeypatch.setattr(cli, "run_scraper", crash_after_first)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+        conn = connect(db)
+        conn.execute(
+            "UPDATE recovery_executions SET status = 'failed' WHERE plan_sha256 = ?", (sha,)
+        )
+        conn.commit()
+        conn.close()
+
+        # Resume attempt with an active matching container on the remaining bin
+        holder = {"sha": sha}
+        monkeypatch.setattr(cli, "_docker_inspect_container", lambda n: {
+            "running": True,
+            "labels": {
+                "sara.recovery.plan_sha256": holder["sha"],
+                "sara.recovery.run_id": n[len("sara-rr-"):] if n.startswith("sara-rr-") else "",
+            },
+            "container_id": "abc",
+        })
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
+        capsys.readouterr()
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        conn.close()
 
     def test_wrong_label_preserves_prior_status(self, tmp_path, monkeypatch, capsys):
-        """Wrong-label container rejection is a no-new-effect exit 2 (V2-F12)."""
-        import inspect
-        source = inspect.getsource(cli._execute_recovery_child)
-        assert 'status="none", process_exit=2' in source
-        assert "wrong ownership labels" in source
+        """Wrong-label container: exit 2, prior parent status unchanged."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        state = {"launches": 0}
+
+        def crash_after_first(command):
+            state["launches"] += 1
+            if state["launches"] == 1:
+                fake(command)
+                raise KeyboardInterrupt
+            return fake(command)
+
+        monkeypatch.setattr(cli, "run_scraper", crash_after_first)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+        conn = connect(db)
+        conn.execute(
+            "UPDATE recovery_executions SET status = 'interrupted' WHERE plan_sha256 = ?", (sha,)
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(cli, "_docker_inspect_container",
+                           lambda n: {"running": False, "labels": {"sara.recovery.plan_sha256": "wrong"}, "container_id": "x"})
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
+        capsys.readouterr()
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "interrupted"
+        conn.close()
+
 
 class TestV2F06Schema:
     def test_not_null_terminal_column_rejected(self, tmp_path):
@@ -340,6 +399,7 @@ class TestV2F08CrossPlatformSidecar:
                 stdout = '{"version":1,"completed_inputs":[]}'
             return R()
 
+        monkeypatch.setattr(scraper, "shutil_which", lambda b: "/usr/bin/docker")
         monkeypatch.setattr(scraper.subprocess, "run", fake_run)
         ids = scraper.load_resume_completed_input_ids(
             tmp_path / "results.jsonl", "gosom/google-maps-scraper@sha256:" + "b" * 64
@@ -352,17 +412,13 @@ class TestV2F08CrossPlatformSidecar:
 
 class TestV2F09ConnectionClose:
     def test_write_connection_closed_after_execution(self, tmp_path, monkeypatch):
-        """The write connection is explicitly closed (V2-F09 outer finally)."""
-        from sara.cli import _safe_release
+        """The write connection is closed (verified via source inspection of finally)."""
+        import inspect
         data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
         assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
-        # After the command, _safe_release and conn.close code exists in the finally;
-        # verify the command source contains the explicit close pattern.
-        import inspect
         source = inspect.getsource(cli.cmd_recovery_run)
         assert "conn.close()" in source
         assert "_safe_release(parent_lock)" in source
-
 
 class TestSRV2_01LockRelease:
     def test_parent_lock_release_failure_does_not_crash(self, tmp_path, monkeypatch):
@@ -378,21 +434,79 @@ class TestSRV2_01LockRelease:
 
 class TestSRV2_02ContainerID:
     def test_name_reuse_race_rejected(self, tmp_path, monkeypatch, capsys):
-        """Container removal uses the immutable ID; name reuse is detected (SR-V2-02)."""
-        import inspect
-        source = inspect.getsource(cli._execute_recovery_child)
-        # docker rm uses container_id, not container_name
-        assert '"docker", "rm", container_id' in source
-        # The name-reuse detection path exists (any form)
-        import re as _re
-        assert _re.search(r'(recheck|no such container|replacement)', source)
+        """Old inspected ID gone + replacement under same name => reject (behavioral)."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        holder = {"sha": sha, "inspect_count": 0}
+
+        def racing_inspect(name):
+            holder["inspect_count"] += 1
+            if holder["inspect_count"] <= 1:
+                return {
+                    "running": False,
+                    "labels": {
+                        "sara.recovery.plan_sha256": holder["sha"],
+                        "sara.recovery.run_id": name[len("sara-rr-"):] if name.startswith("sara-rr-") else "",
+                    },
+                    "container_id": "old-id-gone",
+                }
+            return {
+                "running": False,
+                "labels": {"other": "owner"},
+                "container_id": "replacement-id",
+            }
+
+        def fake_rm(command, **kwargs):
+            class R:
+                returncode = 1
+                stderr = "Error response from daemon: No such container: old-id-gone"
+            return R()
+
+        monkeypatch.setattr(cli, "_docker_inspect_container", racing_inspect)
+        # Only intercept docker rm, not inspect (inspect is monkeypatched at cli level)
+        real_run = subprocess.run
+        def selective_run(command, **kwargs):
+            if "rm" in command:
+                return fake_rm(command, **kwargs)
+            return real_run(command, **kwargs)
+        monkeypatch.setattr(subprocess, "run", selective_run)
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
+        capsys.readouterr()
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "replacement" in err.lower() or "refusing" in err.lower()
 
     def test_stopped_owned_container_removed_by_id(self, tmp_path, monkeypatch):
-        """Stopped owned containers are removed by their immutable ID (SR-V2-02)."""
-        import inspect
-        source = inspect.getsource(cli._execute_recovery_child)
-        assert '"docker", "rm", container_id' in source
-        assert 'inspect.get("container_id")' in source or "container_id" in source
+        """Stopped owned container is removed by its immutable ID (behavioral)."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        holder = {"sha": sha, "removed": None}
+
+        def stopped_owned(name):
+            return {
+                "running": False,
+                "labels": {
+                    "sara.recovery.plan_sha256": holder["sha"],
+                    "sara.recovery.run_id": name[len("sara-rr-"):] if name.startswith("sara-rr-") else "",
+                },
+                "container_id": "immutable-id-999",
+            }
+
+        monkeypatch.setattr(cli, "_docker_inspect_container", stopped_owned)
+        real_run = subprocess.run
+        def selective_run(command, **kwargs):
+            if "rm" in command and "immutable-id-999" in command:
+                holder["removed"] = list(command)
+                class R:
+                    returncode = 0
+                    stderr = ""
+                return R()
+            return real_run(command, **kwargs)
+        monkeypatch.setattr(subprocess, "run", selective_run)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert holder["removed"] is not None
+        assert "immutable-id-999" in holder["removed"]
+        assert "sara-rr-" not in str(holder["removed"][2:])
+
 
 class TestV2F07OrphanAndFS:
     @pytest.mark.parametrize("orphan_files", [
@@ -467,3 +581,118 @@ class TestV2F07ChildInterrupt:
         assert child["status"] == "interrupted"
         assert child["exit_code"] is None
         conn.close()
+
+
+class TestE3F05PKNullability:
+    def test_pk_without_not_null_rejected(self, tmp_path):
+        db = build_db(tmp_path / "sara.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE recovery_executions (
+                plan_sha256 TEXT PRIMARY KEY,
+                source_run_id TEXT NOT NULL,
+                plan_schema_version INTEGER NOT NULL, plan_kind TEXT NOT NULL,
+                policy_id TEXT NOT NULL, output_root TEXT NOT NULL,
+                plan_snapshot_path TEXT NOT NULL, selected_bins INTEGER NOT NULL,
+                planned_searches INTEGER NOT NULL, status TEXT NOT NULL,
+                started_at TEXT NOT NULL, finished_at TEXT, error TEXT, result_json TEXT,
+                FOREIGN KEY(source_run_id) REFERENCES runs(id));
+            CREATE TABLE recovery_execution_bins (
+                plan_sha256 TEXT NOT NULL, row INTEGER NOT NULL, column INTEGER NOT NULL,
+                tier TEXT NOT NULL, bbox_json TEXT NOT NULL, planned_searches INTEGER NOT NULL,
+                run_id TEXT UNIQUE, container_name TEXT NOT NULL UNIQUE,
+                PRIMARY KEY(plan_sha256, row, column),
+                FOREIGN KEY(plan_sha256) REFERENCES recovery_executions(plan_sha256) ON DELETE CASCADE,
+                FOREIGN KEY(run_id) REFERENCES runs(id));
+        """)
+        conn.commit(); conn.close()
+        from sara.storage import ensure_recovery_schema, verify_recovery_schema
+        c = connect_existing(db)
+        c.execute("BEGIN IMMEDIATE")
+        ensure_recovery_schema(c)
+        with pytest.raises(RecoverySchemaError, match="NOT NULL"):
+            verify_recovery_schema(c)
+        c.rollback(); c.close()
+
+    def test_composite_pk_weakened_nullability_rejected(self, tmp_path):
+        db = build_db(tmp_path / "sara.db")
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE recovery_executions (
+                plan_sha256 TEXT PRIMARY KEY NOT NULL,
+                source_run_id TEXT NOT NULL,
+                plan_schema_version INTEGER NOT NULL, plan_kind TEXT NOT NULL,
+                policy_id TEXT NOT NULL, output_root TEXT NOT NULL,
+                plan_snapshot_path TEXT NOT NULL, selected_bins INTEGER NOT NULL,
+                planned_searches INTEGER NOT NULL, status TEXT NOT NULL,
+                started_at TEXT NOT NULL, finished_at TEXT, error TEXT, result_json TEXT,
+                FOREIGN KEY(source_run_id) REFERENCES runs(id));
+            CREATE TABLE recovery_execution_bins (
+                plan_sha256 TEXT NOT NULL, row INTEGER, column INTEGER NOT NULL,
+                tier TEXT NOT NULL, bbox_json TEXT NOT NULL, planned_searches INTEGER NOT NULL,
+                run_id TEXT UNIQUE, container_name TEXT NOT NULL UNIQUE,
+                PRIMARY KEY(plan_sha256, row, column),
+                FOREIGN KEY(plan_sha256) REFERENCES recovery_executions(plan_sha256) ON DELETE CASCADE,
+                FOREIGN KEY(run_id) REFERENCES runs(id));
+        """)
+        conn.commit(); conn.close()
+        from sara.storage import ensure_recovery_schema, verify_recovery_schema
+        c = connect_existing(db)
+        c.execute("BEGIN IMMEDIATE")
+        ensure_recovery_schema(c)
+        with pytest.raises(RecoverySchemaError):
+            verify_recovery_schema(c)
+        c.rollback(); c.close()
+
+
+class TestSRE3_01StrictResult:
+    def _make_complete(self, tmp_path, monkeypatch):
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+        return data, sha, db, plan
+
+    def _tamper_result(self, db, sha, field, value):
+        conn = connect(db)
+        result = json.loads(conn.execute(
+            "SELECT result_json FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()["result_json"])
+        result[field] = value
+        conn.execute(
+            "UPDATE recovery_executions SET result_json = ? WHERE plan_sha256 = ?",
+            (json.dumps(result, sort_keys=True, separators=(",", ":")), sha)
+        )
+        conn.commit()
+        conn.close()
+
+    def test_tampered_child_runs_rejected(self, tmp_path, monkeypatch):
+        data, sha, db, plan = self._make_complete(tmp_path, monkeypatch)
+        self._tamper_result(db, sha, "child_runs", 99)
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no")))
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 2
+
+    def test_tampered_planned_searches_rejected(self, tmp_path, monkeypatch):
+        data, sha, db, plan = self._make_complete(tmp_path, monkeypatch)
+        self._tamper_result(db, sha, "planned_searches", 999)
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no")))
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 2
+
+    def test_negative_count_rejected(self, tmp_path, monkeypatch):
+        data, sha, db, plan = self._make_complete(tmp_path, monkeypatch)
+        self._tamper_result(db, sha, "raw_records", -1)
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no")))
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 2
+
+
+class TestE3F02RuntimeBoundaries:
+    def test_bin_mkdir_failure_classified(self, tmp_path, monkeypatch):
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        real_mkdir = Path.mkdir
+
+        def selective_mkdir(self, *args, **kwargs):
+            if "bins" in str(self):
+                raise OSError("permission denied on bins")
+            return real_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", selective_mkdir)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc in (1, 2)

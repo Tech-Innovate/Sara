@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -167,28 +168,33 @@ class TestStorageFixes:
         c.rollback(); c.close()
 
     def test_sidecar_fallback_command_uses_digest_image(self, tmp_path, monkeypatch):
+        """Force PermissionError via monkeypatch (cross-platform, hermetic)."""
         from sara import scraper
         captured = {}
 
+        def fake_read(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "read_text", fake_read)
+        monkeypatch.setattr(scraper, "shutil_which", lambda b: "/usr/bin/docker")
+
         def fake_run(command, **kwargs):
             captured["command"] = list(command)
-            class R: returncode = 0; stdout = '{"version":1,"completed_inputs":[]}'
+
+            class R:
+                returncode = 0
+                stdout = '{"version":1,"completed_inputs":[]}'
             return R()
 
         monkeypatch.setattr(scraper.subprocess, "run", fake_run)
-        sidecar = tmp_path / "results.jsonl.resume.json"
-        sidecar.write_text("{}", encoding="utf-8")
-        sidecar.chmod(0o000)
-        try:
-            ids = scraper.load_resume_completed_input_ids(
-                tmp_path / "results.jsonl", REAL_DIGEST_IMAGE
-            )
-        finally:
-            sidecar.chmod(0o644)
+        ids = scraper.load_resume_completed_input_ids(
+            tmp_path / "results.jsonl",
+            "gosom/google-maps-scraper@sha256:" + "b" * 64,
+        )
         assert ids == set()
-        assert REAL_DIGEST_IMAGE in captured["command"]
-        assert "--network" in captured["command"]
-
+        cmd = captured["command"]
+        assert any("@sha256:" in part for part in cmd)
+        assert "--network" in cmd and "none" in cmd
 
 class TestWindowsPathFake:
     def test_windows_style_bind_path_handled(self):

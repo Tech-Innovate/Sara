@@ -695,11 +695,11 @@ def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     expected_by_name = {name: (ctype, pk, nullable) for name, ctype, pk, nullable in expected}
     for row in rows:
         ctype, pk, nullable = expected_by_name[row["name"]]
-        if pk == 0 and not nullable and row["notnull"] != 1:
+        if not nullable and row["notnull"] != 1:
             raise RecoverySchemaError(
                 f"table {table} column {row['name']} must be declared NOT NULL"
             )
-        if pk == 0 and nullable and row["notnull"] == 1:
+        if nullable and row["notnull"] == 1:
             raise RecoverySchemaError(
                 f"table {table} column {row['name']} must be nullable (terminal column)"
             )

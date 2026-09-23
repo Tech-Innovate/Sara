@@ -231,7 +231,7 @@ class TestSchemaAndVerifier:
     def test_incompatible_parent_table_rejected(self, tmp_path):
         db = self._break_schema(
             tmp_path,
-            "CREATE TABLE recovery_executions (plan_sha256 TEXT PRIMARY KEY, junk INTEGER);",
+            "CREATE TABLE recovery_executions (plan_sha256 TEXT PRIMARY KEY NOT NULL, junk INTEGER);",
         )
         conn = connect_existing(db)
         conn.execute("BEGIN IMMEDIATE")
@@ -246,7 +246,7 @@ class TestSchemaAndVerifier:
             tmp_path,
             """
             CREATE TABLE recovery_executions (
-                plan_sha256 TEXT PRIMARY KEY, source_run_id TEXT NOT NULL,
+                plan_sha256 TEXT PRIMARY KEY NOT NULL, source_run_id TEXT NOT NULL,
                 plan_schema_version INTEGER NOT NULL, plan_kind TEXT NOT NULL,
                 policy_id TEXT NOT NULL, output_root TEXT NOT NULL,
                 plan_snapshot_path TEXT NOT NULL, selected_bins INTEGER NOT NULL,
@@ -275,7 +275,7 @@ class TestSchemaAndVerifier:
             tmp_path,
             """
             CREATE TABLE recovery_executions (
-                plan_sha256 TEXT PRIMARY KEY, source_run_id TEXT NOT NULL,
+                plan_sha256 TEXT PRIMARY KEY NOT NULL, source_run_id TEXT NOT NULL,
                 plan_schema_version INTEGER NOT NULL, plan_kind TEXT NOT NULL,
                 policy_id TEXT NOT NULL, output_root TEXT NOT NULL,
                 plan_snapshot_path TEXT NOT NULL, selected_bins INTEGER NOT NULL,

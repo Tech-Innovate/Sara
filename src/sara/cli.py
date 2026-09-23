@@ -926,7 +926,11 @@ def _docker_inspect_container(name: str) -> dict | None:
     info = payload[0]
     labels = (info.get("Config") or {}).get("Labels") or {}
     state = info.get("State") or {}
-    return {"running": state.get("Running") is True, "labels": dict(labels)}
+    return {
+        "running": state.get("Running") is True,
+        "labels": dict(labels),
+        "container_id": info.get("Id"),
+    }
 
 
 def _recovery_child_config_json(plan, bin_record, proxy_sha256, plan_sha256) -> str:
@@ -1010,20 +1014,10 @@ def _guard_child_progress_report(plan_sha256, conn, bin_record, run_id, complete
         )
         return 0
     except KeyboardInterrupt:
-        set_recovery_parent_status(
-            conn, plan_sha256, "interrupted",
-            f"child r{bin_record.row}-c{bin_record.column} completed; "
-            "reporting interrupted; no further bins scheduled",
-        )
-        conn.commit()
+        _repair_parent_after_report_failure(conn, plan_sha256, bin_record, "interrupted", "reporting interrupted")
         return 130
     except Exception as exc:
-        set_recovery_parent_status(
-            conn, plan_sha256, "interrupted",
-            f"child r{bin_record.row}-c{bin_record.column} completed; "
-            f"reporting failed ({exc}); no further bins scheduled",
-        )
-        conn.commit()
+        _repair_parent_after_report_failure(conn, plan_sha256, bin_record, "interrupted", f"reporting failed ({exc})")
         return 1
 
 
@@ -1365,8 +1359,7 @@ def cmd_recovery_run(args) -> int:
             conn.rollback()
             if isinstance(finalize_exc, KeyboardInterrupt):
                 raise
-            if isinstance(finalize_exc, KeyboardInterrupt):
-                raise
+
             print(
                 f"recovery-run finalization failed: {finalize_exc}",
                 file=sys.stderr,
@@ -1484,15 +1477,27 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
     if not isinstance(result_raw, str) or not result_raw:
         raise PlanRejected("complete parent has no stored result_json")
     try:
-        result = json.loads(result_raw)
-    except ValueError:
-        raise PlanRejected("complete parent result_json is not valid JSON")
+        result = json.loads(
+            result_raw,
+            parse_constant=lambda t: (_ for _ in ()).throw(ValueError(f"non-standard constant {t!r}")),
+        )
+    except ValueError as exc:
+        raise PlanRejected(f"complete parent result_json is not valid strict JSON: {exc}")
     if not isinstance(result, dict) or set(result) != set(_RESULT_V1_INT_FIELDS):
         raise PlanRejected("complete parent result_json does not match the v1 result field set")
     for field in _RESULT_V1_INT_FIELDS:
         value = result[field]
         if isinstance(value, bool) or not isinstance(value, int):
             raise PlanRejected(f"complete parent result_json field {field} must be an integer")
+        if value < 0:
+            raise PlanRejected(f"complete parent result_json field {field} must be nonnegative")
+    # SR-E3-01: cross-check stable fields against the frozen plan identity.
+    if result["child_runs"] != len(plan.selected_bins):
+        raise PlanRejected("complete parent result_json child_runs does not match the plan's selected-bin count")
+    if result["planned_searches"] != plan.targeted_searches:
+        raise PlanRejected("complete parent result_json planned_searches does not match the plan")
+    if result["source_membership_at_plan_count"] != plan.associated_businesses:
+        raise PlanRejected("complete parent result_json source_membership_at_plan_count does not match the plan")
     return result_raw
 
 
@@ -1509,6 +1514,11 @@ def _execute_recovery_child(
     child_lock = RunLock(bin_dir / ".sara.lock")
     try:
         child_lock.acquire()
+    except OSError as exc:
+        raise _ChildFailure(
+            status="failed", process_exit=1,
+            error=f"child lock/bin directory creation failed: {exc}",
+        ) from exc
     except RuntimeError as exc:
         # Active child lock: another process owns this bin; no new effect.
         raise _ChildFailure(status="none", process_exit=2, error=str(exc)) from exc
@@ -1571,8 +1581,14 @@ def _execute_recovery_child(
                     ),
                 )
             # Matching stopped container still reserves its deterministic
-            # name: remove exactly this container after label ownership was
-            # verified, then continue reconciliation.
+            # name: remove the inspected immutable container ID (not the
+            # mutable name) after label ownership was verified (E3-F01).
+            container_id = inspect.get("container_id")
+            if not container_id or not isinstance(container_id, str):
+                raise _ChildFailure(
+                    status="failed", process_exit=1,
+                    error=f"docker inspect returned no usable container ID for {container_name}",
+                )
             removed = subprocess.run(
                 ["docker", "rm", container_id],
                 capture_output=True, text=True, check=False,
@@ -1622,7 +1638,13 @@ def _execute_recovery_child(
             )
         proxy_sha = plan.config.get("proxy_sha256")
         if proxy_path is not None:
-            current = hashlib.sha256(proxy_path.read_bytes()).hexdigest()
+            try:
+                current = hashlib.sha256(proxy_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                raise _ChildFailure(
+                    status="failed", process_exit=1,
+                    error=f"proxy file re-read failed: {exc}",
+                ) from exc
             if current != proxy_sha:
                 raise _ChildFailure(
                     status="failed", process_exit=2,
@@ -1683,11 +1705,7 @@ def _execute_recovery_child(
                         bbox=bin_record.bbox,
                         finalize_run=("complete", recorded_exit, None),
                     )
-                    print(
-                        "recovery child ingested from existing completion evidence: "
-                        f"r{row}-c{column} unique_seen={stats.unique_seen}"
-                    )
-                    return "complete"
+                    return "complete"  # E3-F04: outer guard handles reporting
             # V2-F05: parent transitions to running only now, after lock/
             # container no-new-effect checks passed and real progress begins.
             if mark_parent_running is not None:
@@ -1706,11 +1724,24 @@ def _execute_recovery_child(
                 conn.rollback()
                 raise
         else:
-            bin_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                bin_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise _ChildFailure(
+                    status="failed", process_exit=1,
+                    error=f"child bin directory creation failed: {exc}",
+                ) from exc
             query_snapshot = bin_dir / "queries.txt"
             snapshot_bytes = recovery_query_snapshot_bytes(list(plan.queries))
             if query_snapshot.exists():
-                if query_snapshot.read_bytes() != snapshot_bytes:
+                try:
+                    existing_bytes = query_snapshot.read_bytes()
+                except OSError as exc:
+                    raise _ChildFailure(
+                        status="failed", process_exit=1,
+                        error=f"child query snapshot read failed: {exc}",
+                    ) from exc
+                if existing_bytes != snapshot_bytes:
                     raise _ChildFailure(
                         status="none", process_exit=2,
                         error="existing child query snapshot does not match the plan queries",
@@ -1850,6 +1881,9 @@ def _execute_recovery_child(
         try:
             completed_ids = load_resume_completed_input_ids(output_file, plan.scraper_image)
             comparison = expected_inputs.compare_completed(completed_ids)
+        except KeyboardInterrupt:
+            child_mark_no_exit("interrupted", "recovery child interrupted during completion verification")
+            raise
         except RuntimeError as exc:
             error = f"completion verification failed after scraper exit 0: {exc}"
             child_mark("failed", 0, error)
@@ -1879,6 +1913,9 @@ def _execute_recovery_child(
                 bbox=bin_record.bbox,
                 finalize_run=("complete", recorded_exit, None),
             )
+        except KeyboardInterrupt:
+            child_mark_no_exit("interrupted", "recovery child interrupted during ingestion")
+            raise
         except Exception as exc:
             error = f"recovery child ingestion failed: {exc}"
             child_mark_no_exit("failed", error)
