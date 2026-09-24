@@ -1120,7 +1120,7 @@ def _bounded_operational_failure(conn, plan_sha256, exc, context):
             _best_effort_parent_failure(conn, plan_sha256, f"{context}: {exc}")
     except Exception:
         pass
-    print(f"recovery-run {context}: {exc}", file=sys.stderr)
+    _best_effort_stderr(f"recovery-run {context}: {exc}")
     return 1
 
 
@@ -1382,8 +1382,7 @@ def cmd_recovery_run(args) -> int:
                 and hashlib.sha256(snapshot_path.read_bytes()).hexdigest() == plan_sha256
             )
         except OSError as exc:
-            print(f"recovery-run failed reading plan snapshot: {exc}", file=sys.stderr)
-            return 1
+            return _bounded_operational_failure(conn, plan_sha256, exc, "plan snapshot read")
         if not snapshot_matches:
             try:
                 started = conn.execute(
@@ -1448,25 +1447,50 @@ def cmd_recovery_run(args) -> int:
                 )
             except _ChildFailure as failure:
                 if failure.status != "none":
-                    conn.execute("BEGIN IMMEDIATE")
+                    # Fix3: repair the mapped child too, not just the parent
+                    child_run_id = mapping["run_id"] or _recovery_child_run_id(
+                        plan_sha256, bin_record.row, bin_record.column
+                    )
                     try:
-                        set_recovery_parent_status(conn, plan_sha256, failure.status, failure.error)
-                        conn.commit()
-                    except BaseException:
-                        conn.rollback()
-                        raise
-                elif state == "registered":
-                    # SR-F5-03: fresh parent with no child progress; leave
-                    # truthful interrupted, not phantom running.
-                    conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        set_recovery_parent_status(
-                            conn, plan_sha256, "interrupted",
-                            f"no-new-effect rejection: {failure.error}",
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            # Child repair: mark failed if not already complete
+                            conn.execute(
+                                "UPDATE runs SET status = ?, finished_at = ?, error = ? "
+                                "WHERE id = ? AND status != 'complete'",
+                                (failure.status, utc_now(), failure.error, child_run_id),
+                            )
+                            set_recovery_parent_status(conn, plan_sha256, failure.status, failure.error)
+                            conn.commit()
+                        except BaseException:
+                            conn.rollback()
+                            raise
+                    except Exception as repair_exc:
+                        _best_effort_stderr(
+                            f"recovery-run child/parent repair failed: {repair_exc}"
                         )
-                        conn.commit()
-                    except BaseException:
-                        conn.rollback()
+                        return 1
+                else:
+                    # Fix4: no-effect rejection. Fresh parent: interrupted.
+                    # Resumed parent with prior progress: interrupted.
+                    # Resumed parent with NO prior progress: preserve state.
+                    # Repair failure: rc 1, never silent rc 2 with running.
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            if state == "registered" or progress_started:
+                                set_recovery_parent_status(
+                                    conn, plan_sha256, "interrupted",
+                                    f"no-new-effect rejection: {failure.error}",
+                                )
+                                conn.commit()
+                            else:
+                                conn.rollback()  # preserve prior status
+                        except BaseException:
+                            conn.rollback()
+                            raise
+                    except Exception:
+                        return 1  # repair failed: rc 1, never silent rc 2
                 print(failure.error, file=sys.stderr)
                 return failure.process_exit
             except KeyboardInterrupt:
@@ -1475,7 +1499,10 @@ def cmd_recovery_run(args) -> int:
                 ki_run_id = mapping["run_id"] or _recovery_child_run_id(
                     plan_sha256, bin_record.row, bin_record.column
                 )
-                _child_ki_guard(conn, ki_run_id)
+                if not _child_ki_guard(conn, ki_run_id):
+                    _best_effort_stderr(
+                        f"warning: child {ki_run_id} interrupt repair did not complete"
+                    )
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     set_recovery_parent_status(
@@ -1504,8 +1531,8 @@ def cmd_recovery_run(args) -> int:
                 if report_rc != 0:
                     return report_rc
 
-        conn.execute("BEGIN IMMEDIATE")
         try:
+            conn.execute("BEGIN IMMEDIATE")
             metrics = finalize_recovery_execution(
                 conn, plan_sha256, plan.source_run_id, plan.associated_businesses
             )
@@ -1922,6 +1949,7 @@ def _execute_recovery_child(
             if _deferred_rm:
                 _remove_stopped_container(_deferred_rm, container_name)
                 _deferred_rm = None  # consumed
+                inspect = None  # container is now absent; sidecar path may proceed
 
             if inspect is None:
                 try:

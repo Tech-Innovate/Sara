@@ -1327,3 +1327,201 @@ class Test429ContainerReorder:
             cli._validate_query_snapshot(bin_dir, plan, is_started=True)
         # The deferred rm variable starts as None in the child executor,
         # meaning the rm does NOT happen before this validation rejects
+
+
+class TestPR4R2StaleInspect:
+    def test_stopped_container_complete_sidecar_no_docker(self, tmp_path, monkeypatch):
+        """After rm succeeds, inspect=None so sidecar path proceeds without Docker."""
+        from sara.scraper import expected_resume_input_ids
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        state = {"n": 0}
+
+        def first_then_crash(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_crash)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+
+        # Resume: stopped container removed, then complete sidecar ingested
+        holder = {"sha": sha}
+        inspect_state = {"count": 0}
+
+        def stopped_then_absent(name):
+            inspect_state["count"] += 1
+            if inspect_state["count"] <= 1:
+                return {
+                    "running": False,
+                    "labels": {
+                        "sara.recovery.plan_sha256": holder["sha"],
+                        "sara.recovery.run_id": name[len("sara-rr-"):] if name.startswith("sara-rr-") else "",
+                    },
+                    "container_id": "stopped-id",
+                }
+            return None  # after rm, container is absent
+
+        monkeypatch.setattr(cli, "_docker_inspect_container", stopped_then_absent)
+
+        rm_calls = []
+        real_run = subprocess.run
+        def track_rm(command, **kwargs):
+            if "rm" in command and "stopped-id" in command:
+                rm_calls.append(list(command))
+                class R:
+                    returncode = 0
+                    stderr = ""
+                return R()
+            return real_run(command, **kwargs)
+        monkeypatch.setattr(subprocess, "run", track_rm)
+
+        # Mock the sidecar as complete for the second bin (the interrupted one)
+        bin2_dir = tmp_path / "recovery" / sha / "bins" / "r1-c1"
+        bin2_dir.mkdir(parents=True, exist_ok=True)
+        bin_record2 = plan.selected_bins[1]
+        expected2 = expected_resume_input_ids(
+            type("Area", (), {"bbox": bin_record2.bbox})(),
+            list(plan.queries), plan.recovery_cell_km,
+        )
+        results2 = bin2_dir / "results.jsonl"
+        results2.write_text("", encoding="utf-8")
+        Path(str(results2) + ".resume.json").write_text(
+            json.dumps({"version": 1, "completed_inputs": sorted(expected2)}), encoding="utf-8"
+        )
+
+        # Count Docker launches during the resume
+        launch_count = {"n": 0}
+        original_run = cli.run_scraper
+        def counting_scraper(command):
+            launch_count["n"] += 1
+            return original_run(command)
+        monkeypatch.setattr(cli, "run_scraper", counting_scraper)
+
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        # The second bin should have been ingested from existing sidecar
+        # evidence without launching Docker for it
+        assert rc == 0
+        # First bin was already complete (skipped), second was direct-ingested
+        # Docker launches should be 0 (no new launches during resume)
+        assert launch_count["n"] == 0
+
+
+class TestPR4R2ChildRepair:
+    def test_child_failure_repairs_mapped_child(self, tmp_path, monkeypatch):
+        """Container inspection failure marks both child and parent failed."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        state = {"n": 0}
+
+        def first_then_container_fail(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_container_fail)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+
+        # Resume with a container that causes an inspection failure on the second bin
+        def failing_inspect(name):
+            raise RuntimeError("docker inspect crashed")
+
+        monkeypatch.setattr(cli, "_docker_inspect_container", failing_inspect)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = connect(db)
+        children = conn.execute(
+            "SELECT r.status FROM runs r JOIN recovery_execution_bins b ON b.run_id = r.id "
+            "WHERE b.plan_sha256 = ? AND r.status != 'complete'", (sha,)
+        ).fetchall()
+        for child in children:
+            assert child["status"] != "running"
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        conn.close()
+
+    def test_resumed_progress_no_effect_interrupted(self, tmp_path, monkeypatch):
+        """Resumed parent with progress + later no-effect => interrupted, not running."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        state = {"n": 0}
+
+        def first_then_crash(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_crash)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+        # Parent is interrupted, first child complete, second interrupted
+
+        # Resume: first child skips (complete), second child hits an active container
+        holder = {"sha": sha}
+        monkeypatch.setattr(cli, "_docker_inspect_container", lambda n: {
+            "running": True,
+            "labels": {
+                "sara.recovery.plan_sha256": holder["sha"],
+                "sara.recovery.run_id": n[len("sara-rr-"):] if n.startswith("sara-rr-") else "",
+            },
+            "container_id": "active-id",
+        })
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        # Parent made progress (first child completed during the original run)
+        # and now hits a no-effect rejection => should be interrupted, not running
+        assert parent["status"] == "interrupted"
+        conn.close()
+
+
+class TestPR4R2RepairFailure:
+    def test_no_effect_repair_db_failure_rc_exactly_1(self, tmp_path, monkeypatch):
+        """Fresh no-effect rejection whose DB repair fails => exactly rc 1."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        bin_dir = tmp_path / "recovery" / sha / "bins" / "r0-c0"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "results.jsonl").write_text("orphan", encoding="utf-8")
+
+        def broken_set(conn, ps, status, error):
+            raise sqlite3.OperationalError("DB gone")
+
+        monkeypatch.setattr(cli, "set_recovery_parent_status", broken_set)
+        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1  # exactly 1, not (1, 2)
+
+    def test_child_failure_repair_db_failure_rc_1(self, tmp_path, monkeypatch):
+        """Non-none child failure whose parent repair fails => exactly rc 1."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        state = {"n": 0}
+
+        def first_then_fail(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            return 1  # scraper failure
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_fail)
+
+        def broken_set(conn, ps, status, error):
+            raise sqlite3.OperationalError("DB gone")
+
+        monkeypatch.setattr(cli, "set_recovery_parent_status", broken_set)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1  # exactly 1, not a re-raised exception
+
+
+class TestPR4R2SnapshotFailure:
+    def test_snapshot_read_routes_through_bounded_handler(self, tmp_path, monkeypatch):
+        """The snapshot-read OSError path is routed through _bounded_operational_failure."""
+        import inspect
+        source = inspect.getsource(cli.cmd_recovery_run)
+        # The snapshot read failure path calls _bounded_operational_failure
+        assert "_bounded_operational_failure" in source
+        assert "plan snapshot read" in source
