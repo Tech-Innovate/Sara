@@ -228,7 +228,7 @@ class ExpectedResumeInputs:
 
         The sidecar set is no longer needed after verification. Removing matches as
         expected IDs stream past keeps peak memory to one large ID set instead of
-        materializing a second full expected set for broad runs.
+        materializing a second expected set for broad runs.
         """
         matched = 0
         missing = 0
