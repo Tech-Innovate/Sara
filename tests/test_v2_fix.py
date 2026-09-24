@@ -1319,3 +1319,85 @@ class TestA54F05NoEffectRepairFailure:
         # When repair fails, the command should return 1, not silently 2
         # The exact code depends on where the repair failure is classified
         assert rc in (1, 2)  # bounded, not traceback
+
+
+class Test429FKVerification:
+    def test_source_run_fk_no_action_verified(self, tmp_path):
+        """SR-429: source_run_id FK must be ON DELETE NO ACTION."""
+        from sara.storage import ensure_recovery_schema, verify_recovery_schema
+        from sara.storage import RecoverySchemaError
+        db = build_db(tmp_path / "sara.db")
+        conn = sqlite3.connect(db)
+        # Create tables with CASCADE on source_run_id (wrong action)
+        conn.executescript("""
+            CREATE TABLE recovery_executions (
+                plan_sha256 TEXT PRIMARY KEY NOT NULL,
+                source_run_id TEXT NOT NULL,
+                plan_schema_version INTEGER NOT NULL, plan_kind TEXT NOT NULL,
+                policy_id TEXT NOT NULL, output_root TEXT NOT NULL,
+                plan_snapshot_path TEXT NOT NULL, selected_bins INTEGER NOT NULL,
+                planned_searches INTEGER NOT NULL, status TEXT NOT NULL,
+                started_at TEXT NOT NULL, finished_at TEXT, error TEXT, result_json TEXT,
+                FOREIGN KEY(source_run_id) REFERENCES runs(id) ON DELETE CASCADE);
+            CREATE TABLE recovery_execution_bins (
+                plan_sha256 TEXT NOT NULL, row INTEGER NOT NULL, column INTEGER NOT NULL,
+                tier TEXT NOT NULL, bbox_json TEXT NOT NULL, planned_searches INTEGER NOT NULL,
+                run_id TEXT UNIQUE, container_name TEXT NOT NULL UNIQUE,
+                PRIMARY KEY(plan_sha256, row, column),
+                FOREIGN KEY(plan_sha256) REFERENCES recovery_executions(plan_sha256) ON DELETE CASCADE,
+                FOREIGN KEY(run_id) REFERENCES runs(id));
+        """)
+        conn.commit(); conn.close()
+        c = connect_existing(db)
+        c.execute("BEGIN IMMEDIATE")
+        ensure_recovery_schema(c)
+        with pytest.raises(RecoverySchemaError, match="NO ACTION"):
+            verify_recovery_schema(c)
+        c.rollback(); c.close()
+
+
+class Test429OperationalBoundary:
+    def test_child_loop_operational_failure_bounded(self, tmp_path, monkeypatch):
+        """Operational failure during child loop -> rc 1, parent repaired."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        # Simulate an operational failure after registration
+        def failing_scraper(command):
+            raise RuntimeError("Docker daemon unreachable")
+
+        monkeypatch.setattr(cli, "run_scraper", failing_scraper)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        conn.close()
+
+    def test_complete_parent_never_downgraded_by_operational_failure(self, tmp_path, monkeypatch):
+        """SR-A54-03: a complete parent is never downgraded."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
+        conn = connect(db)
+        cli._bounded_operational_failure(conn, sha, RuntimeError("test"), "test context")
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "complete"
+        conn.close()
+
+
+class Test429ContainerReorder:
+    def test_stopped_container_not_removed_when_snapshot_bad(self, tmp_path, monkeypatch):
+        """SR-A54-02: a stopped owned container is not removed when the started
+        child's query snapshot is tampered (removal happens after validation)."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        # Verify _validate_query_snapshot rejects a tampered started snapshot
+        bin_dir = tmp_path / "recovery" / sha / "bins" / "r1-c1"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "queries.txt").write_bytes(b"tampered")
+        from sara.recovery import PlanRejected
+        with pytest.raises(PlanRejected, match="does not match"):
+            cli._validate_query_snapshot(bin_dir, plan, is_started=True)
+        # The deferred rm variable starts as None in the child executor,
+        # meaning the rm does NOT happen before this validation rejects

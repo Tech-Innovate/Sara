@@ -668,15 +668,18 @@ def verify_recovery_schema(conn: sqlite3.Connection) -> None:
     if ("runs", "run_id", "id", "NO ACTION") not in parent_fks:
         raise RecoverySchemaError("recovery_execution_bins is missing the child-run foreign key")
     source_fks = {
-        (row["table"], row["from"], row["to"])
+        (row["table"], row["from"], row["to"], row["on_delete"])
         for row in conn.execute("PRAGMA foreign_key_list(recovery_executions)")
     }
-    if ("runs", "source_run_id", "id") not in source_fks:
-        raise RecoverySchemaError("recovery_executions is missing the source-run foreign key")
+    if ("runs", "source_run_id", "id", "NO ACTION") not in source_fks:
+        raise RecoverySchemaError(
+            "recovery_executions is missing the source-run foreign key "
+            "with ON DELETE NO ACTION"
+        )
+def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     # expected rows carry (name, declared type, pk ordinal, nullable);
     # PRAGMA table_info.notnull is checked exactly for every column,
     # including TEXT/composite primary-key columns.
-def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     rows = list(conn.execute(f"PRAGMA table_info({table})"))
     if not rows:
         raise RecoverySchemaError(f"table {table} does not exist")

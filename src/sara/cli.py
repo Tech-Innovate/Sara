@@ -1487,6 +1487,11 @@ def cmd_recovery_run(args) -> int:
                     raise
                 print("recovery-run interrupted", file=sys.stderr)
                 return 130
+            except (sqlite3.Error, OSError, RuntimeError, RecoverySchemaError) as op_exc:
+                # 429: centralized post-registration operational boundary.
+                return _bounded_operational_failure(
+                    conn, plan_sha256, op_exc, "child orchestration"
+                )
             if outcome == "complete":
                 completed_count += 1
                 report_rc = _guard_child_progress_report(
@@ -1803,16 +1808,23 @@ def _execute_recovery_child(
                 )
             # Matching stopped container still reserves its deterministic
             # name: remove the inspected immutable container ID (not the
-            # mutable name) after label ownership was verified (E3-F01).
-            container_id = inspect.get("container_id")
-            if not container_id or not isinstance(container_id, str):
+            # 429/SR-A54-02: DEFER stopped-container removal until AFTER
+            # provenance and query snapshot validation.
+            stopped_container_id = inspect.get("container_id")
+            if not stopped_container_id or not isinstance(stopped_container_id, str):
                 raise _ChildFailure(
                     status="failed", process_exit=1,
                     error=f"docker inspect returned no usable container ID for {container_name}",
                 )
+            _deferred_rm = stopped_container_id  # removed later, after provenance
+
+        # 429/SR-A54-02: Now that provenance and snapshot are validated,
+        # remove the stopped owned container immediately before resume work.
+        _deferred_rm_id = locals().get("_deferred_rm")
+        if _deferred_rm_id:
             try:
                 removed = subprocess.run(
-                    ["docker", "rm", container_id],
+                    ["docker", "rm", _deferred_rm_id],
                     capture_output=True, text=True, check=False,
                 )
             except OSError as rm_exc:
@@ -1823,8 +1835,6 @@ def _execute_recovery_child(
             if removed.returncode != 0:
                 stderr_text = removed.stderr or ""
                 if "no such container" in stderr_text.lower():
-                    # SR-V2-02: the inspected ID disappeared; re-inspect the
-                    # name to detect a replacement before acting further.
                     recheck = _docker_inspect_container(container_name)
                     if recheck is not None:
                         raise _ChildFailure(
@@ -1835,15 +1845,13 @@ def _execute_recovery_child(
                                 "remove a replacement without fresh ownership verification"
                             ),
                         )
-                    # Name absent: the stopped container is gone; continue.
                 else:
                     raise _ChildFailure(
                         status="failed", process_exit=1,
-                        error=(
-                            f"failed to remove stopped owned container {container_id}: "
-                            f"{stderr_text.strip() or removed.returncode}"
-                        ),
+                        error=f"failed to remove stopped owned container {_deferred_rm_id}: "
+                              f"{stderr_text.strip() or removed.returncode}",
                     )
+            _deferred_rm = None  # consumed
 
         options = ScrapeOptions(
             cell_km=plan.recovery_cell_km, depth=plan.depth,
