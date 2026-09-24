@@ -132,8 +132,6 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _reject_json_constant(token: str):
-    # NaN/Infinity/-Infinity are accepted by Python's json.loads by default
-    # but are not standard JSON; source state containing them is rejected.
     raise ValueError(f"non-standard JSON constant {token!r} in recorded run state")
 
 
@@ -343,7 +341,6 @@ def _print_stats(stats) -> None:
 
 
 def _report_stats(stats, *, operation: str) -> int:
-    """Report committed results without letting presentation mutate lifecycle state."""
     try:
         _print_stats(stats)
     except KeyboardInterrupt:
@@ -635,12 +632,6 @@ def cmd_stats(args) -> int:
 
 
 def _best_effort_cleanup(output_path: Path, created: bool) -> None:
-    """Remove a partially written output this invocation created.
-
-    Best effort: if removal itself fails the partial file may remain, so the
-    caller reports the write failure and the exclusive-create guard refuses
-    to overwrite the leftover on a later attempt.
-    """
     if not created:
         return
     try:
@@ -650,13 +641,6 @@ def _best_effort_cleanup(output_path: Path, created: bool) -> None:
 
 
 def _report_recovery_plan(output_path: Path, data: bytes, summary) -> int:
-    """Report a finished plan without letting presentation failure misstate it.
-
-    The plan file is already complete when this runs. A reporting failure
-    must not delete, rewrite, or retroactively fail the finished artifact:
-    the operator gets a bounded lifecycle message and a non-success status
-    while the valid plan stays on disk.
-    """
     digest = hashlib.sha256(data).hexdigest()
     try:
         print(f"recovery_plan written: {output_path}")
@@ -719,7 +703,6 @@ def cmd_recovery_plan(args) -> int:
         return 1
 
     try:
-        # One read snapshot covers the source row and business membership.
         conn.execute("BEGIN")
         try:
             record = load_recovery_source_run(conn, run_id)
@@ -821,8 +804,6 @@ def cmd_recovery_plan(args) -> int:
         return reject(f"plan payload failed strict JSON serialization: {exc}")
     created = False
     try:
-        # O_BINARY is required on Windows so LF bytes are not translated to
-        # CRLF; it is a no-op flag where the platform does not define it.
         fd = os.open(
             output_path,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
@@ -845,8 +826,6 @@ def cmd_recovery_plan(args) -> int:
         print(f"recovery plan failed to write output: {exc}", file=sys.stderr)
         return 1
     except BaseException:
-        # Interruption: best-effort removal of the partial file this
-        # invocation created before propagating.
         _best_effort_cleanup(output_path, created)
         raise
 
@@ -872,7 +851,6 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     raise AssertionError(args.command)
-
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +884,6 @@ def _recovery_container_name(run_id: str) -> str:
 
 
 def _docker_inspect_container(name: str) -> dict | None:
-    """Inspect a deterministic container name; fail closed on ambiguity."""
     completed = subprocess.run(
         ["docker", "inspect", name], capture_output=True, text=True, check=False
     )
@@ -989,7 +966,7 @@ def _write_plan_snapshot(snapshot_path: Path, data: bytes) -> None:
             os.close(fd)
     except FileExistsError:
         raise
-    except OSError as exc:
+    except OSError:
         if created:
             try:
                 snapshot_path.unlink()
@@ -1006,7 +983,6 @@ def _write_plan_snapshot(snapshot_path: Path, data: bytes) -> None:
 
 
 def _guard_child_progress_report(plan_sha256, conn, bin_record, run_id, completed, total) -> int:
-    """Report one committed child; a reporting failure stops scheduling."""
     try:
         print(
             f"recovery child complete: r{bin_record.row}-c{bin_record.column} "
@@ -1022,7 +998,6 @@ def _guard_child_progress_report(plan_sha256, conn, bin_record, run_id, complete
 
 
 def _safe_release(lock) -> None:
-    """Release a RunLock without letting unlink failure overwrite committed state."""
     try:
         lock.release()
     except Exception as exc:
@@ -1030,7 +1005,6 @@ def _safe_release(lock) -> None:
 
 
 def _best_effort_stderr(message: str) -> None:
-    """Print to stderr; a broken stderr cannot reclassify a completed effect."""
     try:
         print(message, file=sys.stderr)
     except Exception:
@@ -1038,15 +1012,13 @@ def _best_effort_stderr(message: str) -> None:
 
 
 def _best_effort_parent_failure(conn, plan_sha256, message):
-    """Best-effort transition of an active parent to failed; never downgrade complete."""
     try:
-        # SR-A54-03: check current status before repair.
         row = conn.execute(
             "SELECT status FROM recovery_executions WHERE plan_sha256 = ?",
             (plan_sha256,),
         ).fetchone()
         if row is not None and row["status"] == "complete":
-            return  # never downgrade a committed complete parent
+            return
         conn.execute("BEGIN IMMEDIATE")
         try:
             set_recovery_parent_status(conn, plan_sha256, "failed", message)
@@ -1059,11 +1031,6 @@ def _best_effort_parent_failure(conn, plan_sha256, message):
 
 
 def _validate_query_snapshot(bin_dir, plan, *, is_started):
-    """SR-F5-01/SR-F5-02: enforce exact query snapshot for every incomplete child.
-
-    Unstarted: missing/partial/mismatching is safely repaired from the plan.
-    Started: missing/mismatching is fail-closed (never rewrite historical evidence).
-    """
     from .scraper import recovery_query_snapshot_bytes
     query_snapshot = bin_dir / "queries.txt"
     expected = recovery_query_snapshot_bytes(list(plan.queries))
@@ -1100,17 +1067,10 @@ def _validate_query_snapshot(bin_dir, plan, *, is_started):
 
 
 def _bounded_operational_failure(conn, plan_sha256, exc, context):
-    """A54-F01: one bounded handler for post-registration operational failures.
-
-    Rolls back any active transaction, best-effort marks the parent failed
-    (unless already complete — SR-A54-03), and returns rc=1. Does NOT
-    swallow _ChildFailure, PlanRejected, KeyboardInterrupt, or AssertionError.
-    """
     try:
         conn.rollback()
     except Exception:
         pass
-    # SR-A54-03: never downgrade a committed complete parent.
     try:
         row = conn.execute(
             "SELECT status FROM recovery_executions WHERE plan_sha256 = ?",
@@ -1125,11 +1085,6 @@ def _bounded_operational_failure(conn, plan_sha256, exc, context):
 
 
 def _repair_parent_after_report_failure(conn, plan_sha256, bin_record, status, detail):
-    """Rollback-safe parent repair after a committed child report failure.
-
-    Never alters the completed child. If the DB repair itself fails, emits
-    best-effort stderr and returns without raising (E4-F01).
-    """
     message = (
         f"child r{bin_record.row}-c{bin_record.column} completed; "
         f"{detail}; no further bins scheduled"
@@ -1197,7 +1152,6 @@ def cmd_recovery_run(args) -> int:
     except (PlanRejected, ValueError) as exc:
         return reject(f"plan rejected: {exc}")
 
-
     proxy_path: Path | None = None
     plan_proxy_sha = plan.config.get("proxy_sha256")
     if plan_proxy_sha is None:
@@ -1214,8 +1168,6 @@ def cmd_recovery_run(args) -> int:
         if hashlib.sha256(proxy_bytes).hexdigest() != plan_proxy_sha:
             return reject("proxy file SHA-256 does not match the plan's recorded proxy hash")
 
-    # RRI-F11: the exact plan-derived scrape contract must validate before
-    # any write connector, output directory, or lock is touched.
     try:
         _preflight_options = ScrapeOptions(
             cell_km=plan.recovery_cell_km, depth=plan.depth,
@@ -1335,19 +1287,21 @@ def cmd_recovery_run(args) -> int:
                 raise
         except (SourceRunRejected, RecoverySchemaError, PlanRejected) as exc:
             return reject(str(exc))
-        except Exception as exc:  # registration must fail closed, never escape
+        except Exception as exc:
             print(f"recovery-run registration failed: {exc}", file=sys.stderr)
             return 1
 
         try:
             mappings_list = list(conn.execute(
-                "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
-                "FROM recovery_execution_bins WHERE plan_sha256 = ? ORDER BY row, column",
+                "SELECT b.row, b.column, b.tier, b.bbox_json, b.planned_searches, "
+                "b.run_id, b.container_name, e.output_root "
+                "FROM recovery_execution_bins AS b "
+                "JOIN recovery_executions AS e ON e.plan_sha256 = b.plan_sha256 "
+                "WHERE b.plan_sha256 = ? ORDER BY b.row, b.column",
                 (plan_sha256,),
             ))
         except (sqlite3.Error, OSError) as exc:
             return _bounded_operational_failure(conn, plan_sha256, exc, "mapping list read")
-        _MAPPING_ROOT_HOLDER["root"] = str(execution_root)
         if state == "complete":
             try:
                 stored_result = _validate_complete_parent(
@@ -1367,9 +1321,6 @@ def cmd_recovery_run(args) -> int:
                 )
                 return 1
             return 2
-        # SR-I02: prior status is preserved through snapshot/mapping
-        # validation and no-new-effect checks; the parent moves to running
-        # only when this invocation actually performs child progress.
 
         try:
             execution_root.mkdir(parents=True, exist_ok=True)
@@ -1406,14 +1357,8 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr(f"recovery-run failed to write plan snapshot: {exc}")
                 return 1
 
-        mappings = {
-            (m["row"], m["column"]): m
-            for m in mappings_list
-        }
+        mappings = {(m["row"], m["column"]): m for m in mappings_list}
         ordered_bins = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))
-        # The persisted mapping set must cover exactly the plan's bins; a
-        # missing or unexpected coordinate is inconsistent durable
-        # execution state. Fail the parent; mutate no child.
         expected_keys = {(b.row, b.column) for b in ordered_bins}
         if set(mappings) != expected_keys:
             mismatch = (
@@ -1433,38 +1378,24 @@ def cmd_recovery_run(args) -> int:
                     raise
             except Exception:
                 return 1
-            _best_effort_stderr(
-                "recovery execution state is inconsistent: mapping set mismatch"
-            )
+            _best_effort_stderr("recovery execution state is inconsistent: mapping set mismatch")
             return 2
         total = len(ordered_bins)
         completed_count = 0
         progress_started = False
         for bin_record in ordered_bins:
             mapping = mappings[(bin_record.row, bin_record.column)]
-            # Ownership of a child row is established only by provenance
-            # (mapped children) or by the executor committing the created
-            # deterministic child; failure handlers must never mutate a
-            # merely derivable ID.
             owned_child = {"run_id": None}
             if mapping["run_id"] is not None:
-                # RRI-F03/SR-I04: full provenance before trusting status.
                 try:
                     child_row = _validate_child_provenance(
                         conn, plan, plan_sha256, mapping, container_names
                     )
                 except PlanRejected as exc:
-                    # Full mapped-child provenance failed: ownership of the
-                    # mapped row was never established — not even when its
-                    # ID equals the plan-derived child ID, since an
-                    # unrelated row can occupy that ID. Fail the recovery
-                    # parent and leave the pointed-to runs row untouched.
                     try:
                         conn.execute("BEGIN IMMEDIATE")
                         try:
-                            set_recovery_parent_status(
-                                conn, plan_sha256, "failed", str(exc)
-                            )
+                            set_recovery_parent_status(conn, plan_sha256, "failed", str(exc))
                             conn.commit()
                         except BaseException:
                             conn.rollback()
@@ -1473,11 +1404,11 @@ def cmd_recovery_run(args) -> int:
                         return 1
                     _best_effort_stderr(f"recovery execution state is inconsistent: {exc}")
                     return 2
-                # Provenance passed: the mapped child is owned.
                 owned_child["run_id"] = mapping["run_id"]
                 if child_row["status"] == "complete":
                     completed_count += 1
                     continue
+
             def mark_parent_running():
                 nonlocal progress_started
                 if not progress_started:
@@ -1490,6 +1421,7 @@ def cmd_recovery_run(args) -> int:
                         except BaseException:
                             conn.rollback()
                             raise
+
             try:
                 outcome = _execute_recovery_child(
                     conn, plan, plan_sha256, execution_root, bin_record,
@@ -1499,13 +1431,6 @@ def cmd_recovery_run(args) -> int:
                 )
             except _ChildFailure as failure:
                 if failure.status != "none":
-                    # Repair the owned child, not just the parent. An
-                    # unstarted bin whose child row was never created owns
-                    # nothing: the derivable ID may name an unrelated run
-                    # and must not be mutated. A committed creation still
-                    # counts: durable state re-establishes ownership — and
-                    # a failure to determine ownership is itself bounded
-                    # (no child mutation, best-effort parent failure).
                     try:
                         child_run_id = owned_child["run_id"] or _durable_owned_child(
                             conn, plan, plan_sha256, bin_record, container_names
@@ -1534,15 +1459,9 @@ def cmd_recovery_run(args) -> int:
                             conn.rollback()
                             raise
                     except Exception as repair_exc:
-                        _best_effort_stderr(
-                            f"recovery-run child/parent repair failed: {repair_exc}"
-                        )
+                        _best_effort_stderr(f"recovery-run child/parent repair failed: {repair_exc}")
                         return 1
                 else:
-                    # Fix4: no-effect rejection. Fresh parent: interrupted.
-                    # Resumed parent with prior progress: interrupted.
-                    # Resumed parent with NO prior progress: preserve state.
-                    # Repair failure: rc 1, never silent rc 2 with running.
                     try:
                         conn.execute("BEGIN IMMEDIATE")
                         try:
@@ -1553,29 +1472,20 @@ def cmd_recovery_run(args) -> int:
                                 )
                                 conn.commit()
                             else:
-                                conn.rollback()  # preserve prior status
+                                conn.rollback()
                         except BaseException:
                             conn.rollback()
                             raise
                     except Exception:
-                        return 1  # repair failed: rc 1, never silent rc 2
+                        return 1
                 _best_effort_stderr(failure.error)
                 return failure.process_exit
             except KeyboardInterrupt:
-                # Bounded KI repair. A failed child-interrupt repair is an
-                # operational failure (bounded parent repair, exit 1); a
-                # failed parent repair falls back to best-effort parent
-                # failure so a resumed running parent never survives the
-                # interrupt as falsely running, then exits 1. Only a fully
-                # repaired interrupt exits 130.
                 try:
                     ki_run_id = owned_child["run_id"] or _durable_owned_child(
                         conn, plan, plan_sha256, bin_record, container_names
                     )
                 except _OwnershipReadError as own_exc:
-                    # Ownership could not be verified: the interrupt is an
-                    # operational repair failure (bounded parent repair,
-                    # exit 1) — never rc 130 and never an escaping error.
                     return _bounded_operational_failure(
                         conn, plan_sha256, own_exc,
                         "child interrupt ownership verification",
@@ -1606,9 +1516,6 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr("recovery-run interrupted")
                 return 130
             except PlanRejected as reject_exc:
-                # Snapshot rejection repairs the owned child and the parent;
-                # if ownership cannot be determined, no child is mutated and
-                # the parent fails bounded (exit 1).
                 try:
                     child_run_id = owned_child["run_id"] or _durable_owned_child(
                         conn, plan, plan_sha256, bin_record, container_names
@@ -1631,9 +1538,7 @@ def cmd_recovery_run(args) -> int:
                                 "error = ? WHERE id = ? AND status != 'complete'",
                                 (utc_now(), str(reject_exc), child_run_id),
                             )
-                        set_recovery_parent_status(
-                            conn, plan_sha256, "failed", str(reject_exc)
-                        )
+                        set_recovery_parent_status(conn, plan_sha256, "failed", str(reject_exc))
                         conn.commit()
                     except BaseException:
                         conn.rollback()
@@ -1643,13 +1548,6 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr(str(reject_exc))
                 return 2
             except (sqlite3.Error, OSError, RuntimeError, RecoverySchemaError) as op_exc:
-                # An operational error mid-child must not strand an owned
-                # active child as running; repair it before the parent. An
-                # unstarted bin owns nothing until its child row commits,
-                # so a merely derivable ID is never mutated; a committed
-                # creation re-establishes ownership from durable state. A
-                # failure to determine ownership stays inside this
-                # operational path (no child mutation; parent repair below).
                 try:
                     child_run_id = owned_child["run_id"] or _durable_owned_child(
                         conn, plan, plan_sha256, bin_record, container_names
@@ -1670,10 +1568,8 @@ def cmd_recovery_run(args) -> int:
                         conn.rollback()
                         raise
                 except Exception:
-                    pass  # child repair best-effort; parent repair below
-                return _bounded_operational_failure(
-                    conn, plan_sha256, op_exc, "child orchestration"
-                )
+                    pass
+                return _bounded_operational_failure(conn, plan_sha256, op_exc, "child orchestration")
             if outcome == "complete":
                 completed_count += 1
                 report_rc = _guard_child_progress_report(
@@ -1696,26 +1592,17 @@ def cmd_recovery_run(args) -> int:
             try:
                 conn.rollback()
             except Exception as rollback_exc:
-                # A failed rollback is itself an operational failure; the
-                # bounded handler retries it and repairs the parent rather
-                # than letting the storage error replace the original one.
                 return _bounded_operational_failure(
                     conn, plan_sha256, rollback_exc, "finalization rollback"
                 )
             if isinstance(finalize_exc, KeyboardInterrupt):
-                # Bounded KI during finalization: children may be complete
-                # while the parent is still running. Repair the parent to
-                # interrupted transactionally; if that repair cannot
-                # commit, fall back to parent-failure semantics.
                 try:
                     status_row = conn.execute(
                         "SELECT status FROM recovery_executions WHERE plan_sha256 = ?",
                         (plan_sha256,),
                     ).fetchone()
                     if status_row is not None and status_row["status"] == "complete":
-                        _best_effort_stderr(
-                            "recovery-run complete; finalization interrupted"
-                        )
+                        _best_effort_stderr("recovery-run complete; finalization interrupted")
                         return 130
                     conn.execute("BEGIN IMMEDIATE")
                     try:
@@ -1730,16 +1617,13 @@ def cmd_recovery_run(args) -> int:
                 except Exception as interrupt_repair_exc:
                     _best_effort_parent_failure(
                         conn, plan_sha256,
-                        f"recovery-run interrupt repair failed during finalization: "
-                        f"{interrupt_repair_exc}",
+                        f"recovery-run interrupt repair failed during finalization: {interrupt_repair_exc}",
                     )
                     return 1
                 _best_effort_stderr("recovery-run interrupted during finalization")
                 return 130
 
-            _best_effort_parent_failure(
-                conn, plan_sha256, f"finalization failed: {finalize_exc}"
-            )
+            _best_effort_parent_failure(conn, plan_sha256, f"finalization failed: {finalize_exc}")
             _best_effort_stderr(f"recovery-run finalization failed: {finalize_exc}")
             return 1
 
@@ -1749,7 +1633,6 @@ def cmd_recovery_run(args) -> int:
                 (plan_sha256,),
             ).fetchone()["result_json"]
         except (sqlite3.Error, TypeError) as fetch_exc:
-            # A54-F01: parent is already committed complete; bounded failure.
             _best_effort_stderr(f"recovery-run failed to fetch final result: {fetch_exc}")
             return 1
         return _guard_final_report(
@@ -1778,18 +1661,15 @@ _RESULT_V1_INT_FIELDS = (
 
 
 def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names):
-    """Full deterministic provenance check for one mapped child.
-
-    Returns the child runs row when every field matches the plan-derived
-    expectation exactly. Raises PlanRejected on any disagreement, before the
-    caller may trust the child's recorded status.
-    """
     row_value, column_value = mapping["row"], mapping["column"]
     expected_run_id = _recovery_child_run_id(plan_sha256, row_value, column_value)
     bin_record = next(
         b for b in plan.selected_bins if (b.row, b.column) == (row_value, column_value)
     )
-    bin_dir = Path(mapping_root(plan_sha256)) / "bins" / f"r{row_value}-c{column_value}"
+    persisted_root = mapping["output_root"]
+    if not isinstance(persisted_root, str) or not persisted_root:
+        raise PlanRejected("recovery execution has invalid persisted output_root")
+    bin_dir = Path(persisted_root) / "bins" / f"r{row_value}-c{column_value}"
     expected_raw = str(bin_dir / "results.jsonl")
     proxy_sha = plan.config.get("proxy_sha256")
     expected_config = _recovery_child_config_json(plan, bin_record, proxy_sha, plan_sha256)
@@ -1808,9 +1688,7 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
     if mapping_bbox != plan_bbox:
         raise PlanRejected(f"mapping r{row_value}-c{column_value} bbox disagrees with the plan")
 
-    child = conn.execute(
-        "SELECT * FROM runs WHERE id = ?", (expected_run_id,)
-    ).fetchone()
+    child = conn.execute("SELECT * FROM runs WHERE id = ?", (expected_run_id,)).fetchone()
     if child is None:
         raise PlanRejected(f"child run {expected_run_id} for r{row_value}-c{column_value} does not exist")
     if child["area_name"] != f"{plan.area_name}-rr-r{row_value}-c{column_value}":
@@ -1829,17 +1707,11 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
         raise PlanRejected(f"child {expected_run_id} config_json disagrees with the plan-derived configuration")
     if child["raw_path"] != expected_raw:
         raise PlanRejected(f"child {expected_run_id} raw_path disagrees with the deterministic bin path")
-    # SR-E4-01: child status must be a known lifecycle state; corrupted
-    # status is an inconsistent-state rejection, never silently normalized.
     if child["status"] not in ("running", "interrupted", "failed", "complete"):
-        raise PlanRejected(
-            f"child {expected_run_id} has invalid status {child['status']!r}"
-        )
-    # SR-A54-01: started_at must be a non-empty string.
+        raise PlanRejected(f"child {expected_run_id} has invalid status {child['status']!r}")
     if not isinstance(child["started_at"], str) or not child["started_at"]:
         raise PlanRejected(f"child {expected_run_id} has invalid started_at")
 
-    # SR-F5-04: status-dependent terminal lifecycle fields must be consistent.
     status = child["status"]
     finished = child["finished_at"]
     error = child["error"]
@@ -1853,22 +1725,11 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
             raise PlanRejected(f"child {expected_run_id} is running but has a finished_at")
     else:
         if not isinstance(finished, str) or not finished:
-            raise PlanRejected(
-                f"child {expected_run_id} is {status} but has no finished_at"
-            )
+            raise PlanRejected(f"child {expected_run_id} is {status} but has no finished_at")
     return child
 
 
-_MAPPING_ROOT_HOLDER: dict[str, str] = {}
-
-
-def mapping_root(plan_sha256: str) -> Path:
-    """Current execution root for provenance path checks (set per invocation)."""
-    return Path(_MAPPING_ROOT_HOLDER["root"])
-
-
 def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names) -> str:
-    """Structural validation before reporting an already-complete execution."""
     expected_keys = {(b.row, b.column) for b in plan.selected_bins}
     actual_keys = {(m["row"], m["column"]) for m in mappings}
     if actual_keys != expected_keys:
@@ -1893,6 +1754,7 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
     ).fetchone()["result_json"]
     if not isinstance(result_raw, str) or not result_raw:
         raise PlanRejected("complete parent has no stored result_json")
+
     def _no_dup_result_keys(pairs):
         seen = set()
         for key, _ in pairs:
@@ -1917,7 +1779,6 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
             raise PlanRejected(f"complete parent result_json field {field} must be an integer")
         if value < 0:
             raise PlanRejected(f"complete parent result_json field {field} must be nonnegative")
-    # SR-E3-01: cross-check stable fields against the frozen plan identity.
     if result["child_runs"] != len(plan.selected_bins):
         raise PlanRejected("complete parent result_json child_runs does not match the plan's selected-bin count")
     if result["planned_searches"] != plan.targeted_searches:
@@ -1928,16 +1789,7 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
 
 
 def _child_ki_guard(conn, run_id):
-    """F5-F02: child interrupt repair after KI.
-
-    Returns "absent" (no child row), "complete" (nothing to repair), or
-    "repaired" (durably marked interrupted). A failure of the repair
-    transaction itself propagates so the caller classifies the interrupt
-    as an operational failure instead of a clean exit 130.
-    """
-    row = conn.execute(
-        "SELECT status FROM runs WHERE id = ?", (run_id,)
-    ).fetchone()
+    row = conn.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
     if row is None:
         return "absent"
     if row["status"] == "complete":
@@ -1956,32 +1808,19 @@ def _child_ki_guard(conn, run_id):
         raise
 
 
-
 class _OwnershipReadError(Exception):
-    """Durable child ownership could not be determined (storage read failure)."""
+    pass
 
 
 def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
-    """Re-establish child ownership from durable state after a failure.
-
-    The volatile owned-child holder can lag a committed child creation
-    (an interrupt between the commit and the holder assignment). The
-    persisted mapping is authoritative: ownership holds only when the
-    mapping carries the plan-derived child ID and that row passes full
-    provenance; anything else — including an unrelated row occupying the
-    deterministic ID — is not owned and is never mutated.
-
-    Returns the owned child run id, or None when the bin definitively
-    owns no child row. Raises _OwnershipReadError when the durable state
-    itself cannot be read; callers must treat that as a bounded failure
-    and never mutate a child.
-    """
     try:
-        conn.rollback()  # discard any transaction left open by the failure
+        conn.rollback()
         fresh = conn.execute(
-            "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
-            "FROM recovery_execution_bins "
-            "WHERE plan_sha256 = ? AND row = ? AND column = ?",
+            "SELECT b.row, b.column, b.tier, b.bbox_json, b.planned_searches, "
+            "b.run_id, b.container_name, e.output_root "
+            "FROM recovery_execution_bins AS b "
+            "JOIN recovery_executions AS e ON e.plan_sha256 = b.plan_sha256 "
+            "WHERE b.plan_sha256 = ? AND b.row = ? AND b.column = ?",
             (plan_sha256, bin_record.row, bin_record.column),
         ).fetchone()
         if fresh is None or fresh["run_id"] is None:
@@ -1996,17 +1835,10 @@ def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
             return None
         return fresh["run_id"]
     except (sqlite3.Error, OSError) as exc:
-        # Only expected read failures are bounded; programmer errors such
-        # as AssertionError (and data-corruption ValueError, which the
-        # loop-level provenance call likewise does not swallow) propagate.
         raise _OwnershipReadError(str(exc)) from exc
 
 
 def _remove_stopped_container(container_id, container_name):
-    """Remove a stopped owned container by its immutable ID.
-
-    Returns None on success. Raises _ChildFailure on failure.
-    """
     try:
         removed = subprocess.run(
             ["docker", "rm", container_id],
@@ -2030,13 +1862,14 @@ def _remove_stopped_container(container_id, container_name):
                         "remove a replacement without fresh ownership verification"
                     ),
                 )
-            return None  # container gone; safe to continue
+            return None
         raise _ChildFailure(
             status="failed", process_exit=1,
             error=f"failed to remove stopped owned container {container_id}: "
                   f"{stderr_text.strip() or removed.returncode}",
         )
     return None
+
 
 def _execute_recovery_child(
     conn, plan, plan_sha256, execution_root, bin_record, mapping, proxy_path, container_name,
@@ -2045,7 +1878,7 @@ def _execute_recovery_child(
     row, column = bin_record.row, bin_record.column
     run_id = _recovery_child_run_id(plan_sha256, row, column)
     bin_dir = execution_root / "bins" / f"r{row}-c{column}"
-    _deferred_rm = None  # 429: stopped-container ID, removed after provenance
+    _deferred_rm = None
     output_file = bin_dir / "results.jsonl"
     area = AreaConfig(f"{plan.area_name}-rr-r{row}-c{column}", bin_record.bbox)
 
@@ -2058,11 +1891,9 @@ def _execute_recovery_child(
             error=f"child lock/bin directory creation failed: {exc}",
         ) from exc
     except RuntimeError as exc:
-        # Active child lock: another process owns this bin; no new effect.
         raise _ChildFailure(status="none", process_exit=2, error=str(exc)) from exc
 
     def mark_child_lifecycle(status: str, error: str | None) -> None:
-        """Update child lifecycle fields without altering exit provenance."""
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
@@ -2075,12 +1906,9 @@ def _execute_recovery_child(
             raise
 
     def record_child_exit(exit_code: int) -> None:
-        """Record a newly observed scraper process exit code."""
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "UPDATE runs SET exit_code = ? WHERE id = ?", (exit_code, run_id)
-            )
+            conn.execute("UPDATE runs SET exit_code = ? WHERE id = ?", (exit_code, run_id))
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -2094,12 +1922,9 @@ def _execute_recovery_child(
             error=f"container liveness reconciliation failed: {exc}",
         ) from exc
     try:
-        pass  # beginning of original guarded body
         if inspect is not None:
             labels = inspect["labels"]
-            if labels.get(_RECOVERY_LABEL_PLAN) != plan_sha256 or labels.get(
-                _RECOVERY_LABEL_RUN
-            ) != run_id:
+            if labels.get(_RECOVERY_LABEL_PLAN) != plan_sha256 or labels.get(_RECOVERY_LABEL_RUN) != run_id:
                 raise _ChildFailure(
                     status="none", process_exit=2,
                     error=(
@@ -2115,17 +1940,13 @@ def _execute_recovery_child(
                         "prior acquisition remains in progress; refusing a second launch"
                     ),
                 )
-            # Matching stopped container still reserves its deterministic
-            # name: remove the inspected immutable container ID (not the
-            # 429/SR-A54-02: DEFER stopped-container removal until AFTER
-            # provenance and query snapshot validation.
             stopped_container_id = inspect.get("container_id")
             if not stopped_container_id or not isinstance(stopped_container_id, str):
                 raise _ChildFailure(
                     status="failed", process_exit=1,
                     error=f"docker inspect returned no usable container ID for {container_name}",
                 )
-            _deferred_rm = stopped_container_id  # removed later, after provenance
+            _deferred_rm = stopped_container_id
 
         options = ScrapeOptions(
             cell_km=plan.recovery_cell_km, depth=plan.depth,
@@ -2165,9 +1986,7 @@ def _execute_recovery_child(
 
         existing_run = None
         if mapping["run_id"] is not None:
-            existing_run = conn.execute(
-                "SELECT * FROM runs WHERE id = ?", (mapping["run_id"],)
-            ).fetchone()
+            existing_run = conn.execute("SELECT * FROM runs WHERE id = ?", (mapping["run_id"],)).fetchone()
             if existing_run is None:
                 raise _ChildFailure(
                     status="failed", process_exit=2,
@@ -2185,24 +2004,17 @@ def _execute_recovery_child(
             if existing_run["status"] == "complete":
                 return "already_complete"
 
-            # SR-F5-01: enforce exact query snapshot before any resume action
             _validate_query_snapshot(bin_dir, plan, is_started=True)
 
-            # 429: Now remove the stopped owned container (deferred from
-            # the inspection phase) after provenance and snapshot validation.
             if _deferred_rm:
                 _remove_stopped_container(_deferred_rm, container_name)
-                _deferred_rm = None  # consumed
-                inspect = None  # container is now absent; sidecar path may proceed
+                _deferred_rm = None
+                inspect = None
 
             if inspect is None:
                 try:
-                    completed_ids = load_resume_completed_input_ids(
-                        output_file, plan.scraper_image
-                    )
+                    completed_ids = load_resume_completed_input_ids(output_file, plan.scraper_image)
                 except (RuntimeError, OSError) as exc:
-                    # E4-F04: invalid evidence is a child failure, not just
-                    # a parent failure; preserve the child's exit_code.
                     mark_child_lifecycle("failed", f"existing resume evidence is invalid: {exc}")
                     raise _ChildFailure(
                         status="failed", process_exit=1,
@@ -2216,13 +2028,11 @@ def _execute_recovery_child(
                         error="existing resume evidence contains unexpected input IDs",
                     )
                 if comparison.missing == 0:
-                    # V2-F05: actual progress (direct ingestion) begins now.
                     if mark_parent_running is not None:
                         mark_parent_running()
                     try:
                         recorded_exit = conn.execute(
-                            "SELECT exit_code FROM runs WHERE id = ?",
-                            (mapping["run_id"],),
+                            "SELECT exit_code FROM runs WHERE id = ?", (mapping["run_id"],)
                         ).fetchone()["exit_code"]
                         ingest_records(
                             conn, mapping["run_id"], iter_jsonl(output_file),
@@ -2242,18 +2052,13 @@ def _execute_recovery_child(
                             status="failed", process_exit=1,
                             error=f"direct-sidecar ingestion failed: {ingest_exc}",
                         ) from ingest_exc
-                    return "complete"  # E3-F04: outer guard handles reporting
-            # V2-F05: parent transitions to running only now, after lock/
-            # container no-new-effect checks passed and real progress begins.
+                    return "complete"
             if mark_parent_running is not None:
                 mark_parent_running()
             conn.execute("BEGIN IMMEDIATE")
             try:
-                # SR-I03: exit_code is the last observed scraper exit; it is
-                # never cleared here and only replaced by a new scraper return.
                 conn.execute(
-                    "UPDATE runs SET status = 'running', finished_at = NULL, error = NULL "
-                    "WHERE id = ?",
+                    "UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?",
                     (mapping["run_id"],),
                 )
                 conn.commit()
@@ -2262,10 +2067,6 @@ def _execute_recovery_child(
                 raise
         else:
             if _deferred_rm is not None:
-                # A stopped container carrying this execution's labels with
-                # no mapped child is anomalous durable state: labels alone
-                # are not an ownership certificate for mutation. Fail
-                # closed with no effect before any child creation.
                 raise _ChildFailure(
                     status="none", process_exit=2,
                     error=(
@@ -2274,7 +2075,6 @@ def _execute_recovery_child(
                         "remove it or create a child"
                     ),
                 )
-            # SR-F5-02: validate/repair unstarted snapshot (no child started yet)
             try:
                 bin_dir.mkdir(parents=True, exist_ok=True)
                 _validate_query_snapshot(bin_dir, plan, is_started=False)
@@ -2307,7 +2107,6 @@ def _execute_recovery_child(
                         status="failed", process_exit=1,
                         error=f"child query snapshot write failed: {exc}",
                     ) from exc
-            # RRI-F07: refuse to silently adopt orphan raw/resume evidence.
             orphan_raw = bin_dir / "results.jsonl"
             orphan_resume = bin_dir / "results.jsonl.resume.json"
             if orphan_raw.exists() or orphan_resume.exists():
@@ -2318,16 +2117,12 @@ def _execute_recovery_child(
                         "files; refusing to adopt untracked scraper evidence"
                     ),
                 )
-            collision = conn.execute(
-                "SELECT id FROM runs WHERE id = ?", (run_id,)
-            ).fetchone()
+            collision = conn.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
             if collision is not None:
                 raise _ChildFailure(
                     status="none", process_exit=2,
                     error=f"derived child run ID {run_id} collides with an unrelated run",
                 )
-            # Build the command without output-path mutation first; the host
-            # file is prepared only after the child row exists.
             try:
                 command = build_docker_command(
                     area=area, queries_file=bin_dir / "queries.txt",
@@ -2341,8 +2136,6 @@ def _execute_recovery_child(
                     status="failed", process_exit=1,
                     error=f"child preparation failed: {exc}",
                 ) from exc
-            # V2-F05: parent transitions to running only now, after
-            # lock/container/option/precision no-new-effect checks passed.
             if mark_parent_running is not None:
                 mark_parent_running()
             conn.execute("BEGIN IMMEDIATE")
@@ -2367,14 +2160,9 @@ def _execute_recovery_child(
                 conn.rollback()
                 raise
             _run_fault_hook("after_child_run_commit")
-            # The deterministic child row is durable: from here on this
-            # invocation owns it and outer failure handlers may repair it.
             if owned_child is not None:
                 owned_child["run_id"] = run_id
 
-            # V2-F01: the child row is durable; exclusively create the
-            # host-owned results file. Failure leaves the row in place and
-            # truthfully marks the child failed without fabricating an exit.
             try:
                 fd = os.open(
                     output_file,
@@ -2416,8 +2204,6 @@ def _execute_recovery_child(
             print(command_for_display(command))
             scraper_exit = run_scraper(command)
         except KeyboardInterrupt:
-            # Sara-side interrupt before any new scraper return: the child is
-            # interrupted without inventing scraper-exit provenance.
             mark_child_lifecycle("interrupted", "recovery child interrupted before scraper return")
             raise
         except (RuntimeError, OSError) as exc:
@@ -2425,9 +2211,6 @@ def _execute_recovery_child(
             raise _ChildFailure(
                 status="failed", process_exit=1, error=f"scraper launch failed: {exc}"
             ) from exc
-        # V2-F02: record every normally observed scraper exit (including
-        # zero) before any completion evaluation, so runs.exit_code is
-        # always the last observed scraper process exit code.
         record_child_exit(scraper_exit)
 
         if scraper_exit != 0:
@@ -2480,6 +2263,7 @@ def _execute_recovery_child(
         return "complete"
     finally:
         _safe_release(child_lock)
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
