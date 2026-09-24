@@ -1423,7 +1423,29 @@ def cmd_recovery_run(args) -> int:
                         conn, plan, plan_sha256, mapping, container_names
                     )
                 except PlanRejected as exc:
-                    return reject(f"recovery execution state is inconsistent: {exc}")
+                    # The stored execution state is unusable. Record the
+                    # lifecycle outcome instead of a bare rejection so a
+                    # crash-stranded running parent/child cannot survive.
+                    child_run_id = mapping["run_id"]
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            conn.execute(
+                                "UPDATE runs SET status = 'failed', finished_at = ?, "
+                                "error = ? WHERE id = ? AND status != 'complete'",
+                                (utc_now(), str(exc), child_run_id),
+                            )
+                            set_recovery_parent_status(
+                                conn, plan_sha256, "failed", str(exc)
+                            )
+                            conn.commit()
+                        except BaseException:
+                            conn.rollback()
+                            raise
+                    except Exception:
+                        return 1
+                    _best_effort_stderr(f"recovery execution state is inconsistent: {exc}")
+                    return 2
                 if child_row["status"] == "complete":
                     completed_count += 1
                     continue
@@ -1494,15 +1516,20 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr(failure.error)
                 return failure.process_exit
             except KeyboardInterrupt:
-                # Bounded KI repair: child and parent repair are both
-                # best-effort; a failed parent repair exits 1, not 130.
+                # Bounded KI repair. A failed child-interrupt repair is an
+                # operational failure (bounded parent repair, exit 1); a
+                # failed parent repair falls back to best-effort parent
+                # failure so a resumed running parent never survives the
+                # interrupt as falsely running, then exits 1. Only a fully
+                # repaired interrupt exits 130.
                 ki_run_id = mapping["run_id"] or _recovery_child_run_id(
                     plan_sha256, bin_record.row, bin_record.column
                 )
-                child_ok = _child_ki_guard(conn, ki_run_id)
-                if not child_ok:
-                    _best_effort_stderr(
-                        f"warning: child {ki_run_id} interrupt repair did not complete"
+                try:
+                    _child_ki_guard(conn, ki_run_id)
+                except Exception as child_repair_exc:
+                    return _bounded_operational_failure(
+                        conn, plan_sha256, child_repair_exc, "child interrupt repair"
                     )
                 try:
                     conn.execute("BEGIN IMMEDIATE")
@@ -1514,8 +1541,12 @@ def cmd_recovery_run(args) -> int:
                     except BaseException:
                         conn.rollback()
                         raise
-                except Exception:
-                    return 1  # parent repair failed: bounded rc 1
+                except Exception as parent_repair_exc:
+                    _best_effort_parent_failure(
+                        conn, plan_sha256,
+                        f"recovery-run interrupt parent repair failed: {parent_repair_exc}",
+                    )
+                    return 1
                 _best_effort_stderr("recovery-run interrupted")
                 return 130
             except PlanRejected as reject_exc:
@@ -1591,10 +1622,7 @@ def cmd_recovery_run(args) -> int:
             _best_effort_parent_failure(
                 conn, plan_sha256, f"finalization failed: {finalize_exc}"
             )
-            print(
-                f"recovery-run finalization failed: {finalize_exc}",
-                file=sys.stderr,
-            )
+            _best_effort_stderr(f"recovery-run finalization failed: {finalize_exc}")
             return 1
 
         try:
@@ -1774,30 +1802,32 @@ def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names
 
 
 def _child_ki_guard(conn, run_id):
-    """F5-F02: best-effort child interrupt repair after KI.
+    """F5-F02: child interrupt repair after KI.
 
-    Returns True if the child was durably marked interrupted.
+    Returns "absent" (no child row), "complete" (nothing to repair), or
+    "repaired" (durably marked interrupted). A failure of the repair
+    transaction itself propagates so the caller classifies the interrupt
+    as an operational failure instead of a clean exit 130.
     """
+    row = conn.execute(
+        "SELECT status FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None:
+        return "absent"
+    if row["status"] == "complete":
+        return "complete"
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute(
-            "SELECT status FROM runs WHERE id = ?", (run_id,)
-        ).fetchone()
-        if row is None or row["status"] == "complete":
-            return False
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                "UPDATE runs SET status = 'interrupted', finished_at = ?, "
-                "error = 'recovery child interrupted' WHERE id = ? AND status != 'complete'",
-                (utc_now(), run_id),
-            )
-            conn.commit()
-            return True
-        except BaseException:
-            conn.rollback()
-            raise
-    except Exception:
-        return False
+        conn.execute(
+            "UPDATE runs SET status = 'interrupted', finished_at = ?, "
+            "error = 'recovery child interrupted' WHERE id = ? AND status != 'complete'",
+            (utc_now(), run_id),
+        )
+        conn.commit()
+        return "repaired"
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 

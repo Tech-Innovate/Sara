@@ -880,14 +880,17 @@ class TestF5F02WholeChildKI:
         conn.commit()
         # The guard should mark it interrupted
         result = cli._child_ki_guard(conn, child_id)
-        assert result is True
+        assert result == "repaired"
         child = conn.execute("SELECT status FROM runs WHERE id = ?", (child_id,)).fetchone()
         assert child["status"] == "interrupted"
         # Guard on an already-complete child does nothing
         conn.execute("UPDATE runs SET status = 'complete' WHERE id = ?", (child_id,))
         conn.commit()
         result2 = cli._child_ki_guard(conn, child_id)
-        assert result2 is False
+        assert result2 == "complete"
+        # A child row that never existed is distinct from repair failure.
+        result3 = cli._child_ki_guard(conn, "nonexistent-run")
+        assert result3 == "absent"
         conn.close()
 
     def test_ki_during_direct_sidecar_ingestion(self, tmp_path, monkeypatch):
@@ -1598,30 +1601,40 @@ class TestPR4R3BoundedRepairs:
             "SELECT status FROM runs WHERE id = ?", (child_id,)
         ).fetchone()
         assert child[0] == "interrupted"
+        # The fallback parent repair ran: the resumed running parent did
+        # not survive the failed interrupt repair as falsely running.
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
         conn.close()
 
-    def test_ki_child_guard_failure_still_bounded_130(self, tmp_path, monkeypatch):
-        """KI whose child guard fails warns and still exits bounded 130."""
+    def test_ki_child_guard_repair_failure_is_operational(self, tmp_path, monkeypatch):
+        """KI whose child-interrupt repair fails is operational: rc 1, parent failed."""
         data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
             monkeypatch, tmp_path
         )
         child_id = cli._recovery_child_run_id(sha, second.row, second.column)
-        monkeypatch.setattr(cli, "_child_ki_guard", lambda conn_, run_id: False)
+
+        def guard_crash(conn_, run_id):
+            raise sqlite3.OperationalError("child interrupt repair crashed")
+
+        monkeypatch.setattr(cli, "_child_ki_guard", guard_crash)
         monkeypatch.setattr(
             cli, "run_scraper",
             lambda c: (_ for _ in ()).throw(KeyboardInterrupt()),
         )
         rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
-        assert rc == 130
+        assert rc == 1
         conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
         child = conn.execute(
             "SELECT status FROM runs WHERE id = ?", (child_id,)
         ).fetchone()
         assert child[0] == "interrupted"
-        parent = conn.execute(
-            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
-        ).fetchone()
-        assert parent[0] == "interrupted"
         conn.close()
 
     def test_started_snapshot_mismatch_fails_child_and_parent(self, tmp_path, monkeypatch):
@@ -1700,4 +1713,134 @@ class TestPR4R3BoundedRepairs:
             "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
         ).fetchone()
         assert parent[0] == "complete"
+        conn.close()
+
+    def _install3(self, monkeypatch, tmp_path):
+        """Three-bin plan: source businesses clustered in three tiles."""
+        from test_recovery_run import build_db, BBOX
+        from sara.recovery import parse_execution_plan
+        from test_recovery_run_exec import FakeScraper
+
+        db = build_db(
+            tmp_path / "sara.db",
+            coords=[(0.001, 0.001)] * 3 + [(0.03, 0.03)] * 2 + [(0.03, 0.001)] * 2,
+        )
+        area = tmp_path / "area.json"
+        area.write_text(json.dumps({"name": "x", "bbox": BBOX}), encoding="utf-8")
+        qfile = tmp_path / "queries.txt"
+        qfile.write_text("restaurant\n", encoding="utf-8")
+        output = tmp_path / "plan.json"
+        rc = cli.main([
+            "--db", str(db), "recovery-plan", "--run-id", "src-run",
+            "--recovery-cell-km", "1.0", "--tier-a-min", "2", "--tier-b-min", "1",
+            "--policy-id", "rr-test", "--output", str(output),
+        ])
+        assert rc == 0
+        data = output.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        plan = parse_execution_plan(data)
+        assert len(plan.selected_bins) == 3
+        plans_by_container = {}
+        records_by_run = {}
+        for bin_record in plan.selected_bins:
+            run_id = cli._recovery_child_run_id(sha, bin_record.row, bin_record.column)
+            container = cli._recovery_container_name(run_id)
+            plans_by_container[container] = (bin_record, run_id, plan)
+            records_by_run[run_id] = _records_for_bin(bin_record, run_id)
+        fake = FakeScraper(plans_by_container, records_by_run)
+        monkeypatch.setattr(cli, "run_scraper", fake)
+        monkeypatch.setattr(cli, "_docker_inspect_container", lambda name: None)
+        return data, sha, db, plan, fake
+
+    def test_provenance_rejection_repairs_stranded_running_rows(self, tmp_path, monkeypatch):
+        """Pre-execution provenance rejection repairs crash-stranded running rows."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        child_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        conn = sqlite3.connect(db)
+        # Crash-strand the child and parent as running, then corrupt the
+        # child's config so pre-execution provenance validation rejects it.
+        conn.execute(
+            "UPDATE runs SET status = 'running', finished_at = NULL, error = NULL, "
+            "config_json = 'not-the-plan-config' WHERE id = ?",
+            (child_id,),
+        )
+        conn.execute(
+            "UPDATE recovery_executions SET status = 'running', finished_at = NULL, "
+            "error = NULL WHERE plan_sha256 = ?",
+            (sha,),
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        child = conn.execute(
+            "SELECT status, finished_at, error FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        assert child[0] == "failed"
+        assert child[1] is not None
+        assert "config" in child[2]
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        conn.close()
+
+    def test_same_invocation_progress_then_no_effect_interrupted(self, tmp_path, monkeypatch):
+        """Resumed run that progresses and then hits a no-effect rejection in the
+        same invocation ends interrupted: the progress branch, pinned."""
+        data, sha, db, plan, fake = self._install3(monkeypatch, tmp_path)
+        bins = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))
+        second, third = bins[1], bins[2]
+        state = {"n": 0}
+
+        def first_then_crash(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_crash)
+        args = run_args(db, data, sha, tmp_path, expected_searches=plan.targeted_searches)
+        assert cli.cmd_recovery_run(args) == 130
+
+        # Resume: bin 1 skips; bin 2 completes (progress in THIS invocation);
+        # bin 3 hits an active owned container => no-effect rejection.
+        monkeypatch.setattr(cli, "run_scraper", fake)
+        third_run = cli._recovery_child_run_id(sha, third.row, third.column)
+        third_container = cli._recovery_container_name(third_run)
+
+        def inspect(name):
+            if name == third_container:
+                return {
+                    "running": True,
+                    "labels": {
+                        "sara.recovery.plan_sha256": sha,
+                        "sara.recovery.run_id": third_run,
+                    },
+                    "container_id": "active-third",
+                }
+            return None
+
+        monkeypatch.setattr(cli, "_docker_inspect_container", inspect)
+        rc = cli.cmd_recovery_run(args)
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        # Progress happened in this invocation before the rejection, so the
+        # truthful terminal state is interrupted.
+        assert parent[0] == "interrupted"
+        second_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        second_status = conn.execute(
+            "SELECT status FROM runs WHERE id = ?", (second_id,)
+        ).fetchone()[0]
+        assert second_status == "complete"
         conn.close()
