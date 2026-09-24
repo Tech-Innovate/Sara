@@ -1486,6 +1486,9 @@ def cmd_recovery_run(args) -> int:
                             conn, plan, plan_sha256, bin_record, container_names
                         )
                     except _OwnershipReadError as own_exc:
+                        _best_effort_stderr(
+                            f"recovery-run child repair could not verify ownership: {own_exc}"
+                        )
                         _best_effort_parent_failure(
                             conn, plan_sha256,
                             f"recovery-run child repair could not verify ownership: {own_exc}",
@@ -1586,6 +1589,9 @@ def cmd_recovery_run(args) -> int:
                         conn, plan, plan_sha256, bin_record, container_names
                     )
                 except _OwnershipReadError as own_exc:
+                    _best_effort_stderr(
+                        f"recovery-run rejection repair could not verify ownership: {own_exc}"
+                    )
                     _best_effort_parent_failure(
                         conn, plan_sha256,
                         f"recovery-run rejection repair could not verify ownership: {own_exc}",
@@ -1916,7 +1922,10 @@ def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
         except PlanRejected:
             return None
         return fresh["run_id"]
-    except Exception as exc:
+    except (sqlite3.Error, OSError) as exc:
+        # Only expected read failures are bounded; programmer errors such
+        # as AssertionError (and data-corruption ValueError, which the
+        # loop-level provenance call likewise does not swallow) propagate.
         raise _OwnershipReadError(str(exc)) from exc
 
 

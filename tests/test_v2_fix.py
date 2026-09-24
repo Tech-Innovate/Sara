@@ -2106,7 +2106,7 @@ class TestPR4R3BoundedRepairs:
         assert parent[0] == "failed"
         conn.close()
 
-    def test_child_failure_ownership_read_failure_is_bounded(self, tmp_path, monkeypatch):
+    def test_child_failure_ownership_read_failure_is_bounded(self, tmp_path, monkeypatch, capsys):
         """A child failure whose ownership re-read fails mutates no child and
         fails the parent bounded: rc 1."""
         data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
@@ -2128,6 +2128,8 @@ class TestPR4R3BoundedRepairs:
         finally:
             clear_recovery_fault_hook("after_child_run_commit")
         assert rc == 1
+        err = capsys.readouterr().err
+        assert "could not verify ownership" in err
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
         child = conn.execute(
@@ -2142,3 +2144,20 @@ class TestPR4R3BoundedRepairs:
         ).fetchone()
         assert parent["status"] == "failed"
         conn.close()
+
+    def test_ownership_read_assertion_error_propagates(self, tmp_path, monkeypatch):
+        """A programmer error during ownership verification is not swallowed."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+
+        def provenance_assert(conn_, plan_, ps, mapping_, containers_):
+            raise AssertionError("programmer error in provenance")
+
+        monkeypatch.setattr(cli, "_validate_child_provenance", provenance_assert)
+        set_recovery_fault_hook(
+            "after_child_run_commit", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        try:
+            with pytest.raises(AssertionError):
+                cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_child_run_commit")
