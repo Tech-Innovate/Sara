@@ -1870,6 +1870,14 @@ def mapping_root(plan_sha256: str) -> Path:
 
 def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names) -> str:
     """Structural validation before reporting an already-complete execution."""
+    expected_keys = {(b.row, b.column) for b in plan.selected_bins}
+    actual_keys = {(m["row"], m["column"]) for m in mappings}
+    if actual_keys != expected_keys:
+        raise PlanRejected(
+            "complete parent mapping set does not match the plan bins "
+            f"(missing {sorted(expected_keys - actual_keys)}, "
+            f"unexpected {sorted(actual_keys - expected_keys)})"
+        )
     incomplete = 0
     for mapping in mappings:
         child = _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names)
