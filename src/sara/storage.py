@@ -673,8 +673,9 @@ def verify_recovery_schema(conn: sqlite3.Connection) -> None:
     }
     if ("runs", "source_run_id", "id") not in source_fks:
         raise RecoverySchemaError("recovery_executions is missing the source-run foreign key")
-
-
+    # expected rows carry (name, declared type, pk ordinal, nullable);
+    # PRAGMA table_info.notnull is checked exactly for every column,
+    # including TEXT/composite primary-key columns.
 def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     rows = list(conn.execute(f"PRAGMA table_info({table})"))
     if not rows:
@@ -951,6 +952,10 @@ def register_recovery_execution(
             raise RecoverySchemaError(
                 f"existing recovery execution has invalid status {existing['status']!r}"
             )
+        # SR-A54-01: parent started_at must be a non-empty string.
+        if not isinstance(existing["started_at"], str) or not existing["started_at"]:
+            raise RecoverySchemaError("recovery execution has invalid started_at")
+
         # SR-F5-04: parent terminal lifecycle fields must be consistent.
         _ps = existing["status"]
         _pf = existing["finished_at"]

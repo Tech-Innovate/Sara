@@ -1038,8 +1038,15 @@ def _best_effort_stderr(message: str) -> None:
 
 
 def _best_effort_parent_failure(conn, plan_sha256, message):
-    """Best-effort transition of an active parent to failed (E4-F06)."""
+    """Best-effort transition of an active parent to failed; never downgrade complete."""
     try:
+        # SR-A54-03: check current status before repair.
+        row = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?",
+            (plan_sha256,),
+        ).fetchone()
+        if row is not None and row["status"] == "complete":
+            return  # never downgrade a committed complete parent
         conn.execute("BEGIN IMMEDIATE")
         try:
             set_recovery_parent_status(conn, plan_sha256, "failed", message)
@@ -1093,17 +1100,26 @@ def _validate_query_snapshot(bin_dir, plan, *, is_started):
 
 
 def _bounded_operational_failure(conn, plan_sha256, exc, context):
-    """F5-F01/F5-F04: one bounded handler for post-registration operational failures.
+    """A54-F01: one bounded handler for post-registration operational failures.
 
     Rolls back any active transaction, best-effort marks the parent failed
-    (unless already complete), and returns rc=1. Does NOT swallow
-    _ChildFailure, PlanRejected, KeyboardInterrupt, or AssertionError.
+    (unless already complete — SR-A54-03), and returns rc=1. Does NOT
+    swallow _ChildFailure, PlanRejected, KeyboardInterrupt, or AssertionError.
     """
     try:
         conn.rollback()
     except Exception:
         pass
-    _best_effort_parent_failure(conn, plan_sha256, f"{context}: {exc}")
+    # SR-A54-03: never downgrade a committed complete parent.
+    try:
+        row = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?",
+            (plan_sha256,),
+        ).fetchone()
+        if row is None or row["status"] != "complete":
+            _best_effort_parent_failure(conn, plan_sha256, f"{context}: {exc}")
+    except Exception:
+        pass
     print(f"recovery-run {context}: {exc}", file=sys.stderr)
     return 1
 
@@ -1323,11 +1339,14 @@ def cmd_recovery_run(args) -> int:
             print(f"recovery-run registration failed: {exc}", file=sys.stderr)
             return 1
 
-        mappings_list = list(conn.execute(
-            "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
-            "FROM recovery_execution_bins WHERE plan_sha256 = ? ORDER BY row, column",
-            (plan_sha256,),
-        ))
+        try:
+            mappings_list = list(conn.execute(
+                "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
+                "FROM recovery_execution_bins WHERE plan_sha256 = ? ORDER BY row, column",
+                (plan_sha256,),
+            ))
+        except (sqlite3.Error, OSError) as exc:
+            return _bounded_operational_failure(conn, plan_sha256, exc, "mapping list read")
         _MAPPING_ROOT_HOLDER["root"] = str(execution_root)
         if state == "complete":
             try:
@@ -1355,8 +1374,7 @@ def cmd_recovery_run(args) -> int:
         try:
             execution_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            print(f"recovery-run failed to create execution root: {exc}", file=sys.stderr)
-            return 1
+            return _bounded_operational_failure(conn, plan_sha256, exc, "execution root creation")
         snapshot_path = execution_root / "recovery-plan.json"
         try:
             snapshot_matches = (
@@ -1367,11 +1385,14 @@ def cmd_recovery_run(args) -> int:
             print(f"recovery-run failed reading plan snapshot: {exc}", file=sys.stderr)
             return 1
         if not snapshot_matches:
-            started = conn.execute(
-                "SELECT COUNT(*) AS n FROM recovery_execution_bins "
-                "WHERE plan_sha256 = ? AND run_id IS NOT NULL",
-                (plan_sha256,),
-            ).fetchone()["n"]
+            try:
+                started = conn.execute(
+                    "SELECT COUNT(*) AS n FROM recovery_execution_bins "
+                    "WHERE plan_sha256 = ? AND run_id IS NOT NULL",
+                    (plan_sha256,),
+                ).fetchone()["n"]
+            except sqlite3.Error as exc:
+                return _bounded_operational_failure(conn, plan_sha256, exc, "started-child count")
             if snapshot_path.exists() and started:
                 return reject(
                     "existing plan snapshot does not match the authorized plan bytes "
@@ -1449,9 +1470,12 @@ def cmd_recovery_run(args) -> int:
                 print(failure.error, file=sys.stderr)
                 return failure.process_exit
             except KeyboardInterrupt:
-                # F5-F02: if an active child row exists, mark it interrupted.
-                if mapping["run_id"] is not None:
-                    _child_ki_guard(conn, mapping["run_id"])
+                # A54-F02: use the deterministic run_id, not the stale
+                # mapping row; a freshly created child row must be tracked.
+                ki_run_id = mapping["run_id"] or _recovery_child_run_id(
+                    plan_sha256, bin_record.row, bin_record.column
+                )
+                _child_ki_guard(conn, ki_run_id)
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     set_recovery_parent_status(
@@ -1501,8 +1525,8 @@ def cmd_recovery_run(args) -> int:
                 (plan_sha256,),
             ).fetchone()["result_json"]
         except (sqlite3.Error, TypeError) as fetch_exc:
-            # Parent is already committed complete; never downgrade it.
-            print(f"recovery-run failed to fetch final result: {fetch_exc}", file=sys.stderr)
+            # A54-F01: parent is already committed complete; bounded failure.
+            _best_effort_stderr(f"recovery-run failed to fetch final result: {fetch_exc}")
             return 1
         return _guard_final_report(
             plan_sha256,
@@ -1587,6 +1611,10 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
         raise PlanRejected(
             f"child {expected_run_id} has invalid status {child['status']!r}"
         )
+    # SR-A54-01: started_at must be a non-empty string.
+    if not isinstance(child["started_at"], str) or not child["started_at"]:
+        raise PlanRejected(f"child {expected_run_id} has invalid started_at")
+
     # SR-F5-04: status-dependent terminal lifecycle fields must be consistent.
     status = child["status"]
     finished = child["finished_at"]
