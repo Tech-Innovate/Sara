@@ -1694,7 +1694,15 @@ def cmd_recovery_run(args) -> int:
             )
             conn.commit()
         except BaseException as finalize_exc:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception as rollback_exc:
+                # A failed rollback is itself an operational failure; the
+                # bounded handler retries it and repairs the parent rather
+                # than letting the storage error replace the original one.
+                return _bounded_operational_failure(
+                    conn, plan_sha256, rollback_exc, "finalization rollback"
+                )
             if isinstance(finalize_exc, KeyboardInterrupt):
                 # Bounded KI during finalization: children may be complete
                 # while the parent is still running. Repair the parent to

@@ -2300,3 +2300,88 @@ class TestPR4R3BoundedRepairs:
         ).fetchone()[0]
         assert unmapped == 0  # no child was created
         conn.close()
+
+    def test_finalization_ki_with_failed_rollback_is_bounded(self, tmp_path, monkeypatch):
+        """A one-shot rollback failure during the finalization KI handler is an
+        operational failure: rc 1, no escaping exception, parent failed."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        class RollbackCrashProxy:
+            """Transparent connection proxy whose first rollback fails once."""
+
+            def __init__(self, real):
+                self._real = real
+                self._crashed = False
+
+            def rollback(self):
+                if not self._crashed:
+                    self._crashed = True
+                    raise sqlite3.OperationalError("rollback crashed")
+                return self._real.rollback()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        real_connect = cli.connect_existing
+        monkeypatch.setattr(
+            cli, "connect_existing",
+            lambda path: RollbackCrashProxy(real_connect(path)),
+        )
+        set_recovery_fault_hook(
+            "after_result_store", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_result_store")
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        children = conn.execute(
+            "SELECT r.status FROM runs r JOIN recovery_execution_bins b "
+            "ON b.run_id = r.id WHERE b.plan_sha256 = ?", (sha,)
+        ).fetchall()
+        assert children and all(c[0] == "complete" for c in children)
+        conn.close()
+
+    def test_mapping_set_mismatch_after_registration_fails_parent(self, tmp_path, monkeypatch):
+        """Corruption between registration and the mapping read (pinned via a
+        wrapped registration) is caught by the post-read set validation:
+        parent failed, rc 2, no child mutation, no KeyError."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        second = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[1]
+        real_register = cli.register_recovery_execution
+
+        def register_and_delete_one(conn_, **kwargs):
+            state = real_register(conn_, **kwargs)
+            conn_.execute(
+                "DELETE FROM recovery_execution_bins WHERE plan_sha256 = ? "
+                "AND row = ? AND column = ?",
+                (sha, second.row, second.column),
+            )
+            return state
+
+        monkeypatch.setattr(cli, "register_recovery_execution", register_and_delete_one)
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        unmapped = conn.execute(
+            "SELECT COUNT(*) FROM recovery_execution_bins "
+            "WHERE plan_sha256 = ? AND run_id IS NOT NULL", (sha,)
+        ).fetchone()[0]
+        assert unmapped == 0
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM recovery_execution_bins WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()[0]
+        assert remaining == len(plan.selected_bins) - 1
+        conn.close()
