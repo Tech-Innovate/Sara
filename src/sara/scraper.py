@@ -55,6 +55,10 @@ class ScrapeOptions:
             raise FileNotFoundError(self.proxy_file)
 
 
+class _ScrapeCommandBuildError(ValueError, RuntimeError):
+    """Invalid scrape options discovered while constructing a command."""
+
+
 @dataclass(frozen=True)
 class CompletionComparison:
     matched: int
@@ -72,7 +76,14 @@ def build_docker_command(
     container_name: str | None = None,
     labels: dict[str, str] | None = None,
 ) -> list[str]:
-    options.validate()
+    try:
+        options.validate()
+    except ValueError as exc:
+        # Recovery performs an initial plan/config validation before effects,
+        # but resumable launch paths build the command again after durable
+        # lifecycle transitions. Keep a late validation failure compatible
+        # with both ValueError callers and RuntimeError operational handlers.
+        raise _ScrapeCommandBuildError(str(exc)) from exc
     queries_file = queries_file.resolve()
     output_file = output_file.resolve()
 
@@ -217,7 +228,7 @@ class ExpectedResumeInputs:
 
         The sidecar set is no longer needed after verification. Removing matches as
         expected IDs stream past keeps peak memory to one large ID set instead of
-        materializing a second expected set for broad runs.
+        materializing a second full expected set for broad runs.
         """
         matched = 0
         missing = 0
