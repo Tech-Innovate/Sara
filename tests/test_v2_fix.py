@@ -1752,13 +1752,15 @@ class TestPR4R3BoundedRepairs:
         monkeypatch.setattr(cli, "_docker_inspect_container", lambda name: None)
         return data, sha, db, plan, fake
 
-    def test_provenance_rejection_repairs_stranded_running_rows(self, tmp_path, monkeypatch):
-        """Pre-execution provenance rejection repairs crash-stranded running rows."""
+    def test_provenance_failure_leaves_mapped_row_untouched(self, tmp_path, monkeypatch):
+        """Pre-execution provenance failure fails only the parent; the mapped
+        row is left untouched even though its ID is the deterministic child."""
         data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
             monkeypatch, tmp_path
         )
         child_id = cli._recovery_child_run_id(sha, second.row, second.column)
         conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
         # Crash-strand the child and parent as running, then corrupt the
         # child's config so pre-execution provenance validation rejects it.
         conn.execute(
@@ -1772,6 +1774,9 @@ class TestPR4R3BoundedRepairs:
             (sha,),
         )
         conn.commit()
+        mapped_before = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (child_id,)).fetchone()
+        )
         conn.close()
         monkeypatch.setattr(
             cli, "run_scraper",
@@ -1780,16 +1785,17 @@ class TestPR4R3BoundedRepairs:
         rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
         assert rc == 2
         conn = sqlite3.connect(db)
-        child = conn.execute(
-            "SELECT status, finished_at, error FROM runs WHERE id = ?", (child_id,)
-        ).fetchone()
-        assert child[0] == "failed"
-        assert child[1] is not None
-        assert "config" in child[2]
+        conn.row_factory = sqlite3.Row
+        # Provenance never established ownership: the stranded row — corrupt
+        # config and all — survives byte-for-byte rather than being failed.
+        mapped_after = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (child_id,)).fetchone()
+        )
+        assert mapped_after == mapped_before
         parent = conn.execute(
             "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
         ).fetchone()
-        assert parent[0] == "failed"
+        assert parent["status"] == "failed"
         conn.close()
 
     def test_same_invocation_progress_then_no_effect_interrupted(self, tmp_path, monkeypatch):
@@ -1991,4 +1997,85 @@ class TestPR4R3BoundedRepairs:
             "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
         ).fetchone()
         assert parent["status"] == "interrupted"
+        conn.close()
+
+    def test_provenance_failure_matching_id_never_mutates_unrelated_row(self, tmp_path, monkeypatch):
+        """mapping.run_id equals the deterministic ID but the referenced row is
+        an unrelated provenance-invalid run: it is never mutated."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        colliding_id = cli._recovery_child_run_id(sha, first.row, first.column)
+        # Bootstrap the recovery tables with a no-effect rejection so the
+        # mappings exist and stay NULL (no child ever started).
+        bin_dir = tmp_path / "recovery" / sha / "bins" / f"r{first.row}-c{first.column}"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "results.jsonl").write_text("orphan", encoding="utf-8")
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("no docker")),
+        )
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 2
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO runs(id, area_name, bbox_json, cell_km, depth, queries_json, "
+            "scraper_image, config_json, raw_path, status, started_at) "
+            "VALUES (?, 'other', '{}', 1.0, 5, '[]', ?, 'unrelated-config', "
+            "'/tmp/other.jsonl', 'running', '2026-09-24T00:00:00+00:00')",
+            (colliding_id, DIGEST_IMAGE),
+        )
+        conn.execute(
+            "UPDATE recovery_execution_bins SET run_id = ? WHERE plan_sha256 = ? "
+            "AND row = ? AND column = ?",
+            (colliding_id, sha, first.row, first.column),
+        )
+        conn.commit()
+        unrelated_before = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (colliding_id,)).fetchone()
+        )
+        conn.close()
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        unrelated_after = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (colliding_id,)).fetchone()
+        )
+        assert unrelated_after == unrelated_before
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        conn.close()
+
+    def test_ki_after_child_commit_repairs_durable_child(self, tmp_path, monkeypatch):
+        """KI in the commit-to-holder window still repairs the durable child."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        child_id = cli._recovery_child_run_id(sha, first.row, first.column)
+        set_recovery_fault_hook(
+            "after_child_run_commit", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_child_run_commit")
+        assert rc == 130
+        conn = sqlite3.connect(db)
+        child = conn.execute(
+            "SELECT status, finished_at FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        # The volatile holder was never set, but durable state (committed
+        # mapping + full provenance) re-established ownership and the KI
+        # guard ran: the child is not stranded as running.
+        assert child[0] == "interrupted"
+        assert child[1] is not None
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "interrupted"
         conn.close()
