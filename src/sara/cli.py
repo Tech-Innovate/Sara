@@ -1491,31 +1491,77 @@ def cmd_recovery_run(args) -> int:
                             raise
                     except Exception:
                         return 1  # repair failed: rc 1, never silent rc 2
-                print(failure.error, file=sys.stderr)
+                _best_effort_stderr(failure.error)
                 return failure.process_exit
             except KeyboardInterrupt:
-                # A54-F02: use the deterministic run_id, not the stale
-                # mapping row; a freshly created child row must be tracked.
+                # Bounded KI repair: child and parent repair are both
+                # best-effort; a failed parent repair exits 1, not 130.
                 ki_run_id = mapping["run_id"] or _recovery_child_run_id(
                     plan_sha256, bin_record.row, bin_record.column
                 )
-                if not _child_ki_guard(conn, ki_run_id):
+                child_ok = _child_ki_guard(conn, ki_run_id)
+                if not child_ok:
                     _best_effort_stderr(
                         f"warning: child {ki_run_id} interrupt repair did not complete"
                     )
-                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    set_recovery_parent_status(
-                        conn, plan_sha256, "interrupted", "recovery-run interrupted"
-                    )
-                    conn.commit()
-                except BaseException:
-                    conn.rollback()
-                    raise
-                print("recovery-run interrupted", file=sys.stderr)
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        set_recovery_parent_status(
+                            conn, plan_sha256, "interrupted", "recovery-run interrupted"
+                        )
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                except Exception:
+                    return 1  # parent repair failed: bounded rc 1
+                _best_effort_stderr("recovery-run interrupted")
                 return 130
+            except PlanRejected as reject_exc:
+                # Snapshot/provenance rejection repairs child + parent.
+                child_run_id = mapping["run_id"] or _recovery_child_run_id(
+                    plan_sha256, bin_record.row, bin_record.column
+                )
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE runs SET status = 'failed', finished_at = ?, "
+                            "error = ? WHERE id = ? AND status != 'complete'",
+                            (utc_now(), str(reject_exc), child_run_id),
+                        )
+                        set_recovery_parent_status(
+                            conn, plan_sha256, "failed", str(reject_exc)
+                        )
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                except Exception:
+                    return 1
+                _best_effort_stderr(str(reject_exc))
+                return 2
             except (sqlite3.Error, OSError, RuntimeError, RecoverySchemaError) as op_exc:
-                # 429: centralized post-registration operational boundary.
+                # An operational error mid-child must not strand the active
+                # child as running; repair it before the parent.
+                child_run_id = mapping["run_id"] or _recovery_child_run_id(
+                    plan_sha256, bin_record.row, bin_record.column
+                )
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        conn.execute(
+                            "UPDATE runs SET status = 'failed', finished_at = ?, "
+                            "error = ? WHERE id = ? AND status != 'complete'",
+                            (utc_now(), f"operational failure: {op_exc}", child_run_id),
+                        )
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                except Exception:
+                    pass  # child repair best-effort; parent repair below
                 return _bounded_operational_failure(
                     conn, plan_sha256, op_exc, "child orchestration"
                 )

@@ -676,9 +676,6 @@ def verify_recovery_schema(conn: sqlite3.Connection) -> None:
             "recovery_executions is missing the source-run foreign key "
             "with ON DELETE NO ACTION"
         )
-    # expected rows carry (name, declared type, pk ordinal, nullable);
-    # PRAGMA table_info.notnull is checked exactly for every column,
-    # including TEXT/composite primary-key columns.
 def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     # expected rows carry (name, declared type, pk ordinal, nullable);
     # PRAGMA table_info.notnull is checked exactly for every column,
@@ -686,12 +683,6 @@ def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     rows = list(conn.execute(f"PRAGMA table_info({table})"))
     if not rows:
         raise RecoverySchemaError(f"table {table} does not exist")
-    # expected rows carry (name, type, pk_ordinal); nullability is required
-    # for every non-PK column (SQLite reports TEXT PRIMARY KEY columns as
-    # nullable in table_info unless NOT NULL is declared, which is accepted
-        # expected rows carry (name, type, pk_ordinal, nullable); notnull is
-    # verified for every column including PK columns (SQLite rowid tables
-    # permit NULL in TEXT PRIMARY KEY unless NOT NULL is explicitly declared)
     actual = [(row["name"], row["type"], row["pk"]) for row in rows]
     expected_layout = [(name, ctype, pk) for name, ctype, pk, _n in expected]
     if actual != expected_layout:

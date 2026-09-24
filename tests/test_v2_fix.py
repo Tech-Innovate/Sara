@@ -1517,11 +1517,187 @@ class TestPR4R2RepairFailure:
         assert rc == 1  # exactly 1, not a re-raised exception
 
 
-class TestPR4R2SnapshotFailure:
-    def test_snapshot_read_routes_through_bounded_handler(self, tmp_path, monkeypatch):
-        """The snapshot-read OSError path is routed through _bounded_operational_failure."""
-        import inspect
-        source = inspect.getsource(cli.cmd_recovery_run)
-        # The snapshot read failure path calls _bounded_operational_failure
-        assert "_bounded_operational_failure" in source
-        assert "plan snapshot read" in source
+class TestPR4R3BoundedRepairs:
+    """Command-level fault injection for the bounded child/parent repair paths."""
+
+    def _first_complete_second_interrupted(self, monkeypatch, tmp_path):
+        """First bin completes; the second launch is interrupted mid-run."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        state = {"n": 0}
+
+        def first_then_crash(command):
+            state["n"] += 1
+            if state["n"] == 1:
+                return fake(command)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cli, "run_scraper", first_then_crash)
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 130
+        second = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[1]
+        return data, sha, db, plan, fake, second
+
+    def test_operational_failure_repairs_stranded_running_child(self, tmp_path, monkeypatch):
+        """A raw operational error mid-resume repairs the stranded running child."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        child_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        # Simulate a hard process death: child 2 is stranded as running with
+        # no finished_at (its interrupt repair never ran).
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE runs SET status = 'running', finished_at = NULL, error = NULL "
+            "WHERE id = ?",
+            (child_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        def broken_resume(conn_, ps):
+            raise sqlite3.OperationalError("resume transition crashed")
+
+        monkeypatch.setattr(cli, "resume_recovery_parent", broken_resume)
+        monkeypatch.setattr(cli, "run_scraper", fake)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        child = conn.execute(
+            "SELECT status, finished_at, error FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        assert child[0] == "failed"
+        assert child[1] is not None
+        assert "operational failure" in child[2]
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        conn.close()
+
+    def test_ki_parent_repair_failure_returns_exactly_1(self, tmp_path, monkeypatch):
+        """KI whose parent repair fails exits exactly 1, never 130 nor a crash."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        child_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        real_set = cli.set_recovery_parent_status
+
+        def broken_on_interrupt(conn_, ps, status, error):
+            if status == "interrupted":
+                raise sqlite3.OperationalError("parent repair crashed")
+            return real_set(conn_, ps, status, error)
+
+        monkeypatch.setattr(cli, "set_recovery_parent_status", broken_on_interrupt)
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        child = conn.execute(
+            "SELECT status FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        assert child[0] == "interrupted"
+        conn.close()
+
+    def test_ki_child_guard_failure_still_bounded_130(self, tmp_path, monkeypatch):
+        """KI whose child guard fails warns and still exits bounded 130."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        child_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        monkeypatch.setattr(cli, "_child_ki_guard", lambda conn_, run_id: False)
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 130
+        conn = sqlite3.connect(db)
+        child = conn.execute(
+            "SELECT status FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        assert child[0] == "interrupted"
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "interrupted"
+        conn.close()
+
+    def test_started_snapshot_mismatch_fails_child_and_parent(self, tmp_path, monkeypatch):
+        """Started-child snapshot rejection lands as child+parent failed, rc 2."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        child_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        snapshot = (
+            tmp_path / "recovery" / sha / "bins"
+            / f"r{second.row}-c{second.column}" / "queries.txt"
+        )
+        snapshot.write_bytes(snapshot.read_bytes() + b"corrupted\n")
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        child = conn.execute(
+            "SELECT status, finished_at, error FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        assert child[0] == "failed"
+        assert child[1] is not None
+        assert "snapshot" in child[2]
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        conn.close()
+
+    def test_plan_snapshot_read_failure_bounded(self, tmp_path, monkeypatch):
+        """An OSError reading the stored plan snapshot is bounded: rc 1, parent failed."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        execution_root = tmp_path / "recovery" / sha
+        execution_root.mkdir(parents=True, exist_ok=True)
+        (execution_root / "recovery-plan.json").mkdir()
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        conn.close()
+
+    def test_resumed_progress_transitions_parent_running_once(self, tmp_path, monkeypatch):
+        """A resumed invocation marks the parent running exactly when progress begins."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        calls = []
+        real_resume = cli.resume_recovery_parent
+
+        def spy_resume(conn_, ps):
+            status = conn_.execute(
+                "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (ps,)
+            ).fetchone()[0]
+            calls.append(status)
+            return real_resume(conn_, ps)
+
+        monkeypatch.setattr(cli, "resume_recovery_parent", spy_resume)
+        monkeypatch.setattr(cli, "run_scraper", fake)
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 0
+        # fired exactly once (skipped complete bin did not fire it), from
+        # the interrupted state, at the moment this invocation began progress
+        assert calls == ["interrupted"]
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "complete"
+        conn.close()
