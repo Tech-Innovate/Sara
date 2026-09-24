@@ -1895,3 +1895,100 @@ class TestPR4R3BoundedRepairs:
         )
         assert real_child_after == real_child_before
         conn.close()
+
+    def test_unstarted_collision_preflight_failure_never_mutates_unrelated_run(self, tmp_path, monkeypatch):
+        """A pre-creation child failure with a deterministic-ID collision never
+        touches the unrelated run."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        colliding_id = cli._recovery_child_run_id(sha, first.row, first.column)
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO runs(id, area_name, bbox_json, cell_km, depth, queries_json, "
+            "scraper_image, config_json, raw_path, status, started_at) "
+            "VALUES (?, 'other', '{}', 1.0, 5, '[]', ?, '{}', '/tmp/other.jsonl', "
+            "'running', '2026-09-24T00:00:00+00:00')",
+            (colliding_id, DIGEST_IMAGE),
+        )
+        conn.commit()
+        unrelated_before = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (colliding_id,)).fetchone()
+        )
+        conn.close()
+        # Make child bin-directory acquisition fail before the deterministic
+        # ID collision check can run: the ID is not owned by this execution.
+        bins_root = tmp_path / "recovery" / sha / "bins"
+        bins_root.parent.mkdir(parents=True, exist_ok=True)
+        bins_root.write_text("not a directory", encoding="utf-8")
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        unrelated_after = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (colliding_id,)).fetchone()
+        )
+        assert unrelated_after == unrelated_before
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        conn.close()
+
+    def test_ki_before_child_creation_never_mutates_unrelated_run(self, tmp_path, monkeypatch):
+        """KI during pre-creation work with a deterministic-ID collision never
+        touches the unrelated run."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        colliding_id = cli._recovery_child_run_id(sha, first.row, first.column)
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO runs(id, area_name, bbox_json, cell_km, depth, queries_json, "
+            "scraper_image, config_json, raw_path, status, started_at) "
+            "VALUES (?, 'other', '{}', 1.0, 5, '[]', ?, '{}', '/tmp/other.jsonl', "
+            "'running', '2026-09-24T00:00:00+00:00')",
+            (colliding_id, DIGEST_IMAGE),
+        )
+        conn.commit()
+        unrelated_before = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (colliding_id,)).fetchone()
+        )
+        conn.close()
+        real_lock = cli.RunLock
+
+        class LockKI:
+            def __init__(self, path):
+                self.path = str(path).replace("\\", "/")
+                self._real = real_lock(path)
+
+            def acquire(self):
+                if "/bins/" in self.path:
+                    raise KeyboardInterrupt()
+                self._real.acquire()
+
+            def release(self):
+                self._real.release()
+
+        monkeypatch.setattr(cli, "RunLock", LockKI)
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 130
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        unrelated_after = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (colliding_id,)).fetchone()
+        )
+        assert unrelated_after == unrelated_before
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "interrupted"
+        conn.close()

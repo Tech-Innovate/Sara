@@ -1416,6 +1416,11 @@ def cmd_recovery_run(args) -> int:
         progress_started = False
         for bin_record in ordered_bins:
             mapping = mappings[(bin_record.row, bin_record.column)]
+            # Ownership of a child row is established only by provenance
+            # (mapped children) or by the executor committing the created
+            # deterministic child; failure handlers must never mutate a
+            # merely derivable ID.
+            owned_child = {"run_id": None}
             if mapping["run_id"] is not None:
                 # RRI-F03/SR-I04: full provenance before trusting status.
                 try:
@@ -1453,6 +1458,8 @@ def cmd_recovery_run(args) -> int:
                         return 1
                     _best_effort_stderr(f"recovery execution state is inconsistent: {exc}")
                     return 2
+                # Provenance passed: the mapped child is owned.
+                owned_child["run_id"] = mapping["run_id"]
                 if child_row["status"] == "complete":
                     completed_count += 1
                     continue
@@ -1473,22 +1480,24 @@ def cmd_recovery_run(args) -> int:
                     conn, plan, plan_sha256, execution_root, bin_record,
                     mapping, proxy_path, container_names[(bin_record.row, bin_record.column)],
                     mark_parent_running=mark_parent_running,
+                    owned_child=owned_child,
                 )
             except _ChildFailure as failure:
                 if failure.status != "none":
-                    # Fix3: repair the mapped child too, not just the parent
-                    child_run_id = mapping["run_id"] or _recovery_child_run_id(
-                        plan_sha256, bin_record.row, bin_record.column
-                    )
+                    # Repair the owned child, not just the parent. An
+                    # unstarted bin whose child row was never created owns
+                    # nothing: the derivable ID may name an unrelated run
+                    # and must not be mutated.
+                    child_run_id = owned_child["run_id"]
                     try:
                         conn.execute("BEGIN IMMEDIATE")
                         try:
-                            # Child repair: mark failed if not already complete
-                            conn.execute(
-                                "UPDATE runs SET status = ?, finished_at = ?, error = ? "
-                                "WHERE id = ? AND status != 'complete'",
-                                (failure.status, utc_now(), failure.error, child_run_id),
-                            )
+                            if child_run_id is not None:
+                                conn.execute(
+                                    "UPDATE runs SET status = ?, finished_at = ?, error = ? "
+                                    "WHERE id = ? AND status != 'complete'",
+                                    (failure.status, utc_now(), failure.error, child_run_id),
+                                )
                             set_recovery_parent_status(conn, plan_sha256, failure.status, failure.error)
                             conn.commit()
                         except BaseException:
@@ -1529,15 +1538,14 @@ def cmd_recovery_run(args) -> int:
                 # failure so a resumed running parent never survives the
                 # interrupt as falsely running, then exits 1. Only a fully
                 # repaired interrupt exits 130.
-                ki_run_id = mapping["run_id"] or _recovery_child_run_id(
-                    plan_sha256, bin_record.row, bin_record.column
-                )
-                try:
-                    _child_ki_guard(conn, ki_run_id)
-                except Exception as child_repair_exc:
-                    return _bounded_operational_failure(
-                        conn, plan_sha256, child_repair_exc, "child interrupt repair"
-                    )
+                ki_run_id = owned_child["run_id"]
+                if ki_run_id is not None:
+                    try:
+                        _child_ki_guard(conn, ki_run_id)
+                    except Exception as child_repair_exc:
+                        return _bounded_operational_failure(
+                            conn, plan_sha256, child_repair_exc, "child interrupt repair"
+                        )
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
@@ -1557,18 +1565,17 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr("recovery-run interrupted")
                 return 130
             except PlanRejected as reject_exc:
-                # Snapshot/provenance rejection repairs child + parent.
-                child_run_id = mapping["run_id"] or _recovery_child_run_id(
-                    plan_sha256, bin_record.row, bin_record.column
-                )
+                # Snapshot rejection repairs the owned child and the parent.
+                child_run_id = owned_child["run_id"]
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
-                        conn.execute(
-                            "UPDATE runs SET status = 'failed', finished_at = ?, "
-                            "error = ? WHERE id = ? AND status != 'complete'",
-                            (utc_now(), str(reject_exc), child_run_id),
-                        )
+                        if child_run_id is not None:
+                            conn.execute(
+                                "UPDATE runs SET status = 'failed', finished_at = ?, "
+                                "error = ? WHERE id = ? AND status != 'complete'",
+                                (utc_now(), str(reject_exc), child_run_id),
+                            )
                         set_recovery_parent_status(
                             conn, plan_sha256, "failed", str(reject_exc)
                         )
@@ -1581,19 +1588,20 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr(str(reject_exc))
                 return 2
             except (sqlite3.Error, OSError, RuntimeError, RecoverySchemaError) as op_exc:
-                # An operational error mid-child must not strand the active
-                # child as running; repair it before the parent.
-                child_run_id = mapping["run_id"] or _recovery_child_run_id(
-                    plan_sha256, bin_record.row, bin_record.column
-                )
+                # An operational error mid-child must not strand an owned
+                # active child as running; repair it before the parent. An
+                # unstarted bin owns nothing until its child row commits,
+                # so a merely derivable ID is never mutated.
+                child_run_id = owned_child["run_id"]
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
-                        conn.execute(
-                            "UPDATE runs SET status = 'failed', finished_at = ?, "
-                            "error = ? WHERE id = ? AND status != 'complete'",
-                            (utc_now(), f"operational failure: {op_exc}", child_run_id),
-                        )
+                        if child_run_id is not None:
+                            conn.execute(
+                                "UPDATE runs SET status = 'failed', finished_at = ?, "
+                                "error = ? WHERE id = ? AND status != 'complete'",
+                                (utc_now(), f"operational failure: {op_exc}", child_run_id),
+                            )
                         conn.commit()
                     except BaseException:
                         conn.rollback()
@@ -1876,7 +1884,7 @@ def _remove_stopped_container(container_id, container_name):
 
 def _execute_recovery_child(
     conn, plan, plan_sha256, execution_root, bin_record, mapping, proxy_path, container_name,
-    *, mark_parent_running=None,
+    *, mark_parent_running=None, owned_child=None,
 ) -> str:
     row, column = bin_record.row, bin_record.column
     run_id = _recovery_child_run_id(plan_sha256, row, column)
@@ -2192,6 +2200,10 @@ def _execute_recovery_child(
             except BaseException:
                 conn.rollback()
                 raise
+            # The deterministic child row is durable: from here on this
+            # invocation owns it and outer failure handlers may repair it.
+            if owned_child is not None:
+                owned_child["run_id"] = run_id
 
             # V2-F01: the child row is durable; exclusively create the
             # host-owned results file. Failure leaves the row in place and
