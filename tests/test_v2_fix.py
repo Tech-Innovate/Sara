@@ -2161,3 +2161,142 @@ class TestPR4R3BoundedRepairs:
                 cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
         finally:
             clear_recovery_fault_hook("after_child_run_commit")
+
+    def test_ki_during_finalization_marks_parent_interrupted(self, tmp_path, monkeypatch):
+        """KI inside finalization (children complete, parent running) ends with
+        the parent interrupted and exactly rc 130."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        set_recovery_fault_hook(
+            "after_result_store", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_result_store")
+        assert rc == 130
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "interrupted"
+        children = conn.execute(
+            "SELECT r.status FROM runs r JOIN recovery_execution_bins b "
+            "ON b.run_id = r.id WHERE b.plan_sha256 = ?", (sha,)
+        ).fetchall()
+        assert children and all(c[0] == "complete" for c in children)
+        conn.close()
+
+    def test_ki_during_finalization_repair_failure_bounded(self, tmp_path, monkeypatch):
+        """KI inside finalization whose interrupt repair fails falls back to
+        parent failure and exits 1."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        real_set = cli.set_recovery_parent_status
+
+        def broken_on_interrupt(conn_, ps, status, error):
+            if status == "interrupted":
+                raise sqlite3.OperationalError("interrupt repair crashed")
+            return real_set(conn_, ps, status, error)
+
+        monkeypatch.setattr(cli, "set_recovery_parent_status", broken_on_interrupt)
+        set_recovery_fault_hook(
+            "after_result_store", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_result_store")
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        conn.close()
+
+    def test_mapping_set_mismatch_rejects_without_keyerror(self, tmp_path, monkeypatch):
+        """A persisted mapping row missing for a plan bin is rejected as
+        inconsistent durable state (rc 2) — never a raw KeyError, with no
+        child mutation and the prior parent state preserved (registration
+        fails closed before the executor accepts it)."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first, second = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[:2]
+        # Bootstrap the recovery tables; an orphan file in the FIRST bin
+        # forces a no-effect rejection before any launch, so no child ever
+        # starts and both mappings stay NULL.
+        bin_dir = tmp_path / "recovery" / sha / "bins" / f"r{first.row}-c{first.column}"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        (bin_dir / "results.jsonl").write_text("orphan", encoding="utf-8")
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("no docker")),
+        )
+        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 2
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "DELETE FROM recovery_execution_bins WHERE plan_sha256 = ? "
+            "AND row = ? AND column = ?",
+            (sha, second.row, second.column),
+        )
+        conn.commit()
+        conn.close()
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        # Registration fails closed on the inconsistent durable state: the
+        # prior interrupted parent is preserved, never mutated, and no
+        # child is created.
+        assert parent[0] == "interrupted"
+        unmapped = conn.execute(
+            "SELECT COUNT(*) FROM recovery_execution_bins "
+            "WHERE plan_sha256 = ? AND run_id IS NOT NULL", (sha,)
+        ).fetchone()[0]
+        assert unmapped == 0
+        conn.close()
+
+    def test_unstarted_stopped_container_fails_closed(self, tmp_path, monkeypatch):
+        """A labeled stopped container with no mapped child is refused with no
+        effect: no removal, no child creation, rc 2."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        first_run = cli._recovery_child_run_id(sha, first.row, first.column)
+        first_container = cli._recovery_container_name(first_run)
+        removed = []
+        monkeypatch.setattr(
+            cli, "_remove_stopped_container",
+            lambda cid, cname: removed.append(cid),
+        )
+
+        def inspect(name):
+            if name == first_container:
+                return {
+                    "running": False,
+                    "labels": {
+                        "sara.recovery.plan_sha256": sha,
+                        "sara.recovery.run_id": first_run,
+                    },
+                    "container_id": "stopped-first",
+                }
+            return None
+
+        monkeypatch.setattr(cli, "_docker_inspect_container", inspect)
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        assert removed == []  # the external container was never removed
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "interrupted"
+        unmapped = conn.execute(
+            "SELECT COUNT(*) FROM recovery_execution_bins "
+            "WHERE plan_sha256 = ? AND run_id IS NOT NULL", (sha,)
+        ).fetchone()[0]
+        assert unmapped == 0  # no child was created
+        conn.close()

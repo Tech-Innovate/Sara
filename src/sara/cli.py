@@ -1412,6 +1412,32 @@ def cmd_recovery_run(args) -> int:
             for m in mappings_list
         }
         ordered_bins = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))
+        # The persisted mapping set must cover exactly the plan's bins; a
+        # missing or unexpected coordinate is inconsistent durable
+        # execution state. Fail the parent; mutate no child.
+        expected_keys = {(b.row, b.column) for b in ordered_bins}
+        if set(mappings) != expected_keys:
+            mismatch = (
+                f"missing {sorted(expected_keys - set(mappings))}, "
+                f"unexpected {sorted(set(mappings) - expected_keys)}"
+            )
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    set_recovery_parent_status(
+                        conn, plan_sha256, "failed",
+                        f"persisted mapping set does not match the plan bins ({mismatch})",
+                    )
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
+            except Exception:
+                return 1
+            _best_effort_stderr(
+                "recovery execution state is inconsistent: mapping set mismatch"
+            )
+            return 2
         total = len(ordered_bins)
         completed_count = 0
         progress_started = False
@@ -1670,7 +1696,39 @@ def cmd_recovery_run(args) -> int:
         except BaseException as finalize_exc:
             conn.rollback()
             if isinstance(finalize_exc, KeyboardInterrupt):
-                raise
+                # Bounded KI during finalization: children may be complete
+                # while the parent is still running. Repair the parent to
+                # interrupted transactionally; if that repair cannot
+                # commit, fall back to parent-failure semantics.
+                try:
+                    status_row = conn.execute(
+                        "SELECT status FROM recovery_executions WHERE plan_sha256 = ?",
+                        (plan_sha256,),
+                    ).fetchone()
+                    if status_row is not None and status_row["status"] == "complete":
+                        _best_effort_stderr(
+                            "recovery-run complete; finalization interrupted"
+                        )
+                        return 130
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        set_recovery_parent_status(
+                            conn, plan_sha256, "interrupted",
+                            "recovery-run interrupted during finalization",
+                        )
+                        conn.commit()
+                    except BaseException:
+                        conn.rollback()
+                        raise
+                except Exception as interrupt_repair_exc:
+                    _best_effort_parent_failure(
+                        conn, plan_sha256,
+                        f"recovery-run interrupt repair failed during finalization: "
+                        f"{interrupt_repair_exc}",
+                    )
+                    return 1
+                _best_effort_stderr("recovery-run interrupted during finalization")
+                return 130
 
             _best_effort_parent_failure(
                 conn, plan_sha256, f"finalization failed: {finalize_exc}"
@@ -2191,6 +2249,19 @@ def _execute_recovery_child(
                 conn.rollback()
                 raise
         else:
+            if _deferred_rm is not None:
+                # A stopped container carrying this execution's labels with
+                # no mapped child is anomalous durable state: labels alone
+                # are not an ownership certificate for mutation. Fail
+                # closed with no effect before any child creation.
+                raise _ChildFailure(
+                    status="none", process_exit=2,
+                    error=(
+                        f"stopped container {container_name} carries this execution's "
+                        "labels but no child is mapped for this bin; refusing to "
+                        "remove it or create a child"
+                    ),
+                )
             # SR-F5-02: validate/repair unstarted snapshot (no child started yet)
             try:
                 bin_dir.mkdir(parents=True, exist_ok=True)
