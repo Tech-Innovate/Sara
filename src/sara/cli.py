@@ -1478,10 +1478,19 @@ def cmd_recovery_run(args) -> int:
                     # unstarted bin whose child row was never created owns
                     # nothing: the derivable ID may name an unrelated run
                     # and must not be mutated. A committed creation still
-                    # counts: durable state re-establishes ownership.
-                    child_run_id = owned_child["run_id"] or _durable_owned_child(
-                        conn, plan, plan_sha256, bin_record, container_names
-                    )
+                    # counts: durable state re-establishes ownership — and
+                    # a failure to determine ownership is itself bounded
+                    # (no child mutation, best-effort parent failure).
+                    try:
+                        child_run_id = owned_child["run_id"] or _durable_owned_child(
+                            conn, plan, plan_sha256, bin_record, container_names
+                        )
+                    except _OwnershipReadError as own_exc:
+                        _best_effort_parent_failure(
+                            conn, plan_sha256,
+                            f"recovery-run child repair could not verify ownership: {own_exc}",
+                        )
+                        return 1
                     try:
                         conn.execute("BEGIN IMMEDIATE")
                         try:
@@ -1531,9 +1540,18 @@ def cmd_recovery_run(args) -> int:
                 # failure so a resumed running parent never survives the
                 # interrupt as falsely running, then exits 1. Only a fully
                 # repaired interrupt exits 130.
-                ki_run_id = owned_child["run_id"] or _durable_owned_child(
-                    conn, plan, plan_sha256, bin_record, container_names
-                )
+                try:
+                    ki_run_id = owned_child["run_id"] or _durable_owned_child(
+                        conn, plan, plan_sha256, bin_record, container_names
+                    )
+                except _OwnershipReadError as own_exc:
+                    # Ownership could not be verified: the interrupt is an
+                    # operational repair failure (bounded parent repair,
+                    # exit 1) — never rc 130 and never an escaping error.
+                    return _bounded_operational_failure(
+                        conn, plan_sha256, own_exc,
+                        "child interrupt ownership verification",
+                    )
                 if ki_run_id is not None:
                     try:
                         _child_ki_guard(conn, ki_run_id)
@@ -1560,10 +1578,19 @@ def cmd_recovery_run(args) -> int:
                 _best_effort_stderr("recovery-run interrupted")
                 return 130
             except PlanRejected as reject_exc:
-                # Snapshot rejection repairs the owned child and the parent.
-                child_run_id = owned_child["run_id"] or _durable_owned_child(
-                    conn, plan, plan_sha256, bin_record, container_names
-                )
+                # Snapshot rejection repairs the owned child and the parent;
+                # if ownership cannot be determined, no child is mutated and
+                # the parent fails bounded (exit 1).
+                try:
+                    child_run_id = owned_child["run_id"] or _durable_owned_child(
+                        conn, plan, plan_sha256, bin_record, container_names
+                    )
+                except _OwnershipReadError as own_exc:
+                    _best_effort_parent_failure(
+                        conn, plan_sha256,
+                        f"recovery-run rejection repair could not verify ownership: {own_exc}",
+                    )
+                    return 1
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
@@ -1589,10 +1616,15 @@ def cmd_recovery_run(args) -> int:
                 # active child as running; repair it before the parent. An
                 # unstarted bin owns nothing until its child row commits,
                 # so a merely derivable ID is never mutated; a committed
-                # creation re-establishes ownership from durable state.
-                child_run_id = owned_child["run_id"] or _durable_owned_child(
-                    conn, plan, plan_sha256, bin_record, container_names
-                )
+                # creation re-establishes ownership from durable state. A
+                # failure to determine ownership stays inside this
+                # operational path (no child mutation; parent repair below).
+                try:
+                    child_run_id = owned_child["run_id"] or _durable_owned_child(
+                        conn, plan, plan_sha256, bin_record, container_names
+                    )
+                except _OwnershipReadError:
+                    child_run_id = None
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
@@ -1846,6 +1878,10 @@ def _child_ki_guard(conn, run_id):
 
 
 
+class _OwnershipReadError(Exception):
+    """Durable child ownership could not be determined (storage read failure)."""
+
+
 def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
     """Re-establish child ownership from durable state after a failure.
 
@@ -1855,25 +1891,33 @@ def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
     mapping carries the plan-derived child ID and that row passes full
     provenance; anything else — including an unrelated row occupying the
     deterministic ID — is not owned and is never mutated.
+
+    Returns the owned child run id, or None when the bin definitively
+    owns no child row. Raises _OwnershipReadError when the durable state
+    itself cannot be read; callers must treat that as a bounded failure
+    and never mutate a child.
     """
-    conn.rollback()  # discard any transaction left open by the failure
-    fresh = conn.execute(
-        "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
-        "FROM recovery_execution_bins "
-        "WHERE plan_sha256 = ? AND row = ? AND column = ?",
-        (plan_sha256, bin_record.row, bin_record.column),
-    ).fetchone()
-    if fresh is None or fresh["run_id"] is None:
-        return None
-    if fresh["run_id"] != _recovery_child_run_id(
-        plan_sha256, bin_record.row, bin_record.column
-    ):
-        return None
     try:
-        _validate_child_provenance(conn, plan, plan_sha256, fresh, container_names)
-    except PlanRejected:
-        return None
-    return fresh["run_id"]
+        conn.rollback()  # discard any transaction left open by the failure
+        fresh = conn.execute(
+            "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
+            "FROM recovery_execution_bins "
+            "WHERE plan_sha256 = ? AND row = ? AND column = ?",
+            (plan_sha256, bin_record.row, bin_record.column),
+        ).fetchone()
+        if fresh is None or fresh["run_id"] is None:
+            return None
+        if fresh["run_id"] != _recovery_child_run_id(
+            plan_sha256, bin_record.row, bin_record.column
+        ):
+            return None
+        try:
+            _validate_child_provenance(conn, plan, plan_sha256, fresh, container_names)
+        except PlanRejected:
+            return None
+        return fresh["run_id"]
+    except Exception as exc:
+        raise _OwnershipReadError(str(exc)) from exc
 
 
 def _remove_stopped_container(container_id, container_name):

@@ -2079,3 +2079,66 @@ class TestPR4R3BoundedRepairs:
         ).fetchone()
         assert parent[0] == "interrupted"
         conn.close()
+
+    def test_ki_ownership_read_failure_is_bounded(self, tmp_path, monkeypatch):
+        """KI whose durable-ownership re-read fails is operational: rc 1, parent
+        failed — not rc 130 and not an escaping exception."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        child_id = cli._recovery_child_run_id(sha, first.row, first.column)
+
+        def provenance_crash(conn_, plan_, ps, mapping_, containers_):
+            raise sqlite3.OperationalError("ownership read crashed")
+
+        monkeypatch.setattr(cli, "_validate_child_provenance", provenance_crash)
+        set_recovery_fault_hook(
+            "after_child_run_commit", lambda: (_ for _ in ()).throw(KeyboardInterrupt())
+        )
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_child_run_commit")
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent[0] == "failed"
+        conn.close()
+
+    def test_child_failure_ownership_read_failure_is_bounded(self, tmp_path, monkeypatch):
+        """A child failure whose ownership re-read fails mutates no child and
+        fails the parent bounded: rc 1."""
+        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
+        first = sorted(plan.selected_bins, key=lambda b: (b.row, b.column))[0]
+        child_id = cli._recovery_child_run_id(sha, first.row, first.column)
+
+        def provenance_crash(conn_, plan_, ps, mapping_, containers_):
+            raise sqlite3.OperationalError("ownership read crashed")
+
+        monkeypatch.setattr(cli, "_validate_child_provenance", provenance_crash)
+        set_recovery_fault_hook(
+            "after_child_run_commit",
+            lambda: (_ for _ in ()).throw(cli._ChildFailure(
+                status="failed", process_exit=1, error="child crashed in the window",
+            )),
+        )
+        try:
+            rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        finally:
+            clear_recovery_fault_hook("after_child_run_commit")
+        assert rc == 1
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        child = conn.execute(
+            "SELECT status, finished_at FROM runs WHERE id = ?", (child_id,)
+        ).fetchone()
+        # Ownership could not be verified: the committed child is left as
+        # durable state recorded it, never mutated by the repair.
+        assert child["status"] == "running"
+        assert child["finished_at"] is None
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        conn.close()
