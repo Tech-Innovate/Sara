@@ -1197,7 +1197,6 @@ def cmd_recovery_run(args) -> int:
     except (PlanRejected, ValueError) as exc:
         return reject(f"plan rejected: {exc}")
 
-
     proxy_path: Path | None = None
     plan_proxy_sha = plan.config.get("proxy_sha256")
     if plan_proxy_sha is None:
@@ -1341,13 +1340,15 @@ def cmd_recovery_run(args) -> int:
 
         try:
             mappings_list = list(conn.execute(
-                "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
-                "FROM recovery_execution_bins WHERE plan_sha256 = ? ORDER BY row, column",
+                "SELECT b.row, b.column, b.tier, b.bbox_json, b.planned_searches, "
+                "b.run_id, b.container_name, e.output_root "
+                "FROM recovery_execution_bins AS b "
+                "JOIN recovery_executions AS e ON e.plan_sha256 = b.plan_sha256 "
+                "WHERE b.plan_sha256 = ? ORDER BY b.row, b.column",
                 (plan_sha256,),
             ))
         except (sqlite3.Error, OSError) as exc:
             return _bounded_operational_failure(conn, plan_sha256, exc, "mapping list read")
-        _MAPPING_ROOT_HOLDER["root"] = str(execution_root)
         if state == "complete":
             try:
                 stored_result = _validate_complete_parent(
@@ -1789,7 +1790,10 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
     bin_record = next(
         b for b in plan.selected_bins if (b.row, b.column) == (row_value, column_value)
     )
-    bin_dir = Path(mapping_root(plan_sha256)) / "bins" / f"r{row_value}-c{column_value}"
+    persisted_root = mapping["output_root"]
+    if not isinstance(persisted_root, str) or not persisted_root:
+        raise PlanRejected("recovery execution has invalid persisted output_root")
+    bin_dir = Path(persisted_root) / "bins" / f"r{row_value}-c{column_value}"
     expected_raw = str(bin_dir / "results.jsonl")
     proxy_sha = plan.config.get("proxy_sha256")
     expected_config = _recovery_child_config_json(plan, bin_record, proxy_sha, plan_sha256)
@@ -1857,14 +1861,6 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
                 f"child {expected_run_id} is {status} but has no finished_at"
             )
     return child
-
-
-_MAPPING_ROOT_HOLDER: dict[str, str] = {}
-
-
-def mapping_root(plan_sha256: str) -> Path:
-    """Current execution root for provenance path checks (set per invocation)."""
-    return Path(_MAPPING_ROOT_HOLDER["root"])
 
 
 def _validate_complete_parent(conn, plan, plan_sha256, mappings, container_names) -> str:
@@ -1979,9 +1975,11 @@ def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
     try:
         conn.rollback()  # discard any transaction left open by the failure
         fresh = conn.execute(
-            "SELECT row, column, tier, bbox_json, planned_searches, run_id, container_name "
-            "FROM recovery_execution_bins "
-            "WHERE plan_sha256 = ? AND row = ? AND column = ?",
+            "SELECT b.row, b.column, b.tier, b.bbox_json, b.planned_searches, "
+            "b.run_id, b.container_name, e.output_root "
+            "FROM recovery_execution_bins AS b "
+            "JOIN recovery_executions AS e ON e.plan_sha256 = b.plan_sha256 "
+            "WHERE b.plan_sha256 = ? AND b.row = ? AND b.column = ?",
             (plan_sha256, bin_record.row, bin_record.column),
         ).fetchone()
         if fresh is None or fresh["run_id"] is None:
