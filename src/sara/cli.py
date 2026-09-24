@@ -1332,6 +1332,9 @@ def cmd_recovery_run(args) -> int:
             except BaseException:
                 conn.rollback()
                 raise
+        except KeyboardInterrupt:
+            _best_effort_stderr("recovery-run interrupted during registration")
+            return 130
         except (SourceRunRejected, RecoverySchemaError, PlanRejected) as exc:
             return reject(str(exc))
         except Exception as exc:  # registration must fail closed, never escape
@@ -1807,9 +1810,7 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
         raise PlanRejected(f"mapping r{row_value}-c{column_value} planned_searches disagrees with the plan")
     if mapping["container_name"] != container_names[(row_value, column_value)]:
         raise PlanRejected(f"mapping r{row_value}-c{column_value} container_name disagrees with the plan")
-    mapping_bbox = json.loads(mapping["bbox_json"])
-    plan_bbox = json.loads(expected_bbox_json)
-    if mapping_bbox != plan_bbox:
+    if mapping["bbox_json"] != expected_bbox_json:
         raise PlanRejected(f"mapping r{row_value}-c{column_value} bbox disagrees with the plan")
 
     child = conn.execute(
@@ -1821,7 +1822,14 @@ def _validate_child_provenance(conn, plan, plan_sha256, mapping, container_names
         raise PlanRejected(f"child {expected_run_id} area_name disagrees with the plan")
     if child["bbox_json"] != expected_bbox_json:
         raise PlanRejected(f"child {expected_run_id} bbox_json disagrees with the plan")
-    if float(child["cell_km"]) != plan.recovery_cell_km:
+    child_cell_km = child["cell_km"]
+    if (
+        isinstance(child_cell_km, bool)
+        or not isinstance(child_cell_km, (int, float))
+        or not math.isfinite(child_cell_km)
+    ):
+        raise PlanRejected(f"child {expected_run_id} has invalid cell_km")
+    if float(child_cell_km) != plan.recovery_cell_km:
         raise PlanRejected(f"child {expected_run_id} cell_km disagrees with the plan")
     if child["depth"] != plan.depth:
         raise PlanRejected(f"child {expected_run_id} depth disagrees with the plan")
@@ -1995,8 +2003,7 @@ def _durable_owned_child(conn, plan, plan_sha256, bin_record, container_names):
         return fresh["run_id"]
     except (sqlite3.Error, OSError) as exc:
         # Only expected read failures are bounded; programmer errors such
-        # as AssertionError (and data-corruption ValueError, which the
-        # loop-level provenance call likewise does not swallow) propagate.
+        # as AssertionError propagate.
         raise _OwnershipReadError(str(exc)) from exc
 
 
