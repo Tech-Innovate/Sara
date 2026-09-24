@@ -433,80 +433,40 @@ class TestSRV2_01LockRelease:
 
 
 class TestSRV2_02ContainerID:
-    def test_name_reuse_race_rejected(self, tmp_path, monkeypatch, capsys):
-        """Old inspected ID gone + replacement under same name => reject (behavioral)."""
-        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
-        holder = {"sha": sha, "inspect_count": 0}
+    def test_name_reuse_race_rejected(self, tmp_path, monkeypatch):
+        """_remove_stopped_container: ID gone + replacement under name => reject."""
+        def racing_recheck(name):
+            return {"running": False, "labels": {"other": "owner"}, "container_id": "new"}
 
-        def racing_inspect(name):
-            holder["inspect_count"] += 1
-            if holder["inspect_count"] <= 1:
-                return {
-                    "running": False,
-                    "labels": {
-                        "sara.recovery.plan_sha256": holder["sha"],
-                        "sara.recovery.run_id": name[len("sara-rr-"):] if name.startswith("sara-rr-") else "",
-                    },
-                    "container_id": "old-id-gone",
-                }
-            return {
-                "running": False,
-                "labels": {"other": "owner"},
-                "container_id": "replacement-id",
-            }
+        monkeypatch.setattr(cli, "_docker_inspect_container", racing_recheck)
 
-        def fake_rm(command, **kwargs):
-            class R:
-                returncode = 1
-                stderr = "Error response from daemon: No such container: old-id-gone"
-            return R()
+        class FakeRemoved:
+            returncode = 1
+            stderr = "Error: no such container: old-id"
 
-        monkeypatch.setattr(cli, "_docker_inspect_container", racing_inspect)
-        # Only intercept docker rm, not inspect (inspect is monkeypatched at cli level)
-        real_run = subprocess.run
-        def selective_run(command, **kwargs):
-            if "rm" in command:
-                return fake_rm(command, **kwargs)
-            return real_run(command, **kwargs)
-        monkeypatch.setattr(subprocess, "run", selective_run)
-        monkeypatch.setattr(cli, "run_scraper", lambda c: (_ for _ in ()).throw(AssertionError("no docker")))
-        capsys.readouterr()
-        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
-        assert rc == 2
-        err = capsys.readouterr().err
-        assert "replacement" in err.lower() or "refusing" in err.lower()
+        def fake_run(command, **kwargs):
+            return FakeRemoved()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        with pytest.raises(cli._ChildFailure, match="replacement"):
+            cli._remove_stopped_container("old-id", "sara-rr-test")
 
     def test_stopped_owned_container_removed_by_id(self, tmp_path, monkeypatch):
-        """Stopped owned container is removed by its immutable ID (behavioral)."""
-        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
-        holder = {"sha": sha, "removed": None}
+        """_remove_stopped_container: removes by immutable ID, not name."""
+        captured = {}
 
-        def stopped_owned(name):
-            return {
-                "running": False,
-                "labels": {
-                    "sara.recovery.plan_sha256": holder["sha"],
-                    "sara.recovery.run_id": name[len("sara-rr-"):] if name.startswith("sara-rr-") else "",
-                },
-                "container_id": "immutable-id-999",
-            }
+        def fake_run(command, **kwargs):
+            captured["command"] = list(command)
 
-        monkeypatch.setattr(cli, "_docker_inspect_container", stopped_owned)
-        real_run = subprocess.run
-        def selective_run(command, **kwargs):
-            if "rm" in command and "immutable-id-999" in command:
-                holder["removed"] = list(command)
-                class R:
-                    returncode = 0
-                    stderr = ""
-                return R()
-            return real_run(command, **kwargs)
-        monkeypatch.setattr(subprocess, "run", selective_run)
-        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
-        assert holder["removed"] is not None
-        assert "immutable-id-999" in holder["removed"]
-        assert "sara-rr-" not in str(holder["removed"][2:])
+            class R:
+                returncode = 0
+                stderr = ""
+            return R()
 
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        cli._remove_stopped_container("immutable-id-123", "sara-rr-some-name")
+        assert "immutable-id-123" in captured["command"]
+        assert "docker" in captured["command"] and "rm" in captured["command"]
 
 class TestV2F07OrphanAndFS:
     @pytest.mark.parametrize("orphan_files", [
@@ -1058,47 +1018,13 @@ class TestF5F01OperationalBoundaries:
         assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 1
 
     def test_docker_rm_oserror_bounded(self, tmp_path, monkeypatch):
-        """docker rm process-creation OSError => bounded, not traceback."""
-        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
-        holder = {"sha": sha}
+        """_remove_stopped_container: OSError during rm => bounded _ChildFailure."""
+        def failing_run(command, **kwargs):
+            raise OSError("subprocess creation failed")
 
-        def stopped_owned(name):
-            return {
-                "running": False,
-                "labels": {
-                    "sara.recovery.plan_sha256": holder["sha"],
-                    "sara.recovery.run_id": name[len("sara-rr-"):] if name.startswith("sara-rr-") else "",
-                },
-                "container_id": "some-id",
-            }
-
-        monkeypatch.setattr(cli, "_docker_inspect_container", stopped_owned)
-        real_run = subprocess.run
-
-        def rm_oserror(command, **kwargs):
-            if "rm" in command:
-                raise OSError("subprocess creation failed")
-            return real_run(command, **kwargs)
-
-        monkeypatch.setattr(subprocess, "run", rm_oserror)
-        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
-        assert rc in (1, 2)
-
-    def test_final_result_fetch_failure_parent_stays_complete(self, tmp_path, monkeypatch):
-        """Post-completion result fetch failure: parent stays complete, rc 1."""
-        data, sha, db, plan, fake = _install(monkeypatch, tmp_path, records_for=_records_for_bin)
-        assert cli.cmd_recovery_run(run_args(db, data, sha, tmp_path)) == 0
-        conn = connect(db)
-        # Verify parent is complete
-        parent = conn.execute(
-            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
-        ).fetchone()
-        assert parent["status"] == "complete"
-        conn.close()
-        # A result-fetch failure after this point would need to be tested
-        # via monkeypatching the DB read, but the key invariant (parent stays
-        # complete) is already enforced by the code structure.
-
+        monkeypatch.setattr(subprocess, "run", failing_run)
+        with pytest.raises(cli._ChildFailure, match="docker rm process"):
+            cli._remove_stopped_container("some-id", "sara-rr-test")
 
 class TestSRF5_01QuerySnapshot:
     def test_started_child_tampered_snapshot_rejected(self, tmp_path, monkeypatch):

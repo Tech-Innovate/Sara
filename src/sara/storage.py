@@ -676,6 +676,9 @@ def verify_recovery_schema(conn: sqlite3.Connection) -> None:
             "recovery_executions is missing the source-run foreign key "
             "with ON DELETE NO ACTION"
         )
+    # expected rows carry (name, declared type, pk ordinal, nullable);
+    # PRAGMA table_info.notnull is checked exactly for every column,
+    # including TEXT/composite primary-key columns.
 def _verify_table_columns(conn, table, expected, *, expected_pk) -> None:
     # expected rows carry (name, declared type, pk ordinal, nullable);
     # PRAGMA table_info.notnull is checked exactly for every column,

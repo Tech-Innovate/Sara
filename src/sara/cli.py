@@ -1727,6 +1727,43 @@ def _child_ki_guard(conn, run_id):
         return False
 
 
+
+def _remove_stopped_container(container_id, container_name):
+    """Remove a stopped owned container by its immutable ID.
+
+    Returns None on success. Raises _ChildFailure on failure.
+    """
+    try:
+        removed = subprocess.run(
+            ["docker", "rm", container_id],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError as rm_exc:
+        raise _ChildFailure(
+            status="failed", process_exit=1,
+            error=f"docker rm process creation failed: {rm_exc}",
+        ) from rm_exc
+    if removed.returncode != 0:
+        stderr_text = removed.stderr or ""
+        if "no such container" in stderr_text.lower():
+            recheck = _docker_inspect_container(container_name)
+            if recheck is not None:
+                raise _ChildFailure(
+                    status="none", process_exit=2,
+                    error=(
+                        f"container name {container_name} now holds a replacement "
+                        "after the inspected container disappeared; refusing to "
+                        "remove a replacement without fresh ownership verification"
+                    ),
+                )
+            return None  # container gone; safe to continue
+        raise _ChildFailure(
+            status="failed", process_exit=1,
+            error=f"failed to remove stopped owned container {container_id}: "
+                  f"{stderr_text.strip() or removed.returncode}",
+        )
+    return None
+
 def _execute_recovery_child(
     conn, plan, plan_sha256, execution_root, bin_record, mapping, proxy_path, container_name,
     *, mark_parent_running=None,
@@ -1734,6 +1771,7 @@ def _execute_recovery_child(
     row, column = bin_record.row, bin_record.column
     run_id = _recovery_child_run_id(plan_sha256, row, column)
     bin_dir = execution_root / "bins" / f"r{row}-c{column}"
+    _deferred_rm = None  # 429: stopped-container ID, removed after provenance
     output_file = bin_dir / "results.jsonl"
     area = AreaConfig(f"{plan.area_name}-rr-r{row}-c{column}", bin_record.bbox)
 
@@ -1818,41 +1856,6 @@ def _execute_recovery_child(
                 )
             _deferred_rm = stopped_container_id  # removed later, after provenance
 
-        # 429/SR-A54-02: Now that provenance and snapshot are validated,
-        # remove the stopped owned container immediately before resume work.
-        _deferred_rm_id = locals().get("_deferred_rm")
-        if _deferred_rm_id:
-            try:
-                removed = subprocess.run(
-                    ["docker", "rm", _deferred_rm_id],
-                    capture_output=True, text=True, check=False,
-                )
-            except OSError as rm_exc:
-                raise _ChildFailure(
-                    status="failed", process_exit=1,
-                    error=f"docker rm process creation failed: {rm_exc}",
-                ) from rm_exc
-            if removed.returncode != 0:
-                stderr_text = removed.stderr or ""
-                if "no such container" in stderr_text.lower():
-                    recheck = _docker_inspect_container(container_name)
-                    if recheck is not None:
-                        raise _ChildFailure(
-                            status="none", process_exit=2,
-                            error=(
-                                f"container name {container_name} now holds a replacement "
-                                "after the inspected container disappeared; refusing to "
-                                "remove a replacement without fresh ownership verification"
-                            ),
-                        )
-                else:
-                    raise _ChildFailure(
-                        status="failed", process_exit=1,
-                        error=f"failed to remove stopped owned container {_deferred_rm_id}: "
-                              f"{stderr_text.strip() or removed.returncode}",
-                    )
-            _deferred_rm = None  # consumed
-
         options = ScrapeOptions(
             cell_km=plan.recovery_cell_km, depth=plan.depth,
             concurrency=plan.config["concurrency"],
@@ -1913,6 +1916,12 @@ def _execute_recovery_child(
 
             # SR-F5-01: enforce exact query snapshot before any resume action
             _validate_query_snapshot(bin_dir, plan, is_started=True)
+
+            # 429: Now remove the stopped owned container (deferred from
+            # the inspection phase) after provenance and snapshot validation.
+            if _deferred_rm:
+                _remove_stopped_container(_deferred_rm, container_name)
+                _deferred_rm = None  # consumed
 
             if inspect is None:
                 try:
