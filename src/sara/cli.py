@@ -1403,7 +1403,7 @@ def cmd_recovery_run(args) -> int:
                 _write_plan_snapshot(snapshot_path, data)
             except OSError as exc:
                 _best_effort_parent_failure(conn, plan_sha256, f"plan snapshot write failed: {exc}")
-                print(f"recovery-run failed to write plan snapshot: {exc}", file=sys.stderr)
+                _best_effort_stderr(f"recovery-run failed to write plan snapshot: {exc}")
                 return 1
 
         mappings = {
@@ -1426,15 +1426,22 @@ def cmd_recovery_run(args) -> int:
                     # The stored execution state is unusable. Record the
                     # lifecycle outcome instead of a bare rejection so a
                     # crash-stranded running parent/child cannot survive.
-                    child_run_id = mapping["run_id"]
+                    # The mapped run is eligible for child repair only when
+                    # its identity equals the plan-derived child ID: an
+                    # untrusted mapping must never mutate the row it
+                    # happens to point at.
                     try:
                         conn.execute("BEGIN IMMEDIATE")
                         try:
-                            conn.execute(
-                                "UPDATE runs SET status = 'failed', finished_at = ?, "
-                                "error = ? WHERE id = ? AND status != 'complete'",
-                                (utc_now(), str(exc), child_run_id),
-                            )
+                            if mapping["run_id"] == _recovery_child_run_id(
+                                plan_sha256, bin_record.row, bin_record.column
+                            ):
+                                conn.execute(
+                                    "UPDATE runs SET status = 'failed', "
+                                    "finished_at = ?, error = ? "
+                                    "WHERE id = ? AND status != 'complete'",
+                                    (utc_now(), str(exc), mapping["run_id"]),
+                                )
                             set_recovery_parent_status(
                                 conn, plan_sha256, "failed", str(exc)
                             )

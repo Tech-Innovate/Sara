@@ -1844,3 +1844,54 @@ class TestPR4R3BoundedRepairs:
         ).fetchone()[0]
         assert second_status == "complete"
         conn.close()
+
+    def test_provenance_mismatch_mapping_never_mutates_unrelated_run(self, tmp_path, monkeypatch):
+        """A corrupted mapping pointing at an unrelated run fails only the
+        recovery parent; the unrelated run is untouched."""
+        data, sha, db, plan, fake, second = self._first_complete_second_interrupted(
+            monkeypatch, tmp_path
+        )
+        real_child_id = cli._recovery_child_run_id(sha, second.row, second.column)
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "INSERT INTO runs(id, area_name, bbox_json, cell_km, depth, queries_json, "
+            "scraper_image, config_json, raw_path, status, started_at) "
+            "VALUES ('unrelated-run', 'other', '{}', 1.0, 5, '[]', "
+            "?, '{}', '/tmp/other.jsonl', 'running', '2026-09-24T00:00:00+00:00')",
+            (DIGEST_IMAGE,),
+        )
+        conn.execute(
+            "UPDATE recovery_execution_bins SET run_id = 'unrelated-run' "
+            "WHERE plan_sha256 = ? AND row = ? AND column = ?",
+            (sha, second.row, second.column),
+        )
+        conn.commit()
+        unrelated_before = dict(
+            conn.execute("SELECT * FROM runs WHERE id = 'unrelated-run'").fetchone()
+        )
+        real_child_before = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (real_child_id,)).fetchone()
+        )
+        conn.close()
+        monkeypatch.setattr(
+            cli, "run_scraper",
+            lambda c: (_ for _ in ()).throw(AssertionError("scraper must not launch")),
+        )
+        rc = cli.cmd_recovery_run(run_args(db, data, sha, tmp_path))
+        assert rc == 2
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        parent = conn.execute(
+            "SELECT status FROM recovery_executions WHERE plan_sha256 = ?", (sha,)
+        ).fetchone()
+        assert parent["status"] == "failed"
+        unrelated_after = dict(
+            conn.execute("SELECT * FROM runs WHERE id = 'unrelated-run'").fetchone()
+        )
+        assert unrelated_after == unrelated_before
+        real_child_after = dict(
+            conn.execute("SELECT * FROM runs WHERE id = ?", (real_child_id,)).fetchone()
+        )
+        assert real_child_after == real_child_before
+        conn.close()
