@@ -24,7 +24,6 @@ from .scraper import (
     load_resume_completed_input_ids,
     recovery_query_snapshot_bytes,
     run_scraper,
-    validate_resume_query_identities,
     validate_recovery_queries,
 )
 from .recovery import (
@@ -2062,9 +2061,18 @@ def _execute_recovery_child(
         # Active child lock: another process owns this bin; no new effect.
         raise _ChildFailure(status="none", process_exit=2, error=str(exc)) from exc
 
-    def child_mark_no_exit(status: str, error: str | None) -> None:
-        """Lifecycle-only child status update; exit provenance is untouched."""
-        child_mark(status, None, error)
+    def mark_child_lifecycle(status: str, error: str | None) -> None:
+        """Update child lifecycle fields without altering exit provenance."""
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE runs SET status = ?, finished_at = ?, error = ? WHERE id = ?",
+                (status, utc_now(), error, run_id),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def record_child_exit(exit_code: int) -> None:
         """Record a newly observed scraper process exit code."""
@@ -2072,18 +2080,6 @@ def _execute_recovery_child(
         try:
             conn.execute(
                 "UPDATE runs SET exit_code = ? WHERE id = ?", (exit_code, run_id)
-            )
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-
-    def child_mark(status: str, exit_code: int | None, error: str | None) -> None:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            conn.execute(
-                "UPDATE runs SET status = ?, finished_at = ?, error = ? WHERE id = ?",
-                (status, utc_now(), error, run_id),
             )
             conn.commit()
         except BaseException:
@@ -2207,14 +2203,14 @@ def _execute_recovery_child(
                 except (RuntimeError, OSError) as exc:
                     # E4-F04: invalid evidence is a child failure, not just
                     # a parent failure; preserve the child's exit_code.
-                    child_mark_no_exit("failed", f"existing resume evidence is invalid: {exc}")
+                    mark_child_lifecycle("failed", f"existing resume evidence is invalid: {exc}")
                     raise _ChildFailure(
                         status="failed", process_exit=1,
                         error=f"existing resume evidence is invalid: {exc}",
                     ) from exc
                 comparison = expected_inputs.compare_completed(completed_ids)
                 if comparison.unexpected:
-                    child_mark_no_exit("failed", "existing resume evidence contains unexpected input IDs")
+                    mark_child_lifecycle("failed", "existing resume evidence contains unexpected input IDs")
                     raise _ChildFailure(
                         status="failed", process_exit=1,
                         error="existing resume evidence contains unexpected input IDs",
@@ -2234,12 +2230,12 @@ def _execute_recovery_child(
                             finalize_run=("complete", recorded_exit, None),
                         )
                     except KeyboardInterrupt:
-                        child_mark_no_exit(
+                        mark_child_lifecycle(
                             "interrupted", "recovery child interrupted during direct ingestion"
                         )
                         raise
                     except Exception as ingest_exc:
-                        child_mark_no_exit(
+                        mark_child_lifecycle(
                             "failed", f"direct-sidecar ingestion failed: {ingest_exc}"
                         )
                         raise _ChildFailure(
@@ -2388,7 +2384,7 @@ def _execute_recovery_child(
                 os.close(fd)
             except FileExistsError:
                 if output_file.stat().st_size != 0:
-                    child_mark_no_exit(
+                    mark_child_lifecycle(
                         "failed",
                         f"child output file exists non-empty before first launch: {output_file}",
                     )
@@ -2397,7 +2393,7 @@ def _execute_recovery_child(
                         error="child output file exists non-empty before first launch",
                     )
             except OSError as open_exc:
-                child_mark_no_exit("failed", f"child output creation failed: {open_exc}")
+                mark_child_lifecycle("failed", f"child output creation failed: {open_exc}")
                 raise _ChildFailure(
                     status="failed", process_exit=1,
                     error=f"child output creation failed: {open_exc}",
@@ -2411,7 +2407,7 @@ def _execute_recovery_child(
                 labels={_RECOVERY_LABEL_PLAN: plan_sha256, _RECOVERY_LABEL_RUN: run_id},
             )
         except (OSError, RuntimeError) as exc:
-            child_mark("failed", None, f"child preparation failed: {exc}")
+            mark_child_lifecycle("failed", f"child preparation failed: {exc}")
             raise _ChildFailure(
                 status="failed", process_exit=1, error=f"child preparation failed: {exc}"
             ) from exc
@@ -2422,10 +2418,10 @@ def _execute_recovery_child(
         except KeyboardInterrupt:
             # Sara-side interrupt before any new scraper return: the child is
             # interrupted without inventing scraper-exit provenance.
-            child_mark_no_exit("interrupted", "recovery child interrupted before scraper return")
+            mark_child_lifecycle("interrupted", "recovery child interrupted before scraper return")
             raise
         except (RuntimeError, OSError) as exc:
-            child_mark_no_exit("failed", f"scraper launch failed: {exc}")
+            mark_child_lifecycle("failed", f"scraper launch failed: {exc}")
             raise _ChildFailure(
                 status="failed", process_exit=1, error=f"scraper launch failed: {exc}"
             ) from exc
@@ -2436,18 +2432,18 @@ def _execute_recovery_child(
 
         if scraper_exit != 0:
             error = f"scraper failed with exit code {scraper_exit}"
-            child_mark_no_exit("failed", error)
+            mark_child_lifecycle("failed", error)
             raise _ChildFailure(status="failed", process_exit=1, error=error)
 
         try:
             completed_ids = load_resume_completed_input_ids(output_file, plan.scraper_image)
             comparison = expected_inputs.compare_completed(completed_ids)
         except KeyboardInterrupt:
-            child_mark_no_exit("interrupted", "recovery child interrupted during completion verification")
+            mark_child_lifecycle("interrupted", "recovery child interrupted during completion verification")
             raise
         except RuntimeError as exc:
             error = f"completion verification failed after scraper exit 0: {exc}"
-            child_mark("failed", 0, error)
+            mark_child_lifecycle("failed", error)
             raise _ChildFailure(status="failed", process_exit=1, error=error) from exc
 
         if comparison.unexpected:
@@ -2455,14 +2451,14 @@ def _execute_recovery_child(
                 f"resume completion state does not match this child: "
                 f"{comparison.unexpected} unexpected completed input(s)"
             )
-            child_mark_no_exit("failed", error)
+            mark_child_lifecycle("failed", error)
             raise _ChildFailure(status="failed", process_exit=1, error=error)
         if comparison.missing:
             error = (
                 "scraper exited before all planned child searches completed: "
                 f"completed {comparison.matched}/{len(expected_inputs)}"
             )
-            child_mark_no_exit("interrupted", error)
+            mark_child_lifecycle("interrupted", error)
             raise _ChildFailure(status="interrupted", process_exit=130, error=error)
 
         recorded_exit = conn.execute(
@@ -2475,11 +2471,11 @@ def _execute_recovery_child(
                 finalize_run=("complete", recorded_exit, None),
             )
         except KeyboardInterrupt:
-            child_mark_no_exit("interrupted", "recovery child interrupted during ingestion")
+            mark_child_lifecycle("interrupted", "recovery child interrupted during ingestion")
             raise
         except Exception as exc:
             error = f"recovery child ingestion failed: {exc}"
-            child_mark_no_exit("failed", error)
+            mark_child_lifecycle("failed", error)
             raise _ChildFailure(status="failed", process_exit=1, error=error) from exc
         return "complete"
     finally:
