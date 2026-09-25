@@ -67,6 +67,14 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     ON knowledge_subjects(merged_into_subject_id)
     """,
     """
+    CREATE TRIGGER knowledge_subjects_id_immutable
+    BEFORE UPDATE OF id ON knowledge_subjects
+    WHEN NEW.id IS NOT OLD.id
+    BEGIN
+        SELECT RAISE(ABORT, 'knowledge subject id is immutable');
+    END
+    """,
+    """
     CREATE TRIGGER knowledge_subjects_kind_immutable
     BEFORE UPDATE OF kind ON knowledge_subjects
     WHEN NEW.kind <> OLD.kind
@@ -182,6 +190,16 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TRIGGER sources_identity_immutable
+    BEFORE UPDATE OF id, source_type, created_at ON sources
+    WHEN NEW.id IS NOT OLD.id
+      OR NEW.source_type IS NOT OLD.source_type
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'source identity/type is immutable');
+    END
+    """,
+    """
     CREATE TRIGGER business_entities_subject_kind_insert
     BEFORE INSERT ON business_entities
     WHEN NOT EXISTS (
@@ -201,6 +219,14 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     )
     BEGIN
         SELECT RAISE(ABORT, 'business_entities subject must have kind business_entity');
+    END
+    """,
+    """
+    CREATE TRIGGER business_entities_id_immutable
+    BEFORE UPDATE OF id ON business_entities
+    WHEN NEW.id IS NOT OLD.id
+    BEGIN
+        SELECT RAISE(ABORT, 'business entity id is immutable');
     END
     """,
     """
@@ -226,6 +252,14 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     END
     """,
     """
+    CREATE TRIGGER business_locations_id_immutable
+    BEFORE UPDATE OF id ON business_locations
+    WHEN NEW.id IS NOT OLD.id
+    BEGIN
+        SELECT RAISE(ABORT, 'business location id is immutable');
+    END
+    """,
+    """
     CREATE TABLE external_identifiers (
         id TEXT PRIMARY KEY,
         subject_id TEXT NOT NULL,
@@ -246,13 +280,24 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     """,
     """
     CREATE TRIGGER external_identifiers_identity_immutable
-    BEFORE UPDATE OF subject_id, source_id, namespace, value ON external_identifiers
-    WHEN NEW.subject_id IS NOT OLD.subject_id
+    BEFORE UPDATE OF id, subject_id, source_id, namespace, value, first_observed_at, created_at
+    ON external_identifiers
+    WHEN NEW.id IS NOT OLD.id
+      OR NEW.subject_id IS NOT OLD.subject_id
       OR NEW.source_id IS NOT OLD.source_id
       OR NEW.namespace IS NOT OLD.namespace
       OR NEW.value IS NOT OLD.value
+      OR NEW.first_observed_at IS NOT OLD.first_observed_at
+      OR NEW.created_at IS NOT OLD.created_at
     BEGIN
         SELECT RAISE(ABORT, 'external identifier identity is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER external_identifiers_no_delete
+    BEFORE DELETE ON external_identifiers
+    BEGIN
+        SELECT RAISE(ABORT, 'external identifier history is durable');
     END
     """,
     """
@@ -307,6 +352,14 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     )
     BEGIN
         SELECT RAISE(ABORT, 'channels subject must have kind channel');
+    END
+    """,
+    """
+    CREATE TRIGGER channels_id_immutable
+    BEFORE UPDATE OF id ON channels
+    WHEN NEW.id IS NOT OLD.id
+    BEGIN
+        SELECT RAISE(ABORT, 'channel id is immutable');
     END
     """,
     """
@@ -733,6 +786,28 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TRIGGER business_relationships_identity_immutable
+    BEFORE UPDATE OF id, from_entity_id, to_entity_id, relationship_type,
+                     first_observed_at, created_at
+    ON business_relationships
+    WHEN NEW.id IS NOT OLD.id
+      OR NEW.from_entity_id IS NOT OLD.from_entity_id
+      OR NEW.to_entity_id IS NOT OLD.to_entity_id
+      OR NEW.relationship_type IS NOT OLD.relationship_type
+      OR NEW.first_observed_at IS NOT OLD.first_observed_at
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN
+        SELECT RAISE(ABORT, 'business relationship identity is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER business_relationships_no_delete
+    BEFORE DELETE ON business_relationships
+    BEGIN
+        SELECT RAISE(ABORT, 'business relationship history is durable');
+    END
+    """,
+    """
     CREATE INDEX ix_business_relationships_from
     ON business_relationships(from_entity_id, relationship_type)
     """,
@@ -957,7 +1032,11 @@ def _has_expected_partial_unique_index(
         if sql_row is None or sql_row[0] is None:
             continue
         normalized_sql = " ".join(str(sql_row[0]).lower().split())
-        if expected_where in normalized_sql:
+        where_marker = " where "
+        if where_marker not in normalized_sql:
+            continue
+        actual_where = normalized_sql.split(where_marker, 1)[1]
+        if actual_where == expected_where.removeprefix("where "):
             return True
     return False
 
