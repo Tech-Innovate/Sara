@@ -260,6 +260,14 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     END
     """,
     """
+    CREATE TRIGGER business_locations_ownership_immutable
+    BEFORE UPDATE OF business_entity_id ON business_locations
+    WHEN NEW.business_entity_id IS NOT OLD.business_entity_id
+    BEGIN
+        SELECT RAISE(ABORT, 'business location ownership is immutable');
+    END
+    """,
+    """
     CREATE TABLE external_identifiers (
         id TEXT PRIMARY KEY,
         subject_id TEXT NOT NULL,
@@ -360,6 +368,15 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     WHEN NEW.id IS NOT OLD.id
     BEGIN
         SELECT RAISE(ABORT, 'channel id is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER channels_ownership_immutable
+    BEFORE UPDATE OF business_entity_id, location_id ON channels
+    WHEN NEW.business_entity_id IS NOT OLD.business_entity_id
+      OR NEW.location_id IS NOT OLD.location_id
+    BEGIN
+        SELECT RAISE(ABORT, 'channel ownership/location scope is immutable');
     END
     """,
     """
@@ -922,6 +939,294 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     BEFORE DELETE ON dossier_domain_assessments
     BEGIN
         SELECT RAISE(ABORT, 'dossier domain assessments are immutable snapshots');
+    END
+    """,
+    """
+    CREATE TABLE dossier_assessment_seals (
+        assessment_id TEXT PRIMARY KEY,
+        sealed_at TEXT NOT NULL,
+        FOREIGN KEY(assessment_id) REFERENCES dossier_assessments(id)
+    )
+    """,
+    """
+    CREATE TRIGGER dossier_assessment_seals_require_domains
+    BEFORE INSERT ON dossier_assessment_seals
+    WHEN NOT EXISTS (
+        SELECT 1 FROM dossier_domain_assessments dda
+        WHERE dda.assessment_id = NEW.assessment_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier assessment cannot be sealed without domain assessments');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_assessment_seals_immutable
+    BEFORE UPDATE ON dossier_assessment_seals
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier assessment seals are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_assessment_seals_no_delete
+    BEFORE DELETE ON dossier_assessment_seals
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier assessment seals are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_domain_assessments_reject_after_seal
+    BEFORE INSERT ON dossier_domain_assessments
+    WHEN EXISTS (
+        SELECT 1 FROM dossier_assessment_seals s
+        WHERE s.assessment_id = NEW.assessment_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'sealed dossier assessment cannot accept new domain rows');
+    END
+    """,
+    """
+    CREATE VIEW finalized_dossier_assessments AS
+    SELECT da.*, s.sealed_at
+    FROM dossier_assessments da
+    JOIN dossier_assessment_seals s ON s.assessment_id = da.id
+    """,
+    """
+    CREATE TRIGGER knowledge_subjects_no_delete
+    BEFORE DELETE ON knowledge_subjects
+    BEGIN
+        SELECT RAISE(ABORT, 'knowledge subjects are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER business_entities_no_delete
+    BEFORE DELETE ON business_entities
+    BEGIN
+        SELECT RAISE(ABORT, 'business entity subjects are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER business_locations_no_delete
+    BEFORE DELETE ON business_locations
+    BEGIN
+        SELECT RAISE(ABORT, 'business location subjects are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER channels_no_delete
+    BEFORE DELETE ON channels
+    BEGIN
+        SELECT RAISE(ABORT, 'channel subjects are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER sources_no_delete
+    BEFORE DELETE ON sources
+    BEGIN
+        SELECT RAISE(ABORT, 'sources are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER predicate_definitions_no_delete
+    BEFORE DELETE ON predicate_definitions
+    BEGIN
+        SELECT RAISE(ABORT, 'predicate definitions are durable');
+    END
+    """,
+    """
+    CREATE TRIGGER schema_migrations_insert_collision_guard
+    BEFORE INSERT ON schema_migrations
+    WHEN EXISTS (
+        SELECT 1 FROM schema_migrations sm
+        WHERE sm.version = NEW.version OR sm.name = NEW.name
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'schema migration identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER knowledge_subjects_insert_collision_guard
+    BEFORE INSERT ON knowledge_subjects
+    WHEN EXISTS (SELECT 1 FROM knowledge_subjects t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'knowledge subject identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER business_entities_insert_collision_guard
+    BEFORE INSERT ON business_entities
+    WHEN EXISTS (SELECT 1 FROM business_entities t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'business entity identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER business_locations_insert_collision_guard
+    BEFORE INSERT ON business_locations
+    WHEN EXISTS (SELECT 1 FROM business_locations t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'business location identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER sources_insert_collision_guard
+    BEFORE INSERT ON sources
+    WHEN EXISTS (SELECT 1 FROM sources t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'source identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER external_identifiers_insert_collision_guard
+    BEFORE INSERT ON external_identifiers
+    WHEN EXISTS (
+        SELECT 1 FROM external_identifiers t
+        WHERE t.id = NEW.id
+           OR (
+               t.source_id = NEW.source_id
+               AND t.namespace = NEW.namespace
+               AND t.value = NEW.value
+           )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'external identifier identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER channels_insert_collision_guard
+    BEFORE INSERT ON channels
+    WHEN EXISTS (SELECT 1 FROM channels t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'channel identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_insert_collision_guard
+    BEFORE INSERT ON acquisition_sessions
+    WHEN EXISTS (
+        SELECT 1 FROM acquisition_sessions t
+        WHERE t.id = NEW.id
+           OR (
+               NEW.legacy_run_id IS NOT NULL
+               AND t.legacy_run_id = NEW.legacy_run_id
+           )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'acquisition session identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER evidence_items_insert_collision_guard
+    BEFORE INSERT ON evidence_items
+    WHEN EXISTS (SELECT 1 FROM evidence_items t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'evidence item identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER predicate_definitions_insert_collision_guard
+    BEFORE INSERT ON predicate_definitions
+    WHEN EXISTS (SELECT 1 FROM predicate_definitions t WHERE t.name = NEW.name)
+    BEGIN
+        SELECT RAISE(ABORT, 'predicate definition identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER observations_insert_collision_guard
+    BEFORE INSERT ON observations
+    WHEN EXISTS (SELECT 1 FROM observations t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'observation identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER facts_insert_collision_guard
+    BEFORE INSERT ON facts
+    WHEN EXISTS (SELECT 1 FROM facts t WHERE t.id = NEW.id)
+      OR (
+          NEW.valid_to IS NULL
+          AND EXISTS (
+              SELECT 1 FROM facts t
+              WHERE t.subject_id = NEW.subject_id
+                AND t.predicate = NEW.predicate
+                AND t.fact_slot = NEW.fact_slot
+                AND t.valid_to IS NULL
+          )
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'fact identity or current slot already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER fact_observation_support_insert_collision_guard
+    BEFORE INSERT ON fact_observation_support
+    WHEN EXISTS (
+        SELECT 1 FROM fact_observation_support t
+        WHERE t.fact_id = NEW.fact_id AND t.observation_id = NEW.observation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'fact observation support already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER fact_acquisition_support_insert_collision_guard
+    BEFORE INSERT ON fact_acquisition_support
+    WHEN EXISTS (
+        SELECT 1 FROM fact_acquisition_support t
+        WHERE t.fact_id = NEW.fact_id
+          AND t.acquisition_session_id = NEW.acquisition_session_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'fact acquisition support already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER business_relationships_insert_collision_guard
+    BEFORE INSERT ON business_relationships
+    WHEN EXISTS (SELECT 1 FROM business_relationships t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'business relationship identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER business_relationship_observation_support_insert_collision_guard
+    BEFORE INSERT ON business_relationship_observation_support
+    WHEN EXISTS (
+        SELECT 1 FROM business_relationship_observation_support t
+        WHERE t.relationship_id = NEW.relationship_id
+          AND t.observation_id = NEW.observation_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'business relationship observation support already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_assessments_insert_collision_guard
+    BEFORE INSERT ON dossier_assessments
+    WHEN EXISTS (SELECT 1 FROM dossier_assessments t WHERE t.id = NEW.id)
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier assessment identity already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_domain_assessments_insert_collision_guard
+    BEFORE INSERT ON dossier_domain_assessments
+    WHEN EXISTS (
+        SELECT 1 FROM dossier_domain_assessments t
+        WHERE t.assessment_id = NEW.assessment_id AND t.domain = NEW.domain
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier domain assessment already exists');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_assessment_seals_insert_collision_guard
+    BEFORE INSERT ON dossier_assessment_seals
+    WHEN EXISTS (
+        SELECT 1 FROM dossier_assessment_seals t
+        WHERE t.assessment_id = NEW.assessment_id
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier assessment seal already exists');
     END
     """,
 )
