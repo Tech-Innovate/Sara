@@ -380,6 +380,16 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     END
     """,
     """
+    CREATE TRIGGER channels_endpoint_identity_immutable
+    BEFORE UPDATE OF channel_type, identifier, normalized_identifier ON channels
+    WHEN NEW.channel_type IS NOT OLD.channel_type
+      OR NEW.identifier IS NOT OLD.identifier
+      OR NEW.normalized_identifier IS NOT OLD.normalized_identifier
+    BEGIN
+        SELECT RAISE(ABORT, 'channel endpoint identity is immutable');
+    END
+    """,
+    """
     CREATE INDEX ix_channels_entity
     ON channels(business_entity_id)
     """,
@@ -677,6 +687,10 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
         CHECK(
             status NOT IN ('unknown', 'not_observed', 'not_applicable')
             OR (value_json IS NULL AND normalized_value_json IS NULL AND value_hash IS NULL)
+        ),
+        CHECK(
+            status NOT IN ('confirmed', 'single_source', 'stale')
+            OR (value_json IS NOT NULL OR normalized_value_json IS NOT NULL OR value_hash IS NOT NULL)
         )
     )
     """,
