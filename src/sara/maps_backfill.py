@@ -523,7 +523,7 @@ def _backfill_evidence_by_business(
     conn: sqlite3.Connection,
 ) -> dict[int, dict[str, Any]]:
     cursor = conn.execute(
-        "SELECT e.id,e.content_sha256,e.metadata_json,a.legacy_run_id "
+        "SELECT e.id,e.content_sha256,e.metadata_json,e.retrieved_at,a.legacy_run_id "
         "FROM evidence_items e "
         "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
         "WHERE e.source_id=? AND a.source_id=? AND a.collector_name=? "
@@ -561,6 +561,11 @@ def _backfill_evidence_by_business(
             raise MapsBackfillError(
                 f"backfill evidence {item['id']} content hash does not match retained raw_json"
             )
+        expected_evidence_id = _evidence_id(legacy_business_id, str(item["content_sha256"]))
+        if str(item["id"]) != expected_evidence_id:
+            raise MapsBackfillError(
+                f"backfill evidence {item['id']} does not have its deterministic Phase-3 identity"
+            )
         if str(metadata.get("legacy_run_id")) != str(item["legacy_run_id"]):
             raise MapsBackfillError(
                 f"backfill evidence {item['id']} legacy run provenance is inconsistent"
@@ -569,8 +574,30 @@ def _backfill_evidence_by_business(
             raise MapsBackfillError(
                 f"multiple immutable Phase-3 evidence items claim Maps business {legacy_business_id}"
             )
+        item["raw_json"] = raw_json
         result[legacy_business_id] = item
     return result
+
+
+def _expected_backfill_observations(
+    business_id: int, evidence: dict[str, Any]
+) -> list[dict[str, Any]]:
+    raw_json = evidence.get("raw_json")
+    if not isinstance(raw_json, str):
+        raise MapsBackfillError(
+            f"backfill evidence {evidence['id']} has no retained raw_json"
+        )
+    try:
+        raw = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise MapsBackfillError(
+            f"backfill evidence {evidence['id']} retained raw_json is malformed"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise MapsBackfillError(
+            f"backfill evidence {evidence['id']} retained raw_json is not an object"
+        )
+    return _observations({"id": business_id, "raw_json": raw_json}, raw)
 
 
 def _verify_complete_coverage(
@@ -610,35 +637,112 @@ def _verify_complete_coverage(
             raise MapsBackfillError(
                 f"existing Maps backfill provenance is incomplete for business {business_id}"
             )
-        observation_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM observations "
-                "WHERE evidence_id=? AND extraction_method='legacy_import' "
-                "AND extractor_name=? AND extractor_version=?",
-                (evidence["id"], BACKFILL_COLLECTOR_NAME, BACKFILL_VERSION),
-            ).fetchone()[0]
-        )
-        support_count = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM facts f "
-                "JOIN fact_observation_support fos "
-                "ON fos.fact_id=f.id AND fos.support_role='supports' "
-                "JOIN observations o ON o.id=fos.observation_id "
-                "WHERE o.evidence_id=? AND o.extraction_method='legacy_import' "
-                "AND o.extractor_name=? AND o.extractor_version=? "
-                "AND f.reconciliation_version=? AND f.status='single_source'",
-                (
-                    evidence["id"],
-                    BACKFILL_COLLECTOR_NAME,
-                    BACKFILL_VERSION,
-                    RECONCILIATION_VERSION,
-                ),
-            ).fetchone()[0]
-        )
-        if support_count != observation_count:
-            raise MapsBackfillError(
-                f"existing Maps backfill fact provenance is incomplete for business {business_id}"
+
+        expected_observations = _expected_backfill_observations(business_id, evidence)
+        expected_observation_rows: list[dict[str, Any]] = []
+        expected_fact_ids: list[str] = []
+        for observation in expected_observations:
+            observation_id = _observation_id(str(evidence["id"]), observation["predicate"])
+            expected_observation_rows.append(
+                {
+                    "id": observation_id,
+                    "subject_id": observation["subject_id"],
+                    "predicate": observation["predicate"],
+                    "evidence_id": str(evidence["id"]),
+                    "value_json": observation["value_json"],
+                    "normalized_value_json": observation["value_json"],
+                    "value_hash": observation["value_hash"],
+                    "observation_kind": "structured_value",
+                    "observed_at": evidence["retrieved_at"],
+                    "extraction_method": "legacy_import",
+                    "extractor_name": BACKFILL_COLLECTOR_NAME,
+                    "extractor_version": BACKFILL_VERSION,
+                }
             )
+            expected_fact_ids.append(_fact_id(observation_id))
+        expected_observation_rows.sort(key=lambda item: str(item["id"]))
+        expected_fact_ids.sort()
+
+        cursor = conn.execute(
+            "SELECT id,subject_id,predicate,evidence_id,value_json,normalized_value_json,value_hash,"
+            "observation_kind,observed_at,extraction_method,extractor_name,extractor_version "
+            "FROM observations WHERE evidence_id=? AND extraction_method='legacy_import' "
+            "AND extractor_name=? AND extractor_version=? ORDER BY id",
+            (evidence["id"], BACKFILL_COLLECTOR_NAME, BACKFILL_VERSION),
+        )
+        actual_observation_rows = [_row_dict(cursor, row) for row in cursor.fetchall()]
+        if actual_observation_rows != expected_observation_rows:
+            raise MapsBackfillError(
+                f"existing Maps backfill observation provenance is incomplete or inconsistent "
+                f"for business {business_id}"
+            )
+
+        cursor = conn.execute(
+            "SELECT f.id FROM facts f "
+            "JOIN fact_observation_support fos ON fos.fact_id=f.id "
+            "JOIN observations o ON o.id=fos.observation_id "
+            "WHERE o.evidence_id=? AND o.extraction_method='legacy_import' "
+            "AND o.extractor_name=? AND o.extractor_version=? "
+            "AND f.reconciliation_version=? ORDER BY f.id",
+            (
+                evidence["id"],
+                BACKFILL_COLLECTOR_NAME,
+                BACKFILL_VERSION,
+                RECONCILIATION_VERSION,
+            ),
+        )
+        actual_fact_ids = [str(row[0]) for row in cursor.fetchall()]
+        if actual_fact_ids != expected_fact_ids:
+            raise MapsBackfillError(
+                f"existing Maps backfill fact provenance is incomplete or inconsistent "
+                f"for business {business_id}"
+            )
+
+        for observation in expected_observations:
+            observation_id = _observation_id(str(evidence["id"]), observation["predicate"])
+            fact_id = _fact_id(observation_id)
+            fact = _fetch_one(
+                conn,
+                "SELECT id,subject_id,predicate,fact_slot,value_json,normalized_value_json,"
+                "value_hash,status,valid_from,last_verified_at,reconciliation_version "
+                "FROM facts WHERE id=?",
+                (fact_id,),
+            )
+            expected_fact = {
+                "id": fact_id,
+                "subject_id": observation["subject_id"],
+                "predicate": observation["predicate"],
+                "fact_slot": observation["fact_slot"],
+                "value_json": observation["value_json"],
+                "normalized_value_json": observation["value_json"],
+                "value_hash": observation["value_hash"],
+                "status": "single_source",
+                "valid_from": evidence["retrieved_at"],
+                "last_verified_at": evidence["retrieved_at"],
+                "reconciliation_version": RECONCILIATION_VERSION,
+            }
+            if fact != expected_fact:
+                raise MapsBackfillError(
+                    f"existing Maps backfill fact provenance is incomplete or inconsistent "
+                    f"for business {business_id}, predicate {observation['predicate']}"
+                )
+
+            support_cursor = conn.execute(
+                "SELECT observation_id,support_role FROM fact_observation_support "
+                "WHERE fact_id=? ORDER BY observation_id,support_role",
+                (fact_id,),
+            )
+            support_rows = [
+                _row_dict(support_cursor, support_row)
+                for support_row in support_cursor.fetchall()
+            ]
+            if support_rows != [
+                {"observation_id": observation_id, "support_role": "supports"}
+            ]:
+                raise MapsBackfillError(
+                    f"existing Maps backfill support provenance is incomplete or inconsistent "
+                    f"for business {business_id}, predicate {observation['predicate']}"
+                )
 
 
 def backfill_maps_business_understanding(conn: sqlite3.Connection) -> MapsBackfillStats:
