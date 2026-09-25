@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from .core import VALUE_STATUSES, row_dict
+from .core import row_dict
 
 
 def attach_provenance(
@@ -138,16 +138,24 @@ def attach_provenance(
                         "observation_id": support["observation_id"],
                     }
                 )
-        if fact["status"] in VALUE_STATUSES and not any(
+        if fact["status"] in {"confirmed", "single_source", "stale"} and not any(
             support["support_role"] == "supports" for support in fact["observation_support"]
         ):
             issues.append({"code": "value_fact_without_supporting_observation", "fact_id": fact_id})
+        if fact["status"] == "conflicted" and len(fact["observation_support"]) < 2:
+            issues.append({"code": "conflicted_fact_without_multiple_observations", "fact_id": fact_id})
         if fact["status"] == "not_observed" and not fact["acquisition_support"]:
             issues.append({"code": "not_observed_without_acquisition_support", "fact_id": fact_id})
 
     for evidence in evidence_by_id.values():
         evidence["observations"].sort(key=lambda item: str(item["id"]))
-    issues.sort(key=lambda item: (str(item["code"]), str(item.get("fact_id", "")), str(item.get("observation_id", ""))))
+    issues.sort(
+        key=lambda item: (
+            str(item["code"]),
+            str(item.get("fact_id", "")),
+            str(item.get("observation_id", "")),
+        )
+    )
     return [evidence_by_id[key] for key in sorted(evidence_by_id)], issues
 
 
