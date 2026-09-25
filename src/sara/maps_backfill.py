@@ -605,11 +605,9 @@ def _verify_complete_coverage(
 ) -> None:
     """Verify original Phase-3 anchors and immutable provenance, not mutable Maps state."""
     source = _source_registry_row(conn)
-    expected_source = _expected_source_registry_row()
-    if source != expected_source:
+    if source is None or source["source_type"] != "google_maps":
         raise MapsBackfillError(
-            f"existing Maps backfill source registry drift: database={source!r}, "
-            f"expected={expected_source!r}"
+            f"existing Maps backfill source identity/type drift: database={source!r}"
         )
 
     evidence_by_business = _backfill_evidence_by_business(conn)
