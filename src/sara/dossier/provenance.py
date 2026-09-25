@@ -1,9 +1,33 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
-from .core import row_dict
+from .core import json_value, row_dict
+
+
+def _semantic_key(value: Any, normalized_value: Any, value_hash: object) -> str | None:
+    semantic = normalized_value if normalized_value is not None else value
+    if semantic is not None:
+        return json.dumps(semantic, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if isinstance(value_hash, str) and value_hash:
+        return f"hash:{value_hash}"
+    return None
+
+
+def _support_matches_fact(fact: dict[str, Any], support: dict[str, Any]) -> bool:
+    fact_hash = fact.get("value_hash")
+    observation_hash = support.get("observation_value_hash")
+    if isinstance(fact_hash, str) and fact_hash and isinstance(observation_hash, str) and observation_hash:
+        return fact_hash == observation_hash
+    fact_key = _semantic_key(fact.get("value"), fact.get("normalized_value"), fact_hash)
+    observation_key = _semantic_key(
+        support.get("observation_value"),
+        support.get("observation_normalized_value"),
+        observation_hash,
+    )
+    return fact_key is not None and fact_key == observation_key
 
 
 def attach_provenance(
@@ -28,6 +52,9 @@ def attach_provenance(
     cursor = conn.execute(
         "SELECT fos.fact_id,fos.support_role,o.id AS observation_id,"
         "o.subject_id AS observation_subject_id,o.predicate AS observation_predicate,"
+        "o.value_json AS observation_value_json,"
+        "o.normalized_value_json AS observation_normalized_value_json,"
+        "o.value_hash AS observation_value_hash,o.observation_kind,"
         "o.observed_at,o.extracted_at,o.extraction_method,o.extractor_name,o.extractor_version,"
         "o.confidence,e.id AS evidence_id,e.source_id,e.source_locator,e.source_role,"
         "e.status AS evidence_status,e.retrieved_at,e.published_at,e.language,e.media_type,"
@@ -48,13 +75,25 @@ def attach_provenance(
         item = row_dict(cursor, row)
         fact_id = str(item["fact_id"])
         joined_observation_counts[fact_id] = joined_observation_counts.get(fact_id, 0) + 1
+        observation_value = json_value(
+            item["observation_value_json"],
+            field=f"observation {item['observation_id']} value_json",
+        )
+        observation_normalized_value = json_value(
+            item["observation_normalized_value_json"],
+            field=f"observation {item['observation_id']} normalized_value_json",
+        )
         support = {
             "support_role": item["support_role"],
             "observation_id": item["observation_id"],
             "observation_subject_id": item["observation_subject_id"],
             "observation_predicate": item["observation_predicate"],
+            "observation_value": observation_value,
+            "observation_normalized_value": observation_normalized_value,
+            "observation_value_hash": item["observation_value_hash"],
             "evidence_id": item["evidence_id"],
             "source_id": item["source_id"],
+            "evidence_status": item["evidence_status"],
         }
         fact_by_id[fact_id]["observation_support"].append(support)
         evidence_id = str(item["evidence_id"])
@@ -87,6 +126,10 @@ def attach_provenance(
             "id": item["observation_id"],
             "subject_id": item["observation_subject_id"],
             "predicate": item["observation_predicate"],
+            "value": observation_value,
+            "normalized_value": observation_normalized_value,
+            "value_hash": item["observation_value_hash"],
+            "observation_kind": item["observation_kind"],
             "observed_at": item["observed_at"],
             "extracted_at": item["extracted_at"],
             "extraction_method": item["extraction_method"],
@@ -126,6 +169,7 @@ def attach_provenance(
             issues.append({"code": "broken_observation_provenance", "fact_id": fact_id})
         if raw_acquisition_counts.get(fact_id, 0) != joined_acquisition_counts.get(fact_id, 0):
             issues.append({"code": "broken_acquisition_provenance", "fact_id": fact_id})
+
         for support in fact["observation_support"]:
             if (
                 support["observation_subject_id"] != fact["subject_id"]
@@ -138,12 +182,59 @@ def attach_provenance(
                         "observation_id": support["observation_id"],
                     }
                 )
+            if support["evidence_status"] != "usable":
+                issues.append(
+                    {
+                        "code": "fact_support_uses_nonusable_evidence",
+                        "fact_id": fact_id,
+                        "observation_id": support["observation_id"],
+                        "evidence_id": support["evidence_id"],
+                        "evidence_status": support["evidence_status"],
+                    }
+                )
+            if (
+                fact["status"] in {"confirmed", "single_source", "stale"}
+                and support["support_role"] == "supports"
+                and not _support_matches_fact(fact, support)
+            ):
+                issues.append(
+                    {
+                        "code": "support_observation_value_mismatch",
+                        "fact_id": fact_id,
+                        "observation_id": support["observation_id"],
+                    }
+                )
+
         if fact["status"] in {"confirmed", "single_source", "stale"} and not any(
             support["support_role"] == "supports" for support in fact["observation_support"]
         ):
             issues.append({"code": "value_fact_without_supporting_observation", "fact_id": fact_id})
-        if fact["status"] == "conflicted" and len(fact["observation_support"]) < 2:
-            issues.append({"code": "conflicted_fact_without_multiple_observations", "fact_id": fact_id})
+
+        if fact["status"] == "conflicted":
+            if len(fact["observation_support"]) < 2:
+                issues.append(
+                    {"code": "conflicted_fact_without_multiple_observations", "fact_id": fact_id}
+                )
+            semantic_values = {
+                key
+                for support in fact["observation_support"]
+                if (
+                    key := _semantic_key(
+                        support["observation_value"],
+                        support["observation_normalized_value"],
+                        support["observation_value_hash"],
+                    )
+                )
+                is not None
+            }
+            if len(semantic_values) < 2:
+                issues.append(
+                    {
+                        "code": "conflicted_fact_without_distinct_observation_values",
+                        "fact_id": fact_id,
+                    }
+                )
+
         if fact["status"] == "not_observed" and not fact["acquisition_support"]:
             issues.append({"code": "not_observed_without_acquisition_support", "fact_id": fact_id})
 
