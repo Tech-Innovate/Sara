@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -101,6 +103,84 @@ def test_rerun_rejects_anchor_only_state_without_phase3_provenance(tmp_path: Pat
     assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM evidence_items").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+
+
+def test_rerun_rejects_retained_evidence_with_zero_observations_and_facts(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "zero-provenance.sqlite")
+    add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM evidence_items").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 10
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 10
+
+    conn.execute("DELETE FROM fact_observation_support")
+    conn.execute("DELETE FROM facts")
+    conn.execute("DELETE FROM observations")
+    conn.commit()
+
+    with pytest.raises(
+        mb.MapsBackfillError,
+        match="observation provenance is incomplete or inconsistent",
+    ):
+        mb.backfill_maps_business_understanding(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM evidence_items").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
+
+
+def test_rerun_rejects_equal_counts_with_substituted_provenance_value(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "substituted-provenance.sqlite")
+    add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    observation_id = str(
+        conn.execute("SELECT id FROM observations ORDER BY id LIMIT 1").fetchone()[0]
+    )
+    fact_id = str(
+        conn.execute(
+            "SELECT fact_id FROM fact_observation_support WHERE observation_id=?",
+            (observation_id,),
+        ).fetchone()[0]
+    )
+    replacement_json = json.dumps(
+        "substituted", ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    replacement_hash = hashlib.sha256(replacement_json.encode("utf-8")).hexdigest()
+    conn.execute(
+        "UPDATE observations SET value_json=?,normalized_value_json=?,value_hash=? WHERE id=?",
+        (replacement_json, replacement_json, replacement_hash, observation_id),
+    )
+    conn.execute(
+        "UPDATE facts SET value_json=?,normalized_value_json=?,value_hash=? WHERE id=?",
+        (replacement_json, replacement_json, replacement_hash, fact_id),
+    )
+    conn.commit()
+
+    assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 10
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 10
+    assert conn.execute("SELECT COUNT(*) FROM fact_observation_support").fetchone()[0] == 10
+
+    with pytest.raises(
+        mb.MapsBackfillError,
+        match="observation provenance is incomplete or inconsistent",
+    ):
+        mb.backfill_maps_business_understanding(conn)
+
+
+def test_rerun_accepts_original_fact_after_later_version_closure(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "closed-fact-version.sqlite")
+    add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    conn.execute("UPDATE facts SET valid_to='2026-09-26T00:00:00+00:00'")
+    conn.commit()
+
+    rerun = mb.backfill_maps_business_understanding(conn)
+    assert rerun.already_backfilled is True
+    assert rerun.business_count == 1
+    assert rerun.facts_created == 0
 
 
 def test_external_identifier_timestamps_record_import_observation_time(
