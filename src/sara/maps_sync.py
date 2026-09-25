@@ -319,7 +319,7 @@ def _link_business(
 def _identifier_row(conn: sqlite3.Connection, namespace: str, value: str) -> dict[str, Any] | None:
     return mb._fetch_one(
         conn,
-        "SELECT id,subject_id,status,first_observed_at,last_observed_at,created_at "
+        "SELECT id,subject_id,source_id,namespace,value,status,first_observed_at,last_observed_at,created_at "
         "FROM external_identifiers WHERE source_id=? AND namespace=? AND value=?",
         (mb.GOOGLE_MAPS_SOURCE_ID, namespace, value),
     )
@@ -835,6 +835,61 @@ def _verify_common_evidence(
     return metadata
 
 
+def _verify_phase3_identifier_rows(
+    conn: sqlite3.Connection,
+    *,
+    evidence: dict[str, Any],
+    evidence_id: str,
+    location_id: str,
+    identifiers: list[dict[str, str]],
+) -> None:
+    for identifier in identifiers:
+        namespace = identifier["namespace"]
+        value = identifier["value"]
+        row = _identifier_row(conn, namespace, value)
+        expected = {
+            "id": mb._external_identifier_id(namespace, value),
+            "subject_id": location_id,
+            "source_id": mb.GOOGLE_MAPS_SOURCE_ID,
+            "namespace": namespace,
+            "value": value,
+            "first_observed_at": evidence["created_at"],
+            "created_at": evidence["created_at"],
+        }
+        if row is None or {key: row[key] for key in expected} != expected:
+            raise MapsSyncError(
+                f"Phase-3 snapshot evidence {evidence_id} external identifier provenance "
+                f"is incomplete or inconsistent for namespace {namespace}"
+            )
+
+
+def _verify_sync_identifier_rows(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    location_id: str,
+    identifiers: list[dict[str, str]],
+) -> None:
+    canonical_location = _resolve_subject(conn, location_id, "location")
+    for identifier in identifiers:
+        namespace = identifier["namespace"]
+        value = identifier["value"]
+        row = _identifier_row(conn, namespace, value)
+        if (
+            row is None
+            or row["id"] != mb._external_identifier_id(namespace, value)
+            or row["source_id"] != mb.GOOGLE_MAPS_SOURCE_ID
+            or row["namespace"] != namespace
+            or row["value"] != value
+            or row["status"] != "active"
+            or _resolve_subject(conn, str(row["subject_id"]), "location") != canonical_location
+        ):
+            raise MapsSyncError(
+                f"sync evidence {evidence_id} external identifier provenance is incomplete "
+                f"or inconsistent for namespace {namespace}"
+            )
+
+
 def _verify_phase3_snapshot(
     conn: sqlite3.Connection,
     *,
@@ -861,7 +916,7 @@ def _verify_phase3_snapshot(
     if metadata.get("import_kind") != "legacy_maps_business_snapshot":
         raise MapsSyncError(f"Phase-3 evidence {evidence_id} has incompatible import kind")
     try:
-        mb._parse_phase3_identifier_snapshot(evidence_id, metadata)
+        phase3_identifiers = mb._parse_phase3_identifier_snapshot(evidence_id, metadata)
     except mb.MapsBackfillError as exc:
         raise MapsSyncError(str(exc)) from exc
 
@@ -869,6 +924,13 @@ def _verify_phase3_snapshot(
     location_id = mb.location_id_for_maps_business(business_id)
     _subject(conn, entity_id, "business_entity")
     _subject(conn, location_id, "location")
+    _verify_phase3_identifier_rows(
+        conn,
+        evidence=evidence,
+        evidence_id=evidence_id,
+        location_id=location_id,
+        identifiers=phase3_identifiers,
+    )
     observations = _snapshot_observations(raw, entity_id=entity_id, location_id=location_id)
     observation_ids = [
         mb._observation_id(evidence_id, observation["predicate"])
@@ -926,7 +988,9 @@ def _verify_sync_snapshot(
     )
     if set(metadata) != _SYNC_METADATA_KEYS or metadata.get("import_kind") != "maps_sync_snapshot":
         raise MapsSyncError(f"sync evidence {evidence_id} metadata contract is inconsistent")
-    _parse_identifier_snapshot(evidence_id, metadata.get("sync_external_identifiers"))
+    sync_identifiers = _parse_identifier_snapshot(
+        evidence_id, metadata.get("sync_external_identifiers")
+    )
     entity_id = metadata.get("sync_entity_id")
     location_id = metadata.get("sync_location_id")
     if not isinstance(entity_id, str) or not isinstance(location_id, str):
@@ -940,6 +1004,12 @@ def _verify_sync_snapshot(
     )
     if owner is None or owner["business_entity_id"] != entity_id:
         raise MapsSyncError(f"sync evidence {evidence_id} frozen subject ownership is inconsistent")
+    _verify_sync_identifier_rows(
+        conn,
+        evidence_id=evidence_id,
+        location_id=location_id,
+        identifiers=sync_identifiers,
+    )
 
     observations = _snapshot_observations(raw, entity_id=entity_id, location_id=location_id)
     observation_ids = [
@@ -1221,6 +1291,17 @@ def sync_maps_business_understanding(conn: sqlite3.Connection) -> MapsSyncStats:
             run = _latest_run(conn, business)
             raw = _parse_raw(business)
             identifiers = _identifier_snapshot(business)
+            session_id, session_kind, session_created = _ensure_session(conn, run)
+            content_hash = mb._sha256_text(str(business["raw_json"]))
+            _existing_snapshot(
+                conn,
+                session_id=session_id,
+                session_kind=session_kind,
+                business=business,
+                run=run,
+                raw=raw,
+                content_hash=content_hash,
+            )
 
             link = mb._fetch_one(
                 conn,
@@ -1324,7 +1405,6 @@ def sync_maps_business_understanding(conn: sqlite3.Connection) -> MapsSyncStats:
                 identifiers_refreshed += refreshed
                 locations_merged += merged
 
-            session_id, session_kind, session_created = _ensure_session(conn, run)
             (
                 new_sessions,
                 new_evidence,
