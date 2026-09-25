@@ -112,7 +112,7 @@ def test_rerun_rejects_anchor_only_state_without_phase3_provenance(tmp_path: Pat
     )
     conn.commit()
 
-    with pytest.raises(mb.MapsBackfillError, match="backfill source registry drift"):
+    with pytest.raises(mb.MapsBackfillError, match="backfill source identity/type drift"):
         mb.backfill_maps_business_understanding(conn)
 
     assert conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0] == 0
