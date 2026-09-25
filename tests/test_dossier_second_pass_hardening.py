@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime, timezone
+
+from sara.dossier import surface
 from sara.dossier.integrity import (
     additional_assessment_integrity,
     additional_fact_integrity,
@@ -125,3 +129,75 @@ def test_sealed_assessment_nonnegative_consistent_counts_are_accepted() -> None:
         ]
     }
     assert additional_assessment_integrity(assessment) == []
+
+
+def test_build_business_dossier_surfaces_independent_integrity_findings(monkeypatch) -> None:
+    fact = _single_source_fact(
+        {
+            "support_role": "supports",
+            "source_id": "source-a",
+            "evidence_status": "usable",
+        },
+        {
+            "support_role": "supports",
+            "source_id": "source-b",
+            "evidence_status": "usable",
+        },
+    )
+    assessment = {
+        "id": "assessment",
+        "integrity_issues": [],
+        "domains": [
+            {
+                "domain": "identity",
+                "fact_count": 1,
+                "fresh_fact_count": 2,
+            }
+        ],
+    }
+
+    monkeypatch.setattr(surface, "verify_schema", lambda _conn: None)
+    monkeypatch.setattr(
+        surface,
+        "evaluation_time",
+        lambda _value: datetime(2026, 9, 26, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        surface,
+        "resolve_selection",
+        lambda _conn, **_kwargs: ("entity", {"kind": "entity_id", "value": "entity"}),
+    )
+    monkeypatch.setattr(surface, "entity_record", lambda _conn, _entity: {"id": "entity"})
+    monkeypatch.setattr(surface, "locations", lambda _conn, _entity: ([], []))
+    monkeypatch.setattr(
+        surface,
+        "enrich_location_aliases",
+        lambda _conn, **kwargs: kwargs["location_rows"],
+    )
+    monkeypatch.setattr(surface, "current_facts", lambda *_args: [fact])
+    monkeypatch.setattr(surface, "attach_provenance", lambda *_args: ([], []))
+    monkeypatch.setattr(surface, "controlled_unknowns", lambda *_args: [])
+    monkeypatch.setattr(surface, "persisted_assessment", lambda *_args: assessment)
+    monkeypatch.setattr(surface, "maps_businesses", lambda *_args: [])
+    monkeypatch.setattr(surface, "preview_domains", lambda *_args: [])
+
+    conn = sqlite3.connect(":memory:")
+    dossier = surface.build_business_dossier(conn, entity_id="entity")
+    conn.close()
+
+    assert dossier["integrity_issues"] == [
+        {
+            "code": "single_source_usable_source_count_mismatch",
+            "fact_id": "fact_single",
+            "usable_source_count": 2,
+            "source_ids": ["source-a", "source-b"],
+        }
+    ]
+    assert dossier["dossier_status"]["persisted_current_policy"]["integrity_issues"] == [
+        {
+            "code": "fresh_fact_count_exceeds_fact_count",
+            "domain": "identity",
+            "fact_count": 1,
+            "fresh_fact_count": 2,
+        }
+    ]
