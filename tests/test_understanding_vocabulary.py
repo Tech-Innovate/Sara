@@ -111,9 +111,9 @@ def test_seed_is_explicit_idempotent_and_does_not_create_business_state(tmp_path
     conn.close()
 
 
-def test_seed_requires_phase_one_and_no_outer_transaction(tmp_path: Path) -> None:
+def test_seed_requires_exact_phase_one_history_and_no_outer_transaction(tmp_path: Path) -> None:
     conn = storage_connect(tmp_path / "unmigrated.sqlite")
-    with pytest.raises(VocabularySeedError, match="migration v1"):
+    with pytest.raises(VocabularySeedError, match="schema version 1 exactly"):
         seed_business_understanding_vocabulary(conn)
 
     apply_migrations(conn)
@@ -122,6 +122,27 @@ def test_seed_requires_phase_one_and_no_outer_transaction(tmp_path: Path) -> Non
         seed_business_understanding_vocabulary(conn)
     conn.rollback()
     conn.close()
+
+    tampered = migrated_conn(tmp_path / "tampered.sqlite")
+    tampered.execute(
+        "UPDATE schema_migrations SET checksum = ? WHERE version = 1",
+        ("0" * 64,),
+    )
+    tampered.commit()
+    with pytest.raises(VocabularySeedError, match="history does not match"):
+        seed_business_understanding_vocabulary(tampered)
+    tampered.close()
+
+    future = migrated_conn(tmp_path / "future.sqlite")
+    future.execute(
+        "INSERT INTO schema_migrations(version, name, checksum, applied_at) "
+        "VALUES (2, 'future_schema', ?, 't2')",
+        ("f" * 64,),
+    )
+    future.commit()
+    with pytest.raises(VocabularySeedError, match="schema version 1 exactly"):
+        seed_business_understanding_vocabulary(future)
+    future.close()
 
 
 def test_seed_fails_closed_and_rolls_back_partial_inserts_on_semantic_drift(tmp_path: Path) -> None:
