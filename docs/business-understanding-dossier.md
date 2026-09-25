@@ -37,17 +37,18 @@ Locations carry `relationship_to_entity` so identity history remains inspectable
 The surface preserves Sara's semantic distinctions:
 
 - `unknown` means the fact cannot currently be established;
-- `not_observed` is only reported when that explicit fact state exists, and the integrity report flags a missing acquisition-support record;
+- `not_observed` is only reported when that explicit fact state exists; integrity checks require acquisition provenance and an absence-specific `supports_absence` support edge rather than treating generic research context as evidence of non-observation;
 - confirmed `false` remains a supported value and is not converted into an unknown;
+- `single_source` is checked against exactly one distinct usable supporting source; multiple observations from that same source still count as one source;
 - a controlled predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
 
-Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, and missing absence provenance rather than silently hiding them.
+Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, and missing absence provenance rather than silently hiding them.
 
 ## Dossier status
 
 If a sealed dossier assessment exists for the active dossier policy, the command returns the chronologically latest complete sealed snapshot. A sealed snapshot must contain every controlled dossier domain or the query fails closed.
 
-Persisted assessments are reported as immutable historical snapshots. Phase 5 does not claim that an old `analysis_ready` value remains current after later fact changes. Snapshot integrity issues such as impossible chronology or `analysis_ready` with a mandatory domain below sufficiency are surfaced separately.
+Persisted assessments are reported as immutable historical snapshots. Phase 5 does not claim that an old `analysis_ready` value remains current after later fact changes. Snapshot integrity issues such as impossible chronology, `fresh_fact_count > fact_count`, or `analysis_ready` with a mandatory domain below sufficiency are surfaced separately.
 
 The `read_only_preview` is intentionally conservative. It may expose states such as `not_started`, `insufficient`, `partial`, `stale`, `conflicted`, or `not_applicable`, but it never promotes a business to `sufficient`, `strong`, or `analysis_ready`. Exact sufficiency policy and persisted assessment computation remain separate work.
 
