@@ -15,6 +15,16 @@ def _single_source_fact(*supports: dict) -> dict:
         "id": "fact_single",
         "status": "single_source",
         "observation_support": list(supports),
+        "acquisition_support": [],
+    }
+
+
+def _not_observed_fact(*supports: dict) -> dict:
+    return {
+        "id": "fact_not_observed",
+        "status": "not_observed",
+        "observation_support": [],
+        "acquisition_support": list(supports),
     }
 
 
@@ -84,6 +94,27 @@ def test_multiple_support_observations_from_same_usable_source_still_count_as_si
             "source_id": "source-a",
             "evidence_status": "usable",
         },
+    )
+    assert additional_fact_integrity([fact]) == []
+
+
+def test_not_observed_requires_absence_specific_acquisition_support() -> None:
+    fact = _not_observed_fact(
+        {"support_role": "searched"},
+        {"support_role": "context"},
+    )
+    assert additional_fact_integrity([fact]) == [
+        {
+            "code": "not_observed_without_absence_support",
+            "fact_id": "fact_not_observed",
+        }
+    ]
+
+
+def test_not_observed_accepts_supports_absence_role() -> None:
+    fact = _not_observed_fact(
+        {"support_role": "searched"},
+        {"support_role": "supports_absence"},
     )
     assert additional_fact_integrity([fact]) == []
 
