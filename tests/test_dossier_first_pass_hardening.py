@@ -79,6 +79,10 @@ def _provenance_db() -> sqlite3.Connection:
             subject_id TEXT NOT NULL,
             predicate TEXT NOT NULL,
             evidence_id TEXT NOT NULL,
+            value_json TEXT,
+            normalized_value_json TEXT,
+            value_hash TEXT,
+            observation_kind TEXT NOT NULL,
             observed_at TEXT,
             extracted_at TEXT NOT NULL,
             extraction_method TEXT NOT NULL,
@@ -98,9 +102,7 @@ def _provenance_db() -> sqlite3.Connection:
         );
         """
     )
-    conn.execute(
-        "INSERT INTO sources VALUES ('source','official_web','Official',NULL,1)"
-    )
+    conn.execute("INSERT INTO sources VALUES ('source','official_web','Official',NULL,1)")
     conn.execute(
         "INSERT INTO acquisition_sessions VALUES "
         "('session','source','collector','1','complete','2026-09-01T00:00:00+00:00',"
@@ -117,10 +119,19 @@ def _provenance_db() -> sqlite3.Connection:
         "'2026-09-01T00:00:00+00:00',NULL,NULL,'text/html',NULL,NULL)"
     )
     for observation_id, evidence_id in (("o1", "e1"), ("o2", "e2")):
+        value_json = json.dumps(f"https://{observation_id}.example")
         conn.execute(
-            "INSERT INTO observations VALUES (?,?,?,?,'2026-09-01T00:00:00+00:00',"
-            "'2026-09-01T00:00:00+00:00','human_verified','test','1',1.0)",
-            (observation_id, "entity", "business.website.official", evidence_id),
+            "INSERT INTO observations VALUES (?,?,?,?,?,?,NULL,'structured_value',"
+            "'2026-09-01T00:00:00+00:00','2026-09-01T00:00:00+00:00',"
+            "'human_verified','test','1',1.0)",
+            (
+                observation_id,
+                "entity",
+                "business.website.official",
+                evidence_id,
+                value_json,
+                value_json,
+            ),
         )
     return conn
 
@@ -130,27 +141,66 @@ def _conflicted_fact() -> dict:
         "id": "fact_conflict",
         "subject_id": "entity",
         "predicate": "business.website.official",
+        "value": None,
+        "normalized_value": None,
+        "value_hash": None,
         "status": "conflicted",
         "observation_support": [],
         "acquisition_support": [],
     }
 
 
-def test_conflicted_fact_accepts_multiple_linked_observations_without_chosen_support_role() -> None:
+def _selected_fact(value: str) -> dict:
+    return {
+        "id": "fact_selected",
+        "subject_id": "entity",
+        "predicate": "business.website.official",
+        "value": value,
+        "normalized_value": value,
+        "value_hash": None,
+        "status": "confirmed",
+        "observation_support": [],
+        "acquisition_support": [],
+    }
+
+
+def test_conflicted_fact_accepts_distinct_linked_observations_without_chosen_support_role() -> None:
     conn = _provenance_db()
     conn.execute("INSERT INTO fact_observation_support VALUES ('fact_conflict','o1','contradicts')")
     conn.execute("INSERT INTO fact_observation_support VALUES ('fact_conflict','o2','contradicts')")
-    _evidence, issues = attach_provenance(conn, [_conflicted_fact()])
+    evidence, issues = attach_provenance(conn, [_conflicted_fact()])
     codes = {item["code"] for item in issues}
     assert "value_fact_without_supporting_observation" not in codes
     assert "conflicted_fact_without_multiple_observations" not in codes
+    assert "conflicted_fact_without_distinct_observation_values" not in codes
+    assert {item["value"] for item in evidence[0]["observations"]} == {"https://o1.example"}
 
 
 def test_conflicted_fact_with_one_observation_is_flagged() -> None:
     conn = _provenance_db()
     conn.execute("INSERT INTO fact_observation_support VALUES ('fact_conflict','o1','contradicts')")
     _evidence, issues = attach_provenance(conn, [_conflicted_fact()])
-    assert {item["code"] for item in issues} >= {"conflicted_fact_without_multiple_observations"}
+    assert {item["code"] for item in issues} >= {
+        "conflicted_fact_without_multiple_observations",
+        "conflicted_fact_without_distinct_observation_values",
+    }
+
+
+def test_selected_fact_support_value_mismatch_is_visible_and_observation_value_is_exposed() -> None:
+    conn = _provenance_db()
+    conn.execute("INSERT INTO fact_observation_support VALUES ('fact_selected','o1','supports')")
+    evidence, issues = attach_provenance(conn, [_selected_fact("https://chosen.example")])
+    assert {item["code"] for item in issues} >= {"support_observation_value_mismatch"}
+    assert evidence[0]["observations"][0]["value"] == "https://o1.example"
+    assert evidence[0]["observations"][0]["normalized_value"] == "https://o1.example"
+
+
+def test_support_from_nonusable_evidence_is_visible() -> None:
+    conn = _provenance_db()
+    conn.execute("UPDATE evidence_items SET status='malformed' WHERE id='e1'")
+    conn.execute("INSERT INTO fact_observation_support VALUES ('fact_selected','o1','supports')")
+    _evidence, issues = attach_provenance(conn, [_selected_fact("https://o1.example")])
+    assert {item["code"] for item in issues} >= {"fact_support_uses_nonusable_evidence"}
 
 
 def _assessment_db() -> sqlite3.Connection:
