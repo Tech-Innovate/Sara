@@ -20,6 +20,11 @@ from .core import (
     verify_schema,
 )
 from .identity import enrich_location_aliases
+from .integrity import (
+    additional_assessment_integrity,
+    additional_fact_integrity,
+    sort_integrity_issues,
+)
 from .provenance import attach_provenance, controlled_unknowns
 from .status import persisted_assessment, preview_domains
 
@@ -59,8 +64,18 @@ def build_business_dossier(
     )
     facts = current_facts(conn, canonical_entity_id, current_location_ids, evaluation)
     evidence, integrity_issues = attach_provenance(conn, facts)
+    integrity_issues = sort_integrity_issues(
+        [*integrity_issues, *additional_fact_integrity(facts)]
+    )
     unknowns = controlled_unknowns(conn, canonical_entity_id, current_location_ids, facts)
     persisted = persisted_assessment(conn, canonical_entity_id)
+    if persisted is not None:
+        persisted["integrity_issues"] = sort_integrity_issues(
+            [
+                *persisted["integrity_issues"],
+                *additional_assessment_integrity(persisted),
+            ]
+        )
 
     return {
         "schema": "sara-business-dossier-v1",
