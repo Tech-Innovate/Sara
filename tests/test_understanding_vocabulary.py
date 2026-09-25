@@ -10,16 +10,19 @@ from sara.storage import connect as storage_connect
 from sara.understanding_vocabulary import (
     DOSSIER_DOMAIN_SEED_V1,
     DOSSIER_POLICY_VERSION,
+    PREDICATE_SEEDS,
+    PREDICATE_SEED_PHASE3,
     PREDICATE_SEED_V1,
     VOCABULARY_VERSION,
     VocabularySeedError,
     mandatory_dossier_domains,
     seed_business_understanding_vocabulary,
+    verify_business_understanding_vocabulary,
     vocabulary_checksum,
 )
 
 
-EXPECTED_PREDICATE_NAMES = (
+EXPECTED_PREDICATE_NAMES_V1 = (
     "business.name.trading",
     "business.category.primary",
     "business.website.official",
@@ -37,6 +40,9 @@ EXPECTED_PREDICATE_NAMES = (
     "reputation.rating",
     "reputation.review_count",
 )
+
+EXPECTED_PHASE3_PREDICATE_NAMES = ("location.operating_status",)
+EXPECTED_PREDICATE_NAMES = EXPECTED_PREDICATE_NAMES_V1 + EXPECTED_PHASE3_PREDICATE_NAMES
 
 EXPECTED_DOSSIER_DOMAINS = (
     "identity",
@@ -90,6 +96,7 @@ def test_seed_is_explicit_idempotent_and_does_not_create_business_state(tmp_path
 
     assert seed_business_understanding_vocabulary(conn) == EXPECTED_PREDICATE_NAMES
     assert seed_business_understanding_vocabulary(conn) == ()
+    verify_business_understanding_vocabulary(conn)
     assert current_schema_version(conn) == 1
 
     rows = list(
@@ -100,7 +107,7 @@ def test_seed_is_explicit_idempotent_and_does_not_create_business_state(tmp_path
         )
     )
     assert tuple(row[0] for row in rows) == EXPECTED_PREDICATE_NAMES
-    assert len(rows) == len(PREDICATE_SEED_V1)
+    assert len(rows) == len(PREDICATE_SEEDS)
 
     assert conn.execute("SELECT COUNT(*) FROM knowledge_subjects").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM business_entities").fetchone()[0] == 0
@@ -108,6 +115,34 @@ def test_seed_is_explicit_idempotent_and_does_not_create_business_state(tmp_path
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
     assert list(conn.execute("PRAGMA foreign_key_check")) == []
+    conn.close()
+
+
+def test_phase_three_predicate_upgrades_an_existing_phase_two_seed(tmp_path: Path) -> None:
+    conn = migrated_conn(tmp_path / "upgrade.sqlite")
+    for seed in PREDICATE_SEED_V1:
+        conn.execute(
+            "INSERT INTO predicate_definitions("
+            "name,domain,subject_kind,value_type,cardinality,reconciliation_policy,"
+            "freshness_days,description,active) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                seed.name,
+                seed.domain,
+                seed.subject_kind,
+                seed.value_type,
+                seed.cardinality,
+                seed.reconciliation_policy,
+                seed.freshness_days,
+                seed.description,
+                seed.active,
+            ),
+        )
+    conn.commit()
+
+    with pytest.raises(VocabularySeedError, match="location.operating_status"):
+        verify_business_understanding_vocabulary(conn)
+    assert seed_business_understanding_vocabulary(conn) == EXPECTED_PHASE3_PREDICATE_NAMES
+    verify_business_understanding_vocabulary(conn)
     conn.close()
 
 
@@ -187,18 +222,22 @@ def test_seed_detects_post_install_drift_in_mutable_metadata(tmp_path: Path) -> 
 
     with pytest.raises(VocabularySeedError, match="business.website.official"):
         seed_business_understanding_vocabulary(conn)
+    with pytest.raises(VocabularySeedError, match="business.website.official"):
+        verify_business_understanding_vocabulary(conn)
     conn.close()
 
 
 def test_domain_policy_matches_the_agreed_business_understanding_surface() -> None:
-    assert VOCABULARY_VERSION == "business-understanding-v1"
+    assert VOCABULARY_VERSION == "business-understanding-v2"
     assert DOSSIER_POLICY_VERSION == "business-understanding-v1"
-    assert tuple(seed.name for seed in PREDICATE_SEED_V1) == EXPECTED_PREDICATE_NAMES
+    assert tuple(seed.name for seed in PREDICATE_SEED_V1) == EXPECTED_PREDICATE_NAMES_V1
+    assert tuple(seed.name for seed in PREDICATE_SEED_PHASE3) == EXPECTED_PHASE3_PREDICATE_NAMES
+    assert tuple(seed.name for seed in PREDICATE_SEEDS) == EXPECTED_PREDICATE_NAMES
     assert tuple(seed.name for seed in DOSSIER_DOMAIN_SEED_V1) == EXPECTED_DOSSIER_DOMAINS
     assert mandatory_dossier_domains() == EXPECTED_MANDATORY_DOMAINS
 
     assert len(set(EXPECTED_PREDICATE_NAMES)) == len(EXPECTED_PREDICATE_NAMES)
     assert len(set(EXPECTED_DOSSIER_DOMAINS)) == len(EXPECTED_DOSSIER_DOMAINS)
-    assert {seed.domain for seed in PREDICATE_SEED_V1} <= set(EXPECTED_DOSSIER_DOMAINS)
+    assert {seed.domain for seed in PREDICATE_SEEDS} <= set(EXPECTED_DOSSIER_DOMAINS)
     assert set(EXPECTED_MANDATORY_DOMAINS) <= set(EXPECTED_DOSSIER_DOMAINS)
     assert len(vocabulary_checksum()) == 64
