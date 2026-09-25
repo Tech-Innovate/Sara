@@ -25,9 +25,16 @@ def enrich_location_aliases(
     for item in location_rows:
         owner = resolve_subject(conn, str(item["business_entity_id"]), "business_entity")
         item["original_owner_canonical_entity_id"] = str(owner["canonical"]["id"])
-        item["relationship_to_entity"] = (
-            "current" if item["current_for_entity"] else "historical_owned"
-        )
+        if item["current_for_entity"]:
+            relationship = "current"
+        elif (
+            str(item["canonical_location_id"]) in current
+            and len(item["resolution_chain"]) > 1
+        ):
+            relationship = "merged_alias"
+        else:
+            relationship = "historical_owned"
+        item["relationship_to_entity"] = relationship
 
     cursor = conn.execute(
         "SELECT bl.id,bl.business_entity_id,bl.label,bl.location_type,bl.created_at,bl.updated_at,"
