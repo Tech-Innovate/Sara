@@ -678,7 +678,7 @@ def _verify_complete_coverage(
             )
 
         cursor = conn.execute(
-            "SELECT f.id FROM facts f "
+            "SELECT DISTINCT f.id FROM facts f "
             "JOIN fact_observation_support fos ON fos.fact_id=f.id "
             "JOIN observations o ON o.id=fos.observation_id "
             "WHERE o.evidence_id=? AND o.extraction_method='legacy_import' "
@@ -728,17 +728,15 @@ def _verify_complete_coverage(
                 )
 
             support_cursor = conn.execute(
-                "SELECT observation_id,support_role FROM fact_observation_support "
-                "WHERE fact_id=? ORDER BY observation_id,support_role",
-                (fact_id,),
+                "SELECT support_role FROM fact_observation_support "
+                "WHERE fact_id=? AND observation_id=?",
+                (fact_id, observation_id),
             )
             support_rows = [
                 _row_dict(support_cursor, support_row)
                 for support_row in support_cursor.fetchall()
             ]
-            if support_rows != [
-                {"observation_id": observation_id, "support_role": "supports"}
-            ]:
+            if support_rows != [{"support_role": "supports"}]:
                 raise MapsBackfillError(
                     f"existing Maps backfill support provenance is incomplete or inconsistent "
                     f"for business {business_id}, predicate {observation['predicate']}"
