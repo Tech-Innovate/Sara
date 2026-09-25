@@ -84,7 +84,9 @@ def test_single_valued_facts_require_canonical_slot_and_one_current_value(
             "t0",
         ),
     )
-    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+    with pytest.raises(
+        sqlite3.IntegrityError, match="fact identity or current slot already exists"
+    ):
         conn.execute(
             _fact_sql(),
             (
