@@ -63,6 +63,21 @@ def add_complete_business(conn) -> int:
     return int(conn.execute("SELECT id FROM businesses").fetchone()[0])
 
 
+def disable_provenance_immutability_guards(conn) -> None:
+    trigger_names = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' "
+            "AND tbl_name IN ('observations','facts','fact_observation_support') "
+            "ORDER BY name"
+        )
+    ]
+    assert trigger_names
+    for trigger_name in trigger_names:
+        escaped_name = trigger_name.replace('"', '""')
+        conn.execute(f'DROP TRIGGER "{escaped_name}"')
+
+
 def test_rerun_rejects_anchor_only_state_without_phase3_provenance(tmp_path: Path) -> None:
     conn = prepared_conn(tmp_path / "anchor-only.sqlite")
     business_id = add_complete_business(conn)
@@ -114,6 +129,7 @@ def test_rerun_rejects_retained_evidence_with_zero_observations_and_facts(tmp_pa
     assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 10
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 10
 
+    disable_provenance_immutability_guards(conn)
     conn.execute("DELETE FROM fact_observation_support")
     conn.execute("DELETE FROM facts")
     conn.execute("DELETE FROM observations")
@@ -148,6 +164,7 @@ def test_rerun_rejects_equal_counts_with_substituted_provenance_value(tmp_path: 
         "substituted", ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     replacement_hash = hashlib.sha256(replacement_json.encode("utf-8")).hexdigest()
+    disable_provenance_immutability_guards(conn)
     conn.execute(
         "UPDATE observations SET value_json=?,normalized_value_json=?,value_hash=? WHERE id=?",
         (replacement_json, replacement_json, replacement_hash, observation_id),
