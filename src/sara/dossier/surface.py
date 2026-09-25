@@ -19,6 +19,7 @@ from .core import (
     resolve_selection,
     verify_schema,
 )
+from .identity import enrich_location_aliases
 from .provenance import attach_provenance, controlled_unknowns
 from .status import persisted_assessment, preview_domains
 
@@ -50,6 +51,12 @@ def build_business_dossier(
     )
     entity = entity_record(conn, canonical_entity_id)
     location_rows, current_location_ids = locations(conn, canonical_entity_id)
+    location_rows = enrich_location_aliases(
+        conn,
+        entity_id=canonical_entity_id,
+        location_rows=location_rows,
+        current_location_ids=current_location_ids,
+    )
     facts = current_facts(conn, canonical_entity_id, current_location_ids, evaluation)
     evidence, integrity_issues = attach_provenance(conn, facts)
     unknowns = controlled_unknowns(conn, canonical_entity_id, current_location_ids, facts)
