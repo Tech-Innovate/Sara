@@ -32,10 +32,10 @@ class DossierDomainSeed:
     description: str
 
 
-VOCABULARY_VERSION = "business-understanding-v1"
-DOSSIER_POLICY_VERSION = "business-understanding-v1"
-
-
+# Phase 2 installed the first 16 predicates. Phase 3 adds one predicate that
+# the v0.2 Maps-backfill contract explicitly requires for the legacy `status`
+# field. Keep the original tuple immutable so the historical phase boundary is
+# reviewable instead of silently redefining "v1" after it shipped.
 PREDICATE_SEED_V1: tuple[PredicateSeed, ...] = (
     PredicateSeed(
         "business.name.trading",
@@ -200,6 +200,25 @@ PREDICATE_SEED_V1: tuple[PredicateSeed, ...] = (
 )
 
 
+PREDICATE_SEED_PHASE3: tuple[PredicateSeed, ...] = (
+    PredicateSeed(
+        "location.operating_status",
+        "operations",
+        "location",
+        "text",
+        "single",
+        "latest_observed",
+        30,
+        "Current public operating status for a location as asserted by retained source evidence.",
+    ),
+)
+
+
+PREDICATE_SEEDS: tuple[PredicateSeed, ...] = PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3
+VOCABULARY_VERSION = "business-understanding-v2"
+DOSSIER_POLICY_VERSION = "business-understanding-v1"
+
+
 DOSSIER_DOMAIN_SEED_V1: tuple[DossierDomainSeed, ...] = (
     DossierDomainSeed("identity", True, "Who exactly is this business?"),
     DossierDomainSeed("classification", True, "What kind of business is it?"),
@@ -228,7 +247,7 @@ def vocabulary_checksum() -> str:
     payload = {
         "vocabulary_version": VOCABULARY_VERSION,
         "dossier_policy_version": DOSSIER_POLICY_VERSION,
-        "predicates": [asdict(seed) for seed in PREDICATE_SEED_V1],
+        "predicates": [asdict(seed) for seed in PREDICATE_SEEDS],
         "dossier_domains": [asdict(seed) for seed in DOSSIER_DOMAIN_SEED_V1],
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -257,7 +276,7 @@ def _predicate_values(seed: PredicateSeed) -> tuple[object, ...]:
 def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
     if current_schema_version(conn) != 1:
         raise VocabularySeedError(
-            "vocabulary seed v1 requires Business Understanding schema version 1 exactly"
+            "vocabulary seed v2 requires Business Understanding schema version 1 exactly"
         )
     expected = MIGRATIONS[0]
     row = conn.execute(
@@ -269,17 +288,41 @@ def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
         )
 
 
+def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
+    """Fail closed unless the current controlled predicate vocabulary is installed exactly."""
+    _require_exact_phase_one_history(conn)
+    for seed in PREDICATE_SEEDS:
+        row = conn.execute(
+            "SELECT domain, subject_kind, value_type, cardinality, "
+            "reconciliation_policy, freshness_days, description, active "
+            "FROM predicate_definitions WHERE name = ?",
+            (seed.name,),
+        ).fetchone()
+        if row is None:
+            raise VocabularySeedError(
+                f"controlled predicate {seed.name!r} is not installed; run vocabulary seeding first"
+            )
+        actual = tuple(row)
+        expected = _predicate_values(seed)
+        if actual != expected:
+            raise VocabularySeedError(
+                f"predicate seed drift for {seed.name!r}: "
+                f"database={actual!r}, expected={expected!r}"
+            )
+
+
 def seed_business_understanding_vocabulary(
     conn: sqlite3.Connection,
 ) -> tuple[str, ...]:
-    """Install the v1 controlled predicate vocabulary into a migrated database.
+    """Install the current controlled predicate vocabulary into a migrated database.
 
     The operation is explicit, transactional, idempotent, and fail-closed. If a
-    predicate name already exists, every seeded field must match this version
-    exactly; Phase 2 never silently rewrites an existing semantic definition.
+    predicate name already exists, every seeded field must match this build
+    exactly; seeding never silently rewrites an existing semantic definition.
 
-    Dossier-domain policy remains code-versioned in ``DOSSIER_DOMAIN_SEED_V1``.
-    Phase 2 does not create assessments, facts, entities, or acquisition data.
+    The original Phase-2 16-predicate tuple remains available as
+    ``PREDICATE_SEED_V1``. Current builds additionally install the Phase-3
+    operating-status predicate required by the Maps backfill contract.
     """
     if conn.in_transaction:
         raise VocabularySeedError(
@@ -296,7 +339,7 @@ def seed_business_understanding_vocabulary(
     inserted: list[str] = []
     try:
         conn.execute("BEGIN IMMEDIATE")
-        for seed in PREDICATE_SEED_V1:
+        for seed in PREDICATE_SEEDS:
             row = conn.execute(
                 "SELECT domain, subject_kind, value_type, cardinality, "
                 "reconciliation_policy, freshness_days, description, active "
