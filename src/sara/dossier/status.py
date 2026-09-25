@@ -23,7 +23,7 @@ def persisted_assessment(conn: sqlite3.Connection, entity_id: str) -> dict[str, 
     if not candidates:
         return None
 
-    _computed, _identifier, result = max(candidates, key=lambda item: (item[0], item[1]))
+    computed_at, _identifier, result = max(candidates, key=lambda item: (item[0], item[1]))
     result["analysis_ready"] = bool(result["analysis_ready"])
     result["summary"] = json_value(
         result.pop("summary_json"), field=f"dossier {result['id']} summary_json"
@@ -49,9 +49,31 @@ def persisted_assessment(conn: sqlite3.Connection, entity_id: str) -> dict[str, 
             f"sealed dossier assessment {result['id']!r} has incomplete domain coverage: "
             f"missing={sorted(expected - actual)!r}, unexpected={sorted(actual - expected)!r}"
         )
-    parse_timestamp(result["facts_as_of"], field=f"dossier {result['id']} facts_as_of")
-    parse_timestamp(result["sealed_at"], field=f"dossier {result['id']} sealed_at")
+
+    facts_as_of = parse_timestamp(result["facts_as_of"], field=f"dossier {result['id']} facts_as_of")
+    sealed_at = parse_timestamp(result["sealed_at"], field=f"dossier {result['id']} sealed_at")
+    integrity_issues: list[dict[str, Any]] = []
+    if facts_as_of > computed_at:
+        integrity_issues.append({"code": "facts_as_of_after_computed_at"})
+    if sealed_at < computed_at:
+        integrity_issues.append({"code": "sealed_before_computed_at"})
+    if result["analysis_ready"]:
+        mandatory = {seed.name for seed in DOSSIER_DOMAIN_SEED_V1 if seed.mandatory_for_initial_analysis}
+        below = sorted(
+            str(item["domain"])
+            for item in domains
+            if item["domain"] in mandatory and item["state"] not in {"sufficient", "strong", "not_applicable"}
+        )
+        if below:
+            integrity_issues.append(
+                {
+                    "code": "analysis_ready_with_mandatory_domain_below_sufficient",
+                    "domains": below,
+                }
+            )
+
     result["domains"] = domains
+    result["integrity_issues"] = integrity_issues
     result["snapshot_semantics"] = "immutable_historical_assessment_not_recomputed_by_phase5"
     return result
 
