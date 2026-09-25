@@ -135,3 +135,38 @@ def test_sync_rejects_existing_snapshot_with_missing_fact_support(tmp_path: Path
         match="(fact/support|support) provenance is incomplete",
     ):
         sync_maps_business_understanding(conn)
+
+
+def test_sync_rejects_phase4_snapshot_with_missing_external_identifier(tmp_path: Path) -> None:
+    conn = _phase4_fixture(tmp_path)
+    identifier_id = mb._external_identifier_id("place_id", "place-new")
+    conn.execute("DROP TRIGGER external_identifiers_no_delete")
+    conn.execute("DELETE FROM external_identifiers WHERE id=?", (identifier_id,))
+    conn.commit()
+    assert conn.execute(
+        "SELECT 1 FROM external_identifiers WHERE id=?", (identifier_id,)
+    ).fetchone() is None
+
+    with pytest.raises(MapsSyncError, match="external identifier provenance"):
+        sync_maps_business_understanding(conn)
+
+    assert conn.execute(
+        "SELECT 1 FROM external_identifiers WHERE id=?", (identifier_id,)
+    ).fetchone() is None
+
+
+def test_sync_rejects_phase3_snapshot_with_missing_external_identifier(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "phase3-identifier-loss.sqlite")
+    _ingest_complete(conn, "r1", "seed", "2026-09-23T10:00:00+00:00")
+    mb.backfill_maps_business_understanding(conn)
+    identifier_id = mb._external_identifier_id("place_id", "place-seed")
+    conn.execute("DROP TRIGGER external_identifiers_no_delete")
+    conn.execute("DELETE FROM external_identifiers WHERE id=?", (identifier_id,))
+    conn.commit()
+
+    with pytest.raises(MapsSyncError, match="external identifier provenance"):
+        sync_maps_business_understanding(conn)
+
+    assert conn.execute(
+        "SELECT 1 FROM external_identifiers WHERE id=?", (identifier_id,)
+    ).fetchone() is None
