@@ -6,21 +6,31 @@ from typing import Any
 def additional_fact_integrity(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     for fact in facts:
-        if fact["status"] != "single_source":
-            continue
-        usable_sources = {
-            str(support["source_id"])
-            for support in fact["observation_support"]
-            if support["support_role"] == "supports"
-            and support["evidence_status"] == "usable"
-        }
-        if len(usable_sources) != 1:
+        if fact["status"] == "single_source":
+            usable_sources = {
+                str(support["source_id"])
+                for support in fact["observation_support"]
+                if support["support_role"] == "supports"
+                and support["evidence_status"] == "usable"
+            }
+            if len(usable_sources) != 1:
+                issues.append(
+                    {
+                        "code": "single_source_usable_source_count_mismatch",
+                        "fact_id": fact["id"],
+                        "usable_source_count": len(usable_sources),
+                        "source_ids": sorted(usable_sources),
+                    }
+                )
+
+        if fact["status"] == "not_observed" and not any(
+            support["support_role"] == "supports_absence"
+            for support in fact["acquisition_support"]
+        ):
             issues.append(
                 {
-                    "code": "single_source_usable_source_count_mismatch",
+                    "code": "not_observed_without_absence_support",
                     "fact_id": fact["id"],
-                    "usable_source_count": len(usable_sources),
-                    "source_ids": sorted(usable_sources),
                 }
             )
     return issues
