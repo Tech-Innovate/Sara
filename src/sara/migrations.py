@@ -340,7 +340,14 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
         CHECK(status IN ('planned', 'running', 'complete', 'partial', 'blocked', 'failed', 'cancelled')),
         CHECK(length(config_hash) = 64),
         CHECK(evidence_count >= 0),
-        CHECK(observation_count >= 0)
+        CHECK(observation_count >= 0),
+        CHECK(
+            (status IN ('planned', 'running') AND finished_at IS NULL AND error IS NULL)
+            OR
+            (status = 'complete' AND finished_at IS NOT NULL AND error IS NULL)
+            OR
+            (status IN ('partial', 'blocked', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+        )
     )
     """,
     """
@@ -359,6 +366,43 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
       OR NEW.legacy_run_id IS NOT OLD.legacy_run_id
     BEGIN
         SELECT RAISE(ABORT, 'acquisition session identity/configuration is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_status_transition
+    BEFORE UPDATE OF status ON acquisition_sessions
+    WHEN NEW.status <> OLD.status
+      AND NOT (
+          (OLD.status = 'planned' AND NEW.status IN (
+              'running', 'complete', 'partial', 'blocked', 'failed', 'cancelled'
+          ))
+          OR
+          (OLD.status = 'running' AND NEW.status IN (
+              'complete', 'partial', 'blocked', 'failed', 'cancelled'
+          ))
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid acquisition session status transition');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_terminal_immutable
+    BEFORE UPDATE OF status, finished_at, error ON acquisition_sessions
+    WHEN OLD.status IN ('complete', 'partial', 'blocked', 'failed', 'cancelled')
+      AND (
+          NEW.status IS NOT OLD.status
+          OR NEW.finished_at IS NOT OLD.finished_at
+          OR NEW.error IS NOT OLD.error
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal acquisition session lifecycle is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_no_delete
+    BEFORE DELETE ON acquisition_sessions
+    BEGIN
+        SELECT RAISE(ABORT, 'acquisition sessions are durable history');
     END
     """,
     """
@@ -402,6 +446,13 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     BEFORE UPDATE ON evidence_items
     BEGIN
         SELECT RAISE(ABORT, 'evidence items are immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER evidence_items_no_delete
+    BEFORE DELETE ON evidence_items
+    BEGIN
+        SELECT RAISE(ABORT, 'evidence items are append-only');
     END
     """,
     """
@@ -515,6 +566,13 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     END
     """,
     """
+    CREATE TRIGGER observations_no_delete
+    BEFORE DELETE ON observations
+    BEGIN
+        SELECT RAISE(ABORT, 'observations are append-only');
+    END
+    """,
+    """
     CREATE INDEX ix_observations_subject_predicate
     ON observations(subject_id, predicate)
     """,
@@ -588,6 +646,13 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     END
     """,
     """
+    CREATE TRIGGER facts_no_delete
+    BEFORE DELETE ON facts
+    BEGIN
+        SELECT RAISE(ABORT, 'fact history is append-only');
+    END
+    """,
+    """
     CREATE UNIQUE INDEX ux_facts_current_slot
     ON facts(subject_id, predicate, fact_slot)
     WHERE valid_to IS NULL
@@ -609,6 +674,20 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TRIGGER fact_observation_support_immutable
+    BEFORE UPDATE ON fact_observation_support
+    BEGIN
+        SELECT RAISE(ABORT, 'fact observation support is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER fact_observation_support_no_delete
+    BEFORE DELETE ON fact_observation_support
+    BEGIN
+        SELECT RAISE(ABORT, 'fact observation support is append-only');
+    END
+    """,
+    """
     CREATE TABLE fact_acquisition_support (
         fact_id TEXT NOT NULL,
         acquisition_session_id TEXT NOT NULL,
@@ -618,6 +697,20 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
         FOREIGN KEY(acquisition_session_id) REFERENCES acquisition_sessions(id),
         CHECK(support_role IN ('searched', 'supports_absence', 'context'))
     )
+    """,
+    """
+    CREATE TRIGGER fact_acquisition_support_immutable
+    BEFORE UPDATE ON fact_acquisition_support
+    BEGIN
+        SELECT RAISE(ABORT, 'fact acquisition support is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER fact_acquisition_support_no_delete
+    BEFORE DELETE ON fact_acquisition_support
+    BEGIN
+        SELECT RAISE(ABORT, 'fact acquisition support is append-only');
+    END
     """,
     """
     CREATE TABLE business_relationships (
@@ -659,6 +752,20 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TRIGGER business_relationship_observation_support_immutable
+    BEFORE UPDATE ON business_relationship_observation_support
+    BEGIN
+        SELECT RAISE(ABORT, 'business relationship observation support is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER business_relationship_observation_support_no_delete
+    BEFORE DELETE ON business_relationship_observation_support
+    BEGIN
+        SELECT RAISE(ABORT, 'business relationship observation support is append-only');
+    END
+    """,
+    """
     CREATE TABLE dossier_assessments (
         id TEXT PRIMARY KEY,
         business_entity_id TEXT NOT NULL,
@@ -674,6 +781,13 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     """
     CREATE TRIGGER dossier_assessments_immutable
     BEFORE UPDATE ON dossier_assessments
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier assessments are immutable snapshots');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_assessments_no_delete
+    BEFORE DELETE ON dossier_assessments
     BEGIN
         SELECT RAISE(ABORT, 'dossier assessments are immutable snapshots');
     END
@@ -711,6 +825,13 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     """
     CREATE TRIGGER dossier_domain_assessments_immutable
     BEFORE UPDATE ON dossier_domain_assessments
+    BEGIN
+        SELECT RAISE(ABORT, 'dossier domain assessments are immutable snapshots');
+    END
+    """,
+    """
+    CREATE TRIGGER dossier_domain_assessments_no_delete
+    BEFORE DELETE ON dossier_domain_assessments
     BEGIN
         SELECT RAISE(ABORT, 'dossier domain assessments are immutable snapshots');
     END
@@ -815,6 +936,32 @@ def _has_unique_index(
     return False
 
 
+def _has_expected_partial_unique_index(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+) -> bool:
+    expected_where = f"where {column.lower()} is not null and {column.lower()} <> ''"
+    for row in conn.execute(f"PRAGMA index_list({table})"):
+        if int(row[2]) != 1 or int(row[4]) != 1:
+            continue
+        index_columns = [
+            str(info[2]) for info in conn.execute(f"PRAGMA index_info({row[1]})")
+        ]
+        if index_columns != [column]:
+            continue
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (row[1],),
+        ).fetchone()
+        if sql_row is None or sql_row[0] is None:
+            continue
+        normalized_sql = " ".join(str(sql_row[0]).lower().split())
+        if expected_where in normalized_sql:
+            return True
+    return False
+
+
 def _validate_core_constraints(conn: sqlite3.Connection) -> None:
     expected_pks = {
         "runs": ["id"],
@@ -831,9 +978,10 @@ def _validate_core_constraints(conn: sqlite3.Connection) -> None:
     if not _has_unique_index(conn, "businesses", ["canonical_key"], partial=False):
         raise MigrationError("Sara core table 'businesses' is missing canonical_key uniqueness")
     for column in ("place_id", "cid", "data_id"):
-        if not _has_unique_index(conn, "businesses", [column], partial=True):
+        if not _has_expected_partial_unique_index(conn, "businesses", column):
             raise MigrationError(
-                f"Sara core table 'businesses' is missing partial uniqueness for {column!r}"
+                "Sara core table 'businesses' is missing the required partial uniqueness "
+                f"predicate for {column!r}"
             )
 
     business_fks = _foreign_keys(conn, "businesses")
@@ -875,6 +1023,8 @@ def _validate_schema_migrations_table(conn: sqlite3.Connection) -> None:
             raise MigrationError(
                 f"schema_migrations column {row[1]!r} must be NOT NULL"
             )
+    if not _has_unique_index(conn, "schema_migrations", ["name"], partial=False):
+        raise MigrationError("schema_migrations.name must have a full UNIQUE constraint")
 
 
 def _load_applied(conn: sqlite3.Connection) -> dict[int, tuple[str, str, str]]:
