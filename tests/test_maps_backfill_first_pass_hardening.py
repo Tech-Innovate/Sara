@@ -102,7 +102,7 @@ def test_rerun_rejects_anchor_only_state_without_phase3_provenance(tmp_path: Pat
     conn.execute(
         "INSERT INTO business_locations("
         "id,business_entity_id,location_type,created_at,updated_at"
-        ") VALUES (?,?,'unknown',?,?)",
+        ") VALUES (?,?, 'unknown',?,?)",
         (location_id, entity_id, created_at, created_at),
     )
     conn.execute(
@@ -295,6 +295,58 @@ def test_rerun_accepts_mutable_source_registry_metadata(tmp_path: Path) -> None:
     assert rerun.already_backfilled is True
     assert rerun.business_count == 1
     assert rerun.facts_created == 0
+
+
+def test_rerun_rejects_missing_phase3_external_identifier(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "missing-identifier.sqlite")
+    add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    metadata = json.loads(
+        str(conn.execute("SELECT metadata_json FROM evidence_items").fetchone()[0])
+    )
+    assert metadata["phase3_external_identifiers"] == [
+        {"namespace": "place_id", "value": "place-a"},
+        {"namespace": "cid", "value": "cid-a"},
+        {"namespace": "data_id", "value": "data-a"},
+    ]
+
+    conn.execute("DROP TRIGGER external_identifiers_no_delete")
+    conn.execute("DELETE FROM external_identifiers WHERE namespace='cid'")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM external_identifiers").fetchone()[0] == 2
+
+    with pytest.raises(
+        mb.MapsBackfillError,
+        match="external identifier provenance is incomplete or inconsistent",
+    ):
+        mb.backfill_maps_business_understanding(conn)
+
+
+def test_rerun_uses_frozen_identifier_snapshot_not_current_maps_columns(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "identifier-snapshot.sqlite")
+    business_id = add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    conn.execute(
+        "UPDATE businesses SET cid='cid-later',data_id='data-later' WHERE id=?",
+        (business_id,),
+    )
+    conn.commit()
+
+    rerun = mb.backfill_maps_business_understanding(conn)
+    assert rerun.already_backfilled is True
+    assert rerun.business_count == 1
+    assert {
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(
+            "SELECT namespace,value FROM external_identifiers ORDER BY namespace"
+        )
+    } == {
+        ("place_id", "place-a"),
+        ("cid", "cid-a"),
+        ("data_id", "data-a"),
+    }
 
 
 def test_external_identifier_timestamps_record_import_observation_time(
