@@ -277,18 +277,26 @@ def _session_counts(prepared):
     return counts
 
 
-def _ensure_source(conn: sqlite3.Connection, created_at: str) -> None:
-    row = _fetch_one(
+def _source_registry_row(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    return _fetch_one(
         conn,
         "SELECT source_type,name,base_url,active FROM sources WHERE id=?",
         (GOOGLE_MAPS_SOURCE_ID,),
     )
-    expected = {
+
+
+def _expected_source_registry_row() -> dict[str, Any]:
+    return {
         "source_type": "google_maps",
         "name": "Google Maps",
         "base_url": None,
         "active": 1,
     }
+
+
+def _ensure_source(conn: sqlite3.Connection, created_at: str) -> None:
+    row = _source_registry_row(conn)
+    expected = _expected_source_registry_row()
     if row is None:
         conn.execute(
             "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
@@ -389,7 +397,6 @@ def _insert_identifiers(
     created_at: str,
 ) -> int:
     count = 0
-    observed_at = str(business["last_seen_at"])
     for namespace in ("place_id", "cid", "data_id"):
         value = _text(business.get(namespace))
         if not value:
@@ -413,8 +420,8 @@ def _insert_identifiers(
                 GOOGLE_MAPS_SOURCE_ID,
                 namespace,
                 value,
-                observed_at,
-                observed_at,
+                created_at,
+                created_at,
                 created_at,
             ),
         )
@@ -512,10 +519,73 @@ def _insert_provenance(
     return 1, len(observations), len(observations)
 
 
+def _backfill_evidence_by_business(
+    conn: sqlite3.Connection,
+) -> dict[int, dict[str, Any]]:
+    cursor = conn.execute(
+        "SELECT e.id,e.content_sha256,e.metadata_json,a.legacy_run_id "
+        "FROM evidence_items e "
+        "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+        "WHERE e.source_id=? AND a.source_id=? AND a.collector_name=? "
+        "AND a.collector_version=? AND a.status='complete' "
+        "AND e.source_role='platform' AND e.status='usable'",
+        (
+            GOOGLE_MAPS_SOURCE_ID,
+            GOOGLE_MAPS_SOURCE_ID,
+            BACKFILL_COLLECTOR_NAME,
+            BACKFILL_VERSION,
+        ),
+    )
+    result: dict[int, dict[str, Any]] = {}
+    for row in cursor.fetchall():
+        item = _row_dict(cursor, row)
+        try:
+            metadata = json.loads(str(item["metadata_json"]))
+        except json.JSONDecodeError as exc:
+            raise MapsBackfillError(
+                f"backfill evidence {item['id']} has malformed metadata_json"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise MapsBackfillError(
+                f"backfill evidence {item['id']} metadata_json is not an object"
+            )
+        if metadata.get("import_kind") != "legacy_maps_business_snapshot":
+            continue
+        legacy_business_id = metadata.get("legacy_business_id")
+        if not isinstance(legacy_business_id, int):
+            raise MapsBackfillError(
+                f"backfill evidence {item['id']} has invalid legacy_business_id"
+            )
+        raw_json = metadata.get("raw_json")
+        if not isinstance(raw_json, str) or _sha256_text(raw_json) != item["content_sha256"]:
+            raise MapsBackfillError(
+                f"backfill evidence {item['id']} content hash does not match retained raw_json"
+            )
+        if str(metadata.get("legacy_run_id")) != str(item["legacy_run_id"]):
+            raise MapsBackfillError(
+                f"backfill evidence {item['id']} legacy run provenance is inconsistent"
+            )
+        if legacy_business_id in result:
+            raise MapsBackfillError(
+                f"multiple immutable Phase-3 evidence items claim Maps business {legacy_business_id}"
+            )
+        result[legacy_business_id] = item
+    return result
+
+
 def _verify_complete_coverage(
     conn: sqlite3.Connection, businesses: list[dict[str, Any]]
 ) -> None:
-    """Verify the durable one-to-one anchor only; later phases own fact refreshes."""
+    """Verify original Phase-3 anchors and immutable provenance, not mutable Maps state."""
+    source = _source_registry_row(conn)
+    expected_source = _expected_source_registry_row()
+    if source != expected_source:
+        raise MapsBackfillError(
+            f"existing Maps backfill source registry drift: database={source!r}, "
+            f"expected={expected_source!r}"
+        )
+
+    evidence_by_business = _backfill_evidence_by_business(conn)
     for business in businesses:
         business_id = int(business["id"])
         expected_entity = business_entity_id_for_maps_business(business_id)
@@ -535,14 +605,50 @@ def _verify_complete_coverage(
                 f"existing Maps backfill anchor drift for business {business_id}"
             )
 
+        evidence = evidence_by_business.get(business_id)
+        if evidence is None:
+            raise MapsBackfillError(
+                f"existing Maps backfill provenance is incomplete for business {business_id}"
+            )
+        observation_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM observations "
+                "WHERE evidence_id=? AND extraction_method='legacy_import' "
+                "AND extractor_name=? AND extractor_version=?",
+                (evidence["id"], BACKFILL_COLLECTOR_NAME, BACKFILL_VERSION),
+            ).fetchone()[0]
+        )
+        support_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM facts f "
+                "JOIN fact_observation_support fos "
+                "ON fos.fact_id=f.id AND fos.support_role='supports' "
+                "JOIN observations o ON o.id=fos.observation_id "
+                "WHERE o.evidence_id=? AND o.extraction_method='legacy_import' "
+                "AND o.extractor_name=? AND o.extractor_version=? "
+                "AND f.reconciliation_version=? AND f.status='single_source'",
+                (
+                    evidence["id"],
+                    BACKFILL_COLLECTOR_NAME,
+                    BACKFILL_VERSION,
+                    RECONCILIATION_VERSION,
+                ),
+            ).fetchone()[0]
+        )
+        if support_count != observation_count:
+            raise MapsBackfillError(
+                f"existing Maps backfill fact provenance is incomplete for business {business_id}"
+            )
+
 
 def backfill_maps_business_understanding(conn: sqlite3.Connection) -> MapsBackfillStats:
     """Perform the one-time, conservative Phase-3 Maps backfill atomically.
 
     On first success every current canonical Maps business receives exactly one
     provisional Business Entity and one Location. A later call is a no-op when
-    every current row is already anchored. A mixed linked/unlinked state fails
-    closed so this operation cannot silently become the Phase-4 synchronizer.
+    every current row is already anchored and its immutable Phase-3 provenance
+    is still complete. A mixed linked/unlinked state fails closed so this
+    operation cannot silently become the Phase-4 synchronizer.
     """
     if conn.in_transaction:
         raise MapsBackfillError(
