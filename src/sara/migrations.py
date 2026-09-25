@@ -677,6 +677,19 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
     END
     """,
     """
+    CREATE TRIGGER facts_single_cardinality_slot_insert
+    BEFORE INSERT ON facts
+    WHEN NEW.fact_slot <> '__single__'
+      AND EXISTS (
+          SELECT 1
+          FROM predicate_definitions pd
+          WHERE pd.name = NEW.predicate AND pd.cardinality = 'single'
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'single-valued facts must use __single__ slot');
+    END
+    """,
+    """
     CREATE TRIGGER facts_version_immutable
     BEFORE UPDATE ON facts
     WHEN NEW.id IS NOT OLD.id
@@ -940,9 +953,69 @@ _REQUIRED_CORE_COLUMNS: dict[str, frozenset[str]] = {
     "run_businesses": frozenset({"run_id", "business_id", "first_observed_at"}),
 }
 
+_REQUIRED_CORE_TYPES: dict[str, dict[str, str]] = {
+    "runs": {
+        "id": "TEXT",
+        "area_name": "TEXT",
+        "bbox_json": "TEXT",
+        "cell_km": "REAL",
+        "depth": "INTEGER",
+        "queries_json": "TEXT",
+        "scraper_image": "TEXT",
+        "config_json": "TEXT",
+        "raw_path": "TEXT",
+        "status": "TEXT",
+        "started_at": "TEXT",
+        "finished_at": "TEXT",
+        "exit_code": "INTEGER",
+        "error": "TEXT",
+        "raw_records": "INTEGER",
+        "accepted_records": "INTEGER",
+        "out_of_bounds_records": "INTEGER",
+        "unlocated_records": "INTEGER",
+        "unidentified_records": "INTEGER",
+        "unique_seen": "INTEGER",
+        "new_businesses": "INTEGER",
+    },
+    "businesses": {
+        "id": "INTEGER",
+        "canonical_key": "TEXT",
+        "place_id": "TEXT",
+        "cid": "TEXT",
+        "data_id": "TEXT",
+        "title": "TEXT",
+        "category": "TEXT",
+        "address": "TEXT",
+        "latitude": "REAL",
+        "longitude": "REAL",
+        "phone": "TEXT",
+        "website": "TEXT",
+        "review_rating": "REAL",
+        "review_count": "INTEGER",
+        "status": "TEXT",
+        "first_seen_at": "TEXT",
+        "last_seen_at": "TEXT",
+        "first_run_id": "TEXT",
+        "last_run_id": "TEXT",
+        "raw_json": "TEXT",
+    },
+    "run_businesses": {
+        "run_id": "TEXT",
+        "business_id": "INTEGER",
+        "first_observed_at": "TEXT",
+    },
+}
+
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> frozenset[str]:
     return frozenset(str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def _table_column_types(conn: sqlite3.Connection, table: str) -> dict[str, str]:
+    return {
+        str(row[1]): str(row[2]).upper()
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
 
 
 def validate_core_schema(conn: sqlite3.Connection) -> None:
@@ -959,6 +1032,17 @@ def validate_core_schema(conn: sqlite3.Connection) -> None:
         if missing:
             raise MigrationError(
                 f"Sara core table {table!r} is missing required columns: {missing!r}"
+            )
+        actual_types = _table_column_types(conn, table)
+        incompatible_types = sorted(
+            (column, actual_types.get(column), expected_type)
+            for column, expected_type in _REQUIRED_CORE_TYPES[table].items()
+            if actual_types.get(column) != expected_type
+        )
+        if incompatible_types:
+            raise MigrationError(
+                f"Sara core table {table!r} has incompatible declared column types: "
+                f"{incompatible_types!r}"
             )
     _validate_core_constraints(conn)
 
