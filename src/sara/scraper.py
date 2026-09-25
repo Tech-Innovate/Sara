@@ -55,6 +55,10 @@ class ScrapeOptions:
             raise FileNotFoundError(self.proxy_file)
 
 
+class _ScrapeCommandBuildError(ValueError, RuntimeError):
+    """Invalid scrape options discovered while constructing a command."""
+
+
 @dataclass(frozen=True)
 class CompletionComparison:
     matched: int
@@ -69,8 +73,17 @@ def build_docker_command(
     output_file: Path,
     options: ScrapeOptions,
     prepare_paths: bool = True,
+    container_name: str | None = None,
+    labels: dict[str, str] | None = None,
 ) -> list[str]:
-    options.validate()
+    try:
+        options.validate()
+    except ValueError as exc:
+        # Recovery performs an initial plan/config validation before effects,
+        # but resumable launch paths build the command again after durable
+        # lifecycle transitions. Keep a late validation failure compatible
+        # with both ValueError callers and RuntimeError operational handlers.
+        raise _ScrapeCommandBuildError(str(exc)) from exc
     queries_file = queries_file.resolve()
     output_file = output_file.resolve()
 
@@ -96,6 +109,13 @@ def build_docker_command(
     command = [
         "docker", "run", "--rm",
         "-e", "DISABLE_TELEMETRY=1",
+    ]
+    if container_name is not None:
+        command += ["--name", container_name]
+    if labels:
+        for key in sorted(labels):
+            command += ["--label", f"{key}={labels[key]}"]
+    command += [
         "-v", "gmaps-playwright-cache:/opt",
         "-v", f"{queries_file}:/queries.txt:ro",
         "-v", f"{output_file.parent}:/out",
@@ -124,6 +144,25 @@ def build_docker_command(
     if options.proxy_file is not None:
         command += ["-proxies-file", "/run/secrets/gmaps-proxies"]
     return command
+
+
+def validate_recovery_queries(queries: list[str]) -> None:
+    """Reject queries that cannot map one-to-one onto physical file records.
+
+    Embedded newlines would expand one logical query into several physical
+    query-file lines, invalidating any exact planned-search acknowledgment.
+    Identity validation then mirrors the upstream resume parser so duplicate
+    resume identities fail before any external effect.
+    """
+    for query in queries:
+        if "\n" in query or "\r" in query:
+            raise ValueError(f"query contains an embedded newline: {query!r}")
+    validate_resume_query_identities(queries)
+
+
+def recovery_query_snapshot_bytes(queries: list[str]) -> bytes:
+    """Deterministic UTF-8 LF-separated query snapshot bytes."""
+    return ("\n".join(queries) + "\n").encode("utf-8")
 
 
 def command_for_display(command: list[str]) -> str:
