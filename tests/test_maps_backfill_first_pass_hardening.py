@@ -200,6 +200,71 @@ def test_rerun_accepts_original_fact_after_later_version_closure(tmp_path: Path)
     assert rerun.facts_created == 0
 
 
+def test_rerun_accepts_later_support_enrichment_on_original_fact(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "support-enrichment.sqlite")
+    add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    original = conn.execute(
+        "SELECT o.subject_id,o.predicate,o.evidence_id,f.id "
+        "FROM observations o "
+        "JOIN fact_observation_support fos ON fos.observation_id=o.id "
+        "JOIN facts f ON f.id=fos.fact_id "
+        "WHERE o.predicate='business.name.trading' "
+        "AND o.extraction_method='legacy_import' "
+        "AND f.reconciliation_version=?",
+        (mb.RECONCILIATION_VERSION,),
+    ).fetchone()
+    assert original is not None
+    subject_id, predicate, evidence_id, fact_id = map(str, original)
+
+    value_json = json.dumps(
+        "Later contradictory name",
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    value_hash = hashlib.sha256(value_json.encode("utf-8")).hexdigest()
+    later_observation_id = "obs_later_support_enrichment"
+    later_at = "2026-09-26T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO observations("
+        "id,subject_id,predicate,evidence_id,value_json,normalized_value_json,value_hash,"
+        "observation_kind,observed_at,extracted_at,extraction_method,extractor_name,"
+        "extractor_version,confidence,created_at"
+        ") VALUES (?,?,?,?,?,?,?,'source_assertion',?,?,'human_verified',"
+        "'test.support-enrichment','1',1.0,?)",
+        (
+            later_observation_id,
+            subject_id,
+            predicate,
+            evidence_id,
+            value_json,
+            value_json,
+            value_hash,
+            later_at,
+            later_at,
+            later_at,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO fact_observation_support(fact_id,observation_id,support_role) "
+        "VALUES (?,?,'contradicts')",
+        (fact_id, later_observation_id),
+    )
+    conn.commit()
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM fact_observation_support WHERE fact_id=?",
+        (fact_id,),
+    ).fetchone()[0] == 2
+
+    rerun = mb.backfill_maps_business_understanding(conn)
+    assert rerun.already_backfilled is True
+    assert rerun.business_count == 1
+    assert rerun.facts_created == 0
+
+
 def test_external_identifier_timestamps_record_import_observation_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
