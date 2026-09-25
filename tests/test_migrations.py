@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from sara.migrations import MIGRATIONS, Migration, MigrationError, apply_migrations, current_schema_version
+from sara.storage import connect as storage_connect
 
 
 CORE_SCHEMA = """
@@ -83,7 +84,7 @@ def seed_evidence(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at) VALUES "
-        "('acq','be_1','src','test','1','{}',?,'complete','t0')",
+        "('acq','be_1','src','test','1','{}',?,'running','t0')",
         ("a" * 64,),
     )
     conn.execute(
@@ -138,6 +139,15 @@ def test_checksum_unknown_version_and_malformed_registry_fail_closed() -> None:
         apply_migrations(conn)
     assert "knowledge_subjects" not in tables(conn)
 
+    conn = core_conn()
+    conn.execute(
+        "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,"
+        "checksum TEXT NOT NULL,applied_at TEXT NOT NULL)"
+    )
+    conn.commit()
+    with pytest.raises(MigrationError, match="full UNIQUE constraint"):
+        apply_migrations(conn)
+
 
 def test_broken_migration_and_incompatible_core_roll_back() -> None:
     conn = core_conn()
@@ -186,6 +196,26 @@ def test_phase_one_neither_backfills_nor_changes_core_state() -> None:
     assert conn.execute("SELECT COUNT(*) FROM business_locations").fetchone()[0] == 0
 
 
+def test_actual_storage_schema_is_supported_and_partial_identity_predicates_fail_closed(tmp_path: Path) -> None:
+    good = storage_connect(tmp_path / "good.sqlite")
+    assert apply_migrations(good) == (1,)
+    assert good.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert list(good.execute("PRAGMA foreign_key_check")) == []
+    good.close()
+
+    bad = storage_connect(tmp_path / "bad.sqlite")
+    bad.execute("DROP INDEX ux_business_place_id")
+    bad.execute(
+        "CREATE UNIQUE INDEX ux_business_place_id ON businesses(place_id) "
+        "WHERE place_id = 'only-this-value'"
+    )
+    bad.commit()
+    with pytest.raises(MigrationError, match="partial uniqueness predicate"):
+        apply_migrations(bad)
+    assert current_schema_version(bad) == 0
+    bad.close()
+
+
 def test_maps_link_cascades_but_location_survives() -> None:
     conn = core_conn(); apply_migrations(conn); seed_entity(conn)
     conn.execute("INSERT INTO knowledge_subjects VALUES ('loc','location','active',NULL,'t0','t0',NULL)")
@@ -226,6 +256,43 @@ def test_subject_kind_location_ownership_and_redirect_invariants() -> None:
         conn.execute("UPDATE knowledge_subjects SET record_state='merged',merged_into_subject_id='be_a',merged_at='t1' WHERE id='be_c'")
 
 
+def test_acquisition_lifecycle_is_consistent_terminal_and_durable() -> None:
+    conn = core_conn(); apply_migrations(conn); seed_entity(conn)
+    conn.execute("INSERT INTO sources VALUES ('src', 'official_web', 'Site', NULL, 't0', 1)")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at) VALUES "
+            "('bad','be_1','src','test','1','{}',?,'complete','t0')",
+            ("b" * 64,),
+        )
+
+    conn.execute(
+        "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at) VALUES "
+        "('acq','be_1','src','test','1','{}',?,'planned','t0')",
+        ("a" * 64,),
+    )
+    conn.execute("UPDATE acquisition_sessions SET status='running' WHERE id='acq'")
+    with pytest.raises(sqlite3.IntegrityError, match="invalid acquisition session status transition"):
+        conn.execute("UPDATE acquisition_sessions SET status='planned' WHERE id='acq'")
+    conn.execute("UPDATE acquisition_sessions SET status='complete',finished_at='t1' WHERE id='acq'")
+    with pytest.raises(sqlite3.IntegrityError, match="terminal acquisition session lifecycle is immutable"):
+        conn.execute("UPDATE acquisition_sessions SET finished_at='t2' WHERE id='acq'")
+    with pytest.raises(sqlite3.IntegrityError, match="terminal acquisition session lifecycle is immutable"):
+        conn.execute("UPDATE acquisition_sessions SET status='failed',error='x' WHERE id='acq'")
+
+    conn.execute(
+        "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at) VALUES "
+        "('planned','be_1','src','test','1','{}',?,'planned','t0')",
+        ("c" * 64,),
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="durable history"):
+        conn.execute("DELETE FROM acquisition_sessions WHERE id='planned'")
+
+
 def test_acquisition_evidence_and_identifier_provenance_is_immutable() -> None:
     conn = core_conn(); apply_migrations(conn); seed_evidence(conn)
     conn.execute("INSERT INTO sources VALUES ('src2','other','Other',NULL,'t0',1)")
@@ -236,9 +303,13 @@ def test_acquisition_evidence_and_identifier_provenance_is_immutable() -> None:
         )
     with pytest.raises(sqlite3.IntegrityError, match="evidence items are immutable"):
         conn.execute("UPDATE evidence_items SET status='incomplete' WHERE id='ev'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM evidence_items WHERE id='ev'")
     with pytest.raises(sqlite3.IntegrityError, match="acquisition session identity/configuration is immutable"):
         conn.execute("UPDATE acquisition_sessions SET config_json='x' WHERE id='acq'")
     conn.execute("UPDATE acquisition_sessions SET status='partial',finished_at='t1' WHERE id='acq'")
+    with pytest.raises(sqlite3.IntegrityError, match="terminal acquisition session lifecycle is immutable"):
+        conn.execute("UPDATE acquisition_sessions SET status='running',finished_at=NULL WHERE id='acq'")
 
     conn.execute("INSERT INTO external_identifiers VALUES ('xid','be_1','src','key','v','active','t0','t0','t0')")
     with pytest.raises(sqlite3.IntegrityError, match="external identifier identity is immutable"):
@@ -254,6 +325,8 @@ def test_observation_fact_and_predicate_semantics_are_guarded() -> None:
     )
     with pytest.raises(sqlite3.IntegrityError, match="observations are immutable"):
         conn.execute("UPDATE observations SET value_json='\"B\"' WHERE id='obs'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM observations WHERE id='obs'")
     with pytest.raises(sqlite3.IntegrityError, match="predicate semantics are immutable"):
         conn.execute("UPDATE predicate_definitions SET subject_kind='location' WHERE name='business.name.trading'")
     conn.execute("UPDATE predicate_definitions SET freshness_days=90 WHERE name='business.name.trading'")
@@ -272,12 +345,30 @@ def test_observation_fact_and_predicate_semantics_are_guarded() -> None:
         )
 
 
-def test_fact_versions_are_append_history_and_null_states_carry_no_values() -> None:
-    conn = core_conn(); apply_migrations(conn); seed_entity(conn); seed_predicate(conn)
+def test_fact_versions_and_support_are_append_only_history() -> None:
+    conn = core_conn(); apply_migrations(conn); seed_evidence(conn); seed_predicate(conn)
+    conn.execute(
+        "INSERT INTO observations(id,subject_id,predicate,evidence_id,value_json,observation_kind,extracted_at,"
+        "extraction_method,extractor_name,extractor_version,created_at) VALUES "
+        "('obs','be_1','business.name.trading','ev','\"A\"','source_assertion','t0','deterministic_parser','x','1','t0')"
+    )
     conn.execute(
         "INSERT INTO facts(id,subject_id,predicate,fact_slot,value_json,status,valid_from,reconciled_at,reconciliation_version,created_at) "
         "VALUES ('f1','be_1','business.name.trading','__single__','\"A\"','single_source','t0','t0','v1','t0')"
     )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM facts WHERE id='f1'")
+    conn.execute("INSERT INTO fact_observation_support VALUES ('f1','obs','supports')")
+    conn.execute("INSERT INTO fact_acquisition_support VALUES ('f1','acq','context')")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE fact_observation_support SET support_role='contradicts' WHERE fact_id='f1'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM fact_observation_support WHERE fact_id='f1'")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE fact_acquisition_support SET support_role='searched' WHERE fact_id='f1'")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM fact_acquisition_support WHERE fact_id='f1'")
+
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO facts(id,subject_id,predicate,fact_slot,value_json,status,valid_from,reconciled_at,reconciliation_version,created_at) "
@@ -307,6 +398,10 @@ def test_dossier_snapshots_are_immutable() -> None:
         conn.execute("UPDATE dossier_assessments SET analysis_ready=1 WHERE id='da'")
     with pytest.raises(sqlite3.IntegrityError, match="immutable snapshots"):
         conn.execute("UPDATE dossier_domain_assessments SET state='strong' WHERE assessment_id='da'")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable snapshots"):
+        conn.execute("DELETE FROM dossier_domain_assessments WHERE assessment_id='da'")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable snapshots"):
+        conn.execute("DELETE FROM dossier_assessments WHERE id='da'")
 
 
 def test_registry_ordering_gaps_and_applied_history_are_rejected() -> None:
