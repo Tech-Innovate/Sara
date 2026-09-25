@@ -2098,6 +2098,7 @@ def _execute_recovery_child(
             status="failed", process_exit=1,
             error=f"container liveness reconciliation failed: {exc}",
         ) from exc
+
     try:
         pass  # beginning of original guarded body
         if inspect is not None:
@@ -2279,40 +2280,9 @@ def _execute_recovery_child(
                         "remove it or create a child"
                     ),
                 )
-            # SR-F5-02: validate/repair unstarted snapshot (no child started yet)
-            try:
-                bin_dir.mkdir(parents=True, exist_ok=True)
-                _validate_query_snapshot(bin_dir, plan, is_started=False)
-            except OSError as exc:
-                raise _ChildFailure(
-                    status="failed", process_exit=1,
-                    error=f"child bin directory creation failed: {exc}",
-                ) from exc
-            query_snapshot = bin_dir / "queries.txt"
-            snapshot_bytes = recovery_query_snapshot_bytes(list(plan.queries))
-            if query_snapshot.exists():
-                try:
-                    existing_bytes = query_snapshot.read_bytes()
-                except OSError as exc:
-                    raise _ChildFailure(
-                        status="failed", process_exit=1,
-                        error=f"child query snapshot read failed: {exc}",
-                    ) from exc
-                if existing_bytes != snapshot_bytes:
-                    raise _ChildFailure(
-                        status="none", process_exit=2,
-                        error="existing child query snapshot does not match the plan queries",
-                    )
-            else:
-                try:
-                    with open(query_snapshot, "wb") as handle:
-                        handle.write(snapshot_bytes)
-                except OSError as exc:
-                    raise _ChildFailure(
-                        status="failed", process_exit=1,
-                        error=f"child query snapshot write failed: {exc}",
-                    ) from exc
-            # RRI-F07: refuse to silently adopt orphan raw/resume evidence.
+            # RRI-F07: orphan scraper evidence is a no-effect rejection.
+            # Inspect it before repairing queries.txt so rejection cannot
+            # rewrite or delete operator-visible evidence in this bin.
             orphan_raw = bin_dir / "results.jsonl"
             orphan_resume = bin_dir / "results.jsonl.resume.json"
             if orphan_raw.exists() or orphan_resume.exists():
@@ -2323,6 +2293,16 @@ def _execute_recovery_child(
                         "files; refusing to adopt untracked scraper evidence"
                     ),
                 )
+            # SR-F5-02: after no-effect guards pass, repair the unstarted
+            # snapshot once from the frozen plan.
+            try:
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                _validate_query_snapshot(bin_dir, plan, is_started=False)
+            except OSError as exc:
+                raise _ChildFailure(
+                    status="failed", process_exit=1,
+                    error=f"child bin directory creation failed: {exc}",
+                ) from exc
             collision = conn.execute(
                 "SELECT id FROM runs WHERE id = ?", (run_id,)
             ).fetchone()
