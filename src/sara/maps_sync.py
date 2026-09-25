@@ -881,7 +881,6 @@ def _verify_sync_identifier_rows(
             or row["source_id"] != mb.GOOGLE_MAPS_SOURCE_ID
             or row["namespace"] != namespace
             or row["value"] != value
-            or row["status"] != "active"
             or _resolve_subject(conn, str(row["subject_id"]), "location") != canonical_location
         ):
             raise MapsSyncError(
