@@ -15,7 +15,6 @@ class DossierQueryError(RuntimeError):
     """The requested Business Understanding dossier cannot be read safely."""
 
 
-VALUE_STATUSES = frozenset({"confirmed", "single_source", "conflicted", "stale"})
 NULL_STATUSES = frozenset({"unknown", "not_observed", "not_applicable"})
 _REQUIRED_OBJECTS = {
     "knowledge_subjects": "table",
@@ -285,7 +284,7 @@ def maps_businesses(conn: sqlite3.Connection, current_location_ids: list[str]) -
 def _freshness(fact: dict[str, Any], evaluated_at: datetime) -> dict[str, Any]:
     freshness_days = fact["freshness_days"]
     reference_text = fact["last_verified_at"] or fact["valid_from"]
-    if fact["status"] in NULL_STATUSES or fact["status"] == "conflicted" or freshness_days is None:
+    if fact["status"] in {"unknown", "not_applicable"} or freshness_days is None:
         return {
             "evaluated": False,
             "freshness_days": freshness_days,
