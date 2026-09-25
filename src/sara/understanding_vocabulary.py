@@ -5,7 +5,7 @@ import json
 import sqlite3
 from dataclasses import asdict, dataclass
 
-from .migrations import current_schema_version
+from .migrations import MIGRATIONS, current_schema_version
 
 
 class VocabularySeedError(RuntimeError):
@@ -85,7 +85,7 @@ PREDICATE_SEED_V1: tuple[PredicateSeed, ...] = (
         "multi",
         "supported_set",
         90,
-        "Customer segment explicitly stated by the business or another retained source.",
+        "Customer segment explicitly stated in retained source evidence; inferred segments require a separate future predicate.",
     ),
     PredicateSeed(
         "business.offering.service",
@@ -254,6 +254,21 @@ def _predicate_values(seed: PredicateSeed) -> tuple[object, ...]:
     )
 
 
+def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
+    if current_schema_version(conn) != 1:
+        raise VocabularySeedError(
+            "vocabulary seed v1 requires Business Understanding schema version 1 exactly"
+        )
+    expected = MIGRATIONS[0]
+    row = conn.execute(
+        "SELECT name, checksum FROM schema_migrations WHERE version = 1"
+    ).fetchone()
+    if row is None or tuple(row) != (expected.name, expected.checksum):
+        raise VocabularySeedError(
+            "Business Understanding migration v1 history does not match this Sara build"
+        )
+
+
 def seed_business_understanding_vocabulary(
     conn: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -270,10 +285,7 @@ def seed_business_understanding_vocabulary(
         raise VocabularySeedError(
             "vocabulary seeding requires a connection with no active transaction"
         )
-    if current_schema_version(conn) < 1:
-        raise VocabularySeedError(
-            "Business Understanding schema migration v1 must be applied before vocabulary seeding"
-        )
+    _require_exact_phase_one_history(conn)
 
     conn.execute("PRAGMA foreign_keys = ON")
     if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
