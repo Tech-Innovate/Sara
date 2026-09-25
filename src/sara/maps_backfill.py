@@ -37,6 +37,7 @@ BACKFILL_COLLECTOR_NAME = "sara.maps_backfill"
 BACKFILL_VERSION = "1"
 RECONCILIATION_VERSION = "maps-backfill-v1"
 _ID_NAMESPACE = "sara.business-understanding.maps-backfill.v1"
+_IDENTIFIER_NAMESPACES = ("place_id", "cid", "data_id")
 
 _FIELD_SPECS: tuple[tuple[str, str, str], ...] = (
     ("title", "business_entity", "business.name.trading"),
@@ -163,11 +164,61 @@ def _source_locator(raw: dict[str, Any]) -> str | None:
     link = _text(raw.get("link"))
     if link:
         return link
-    for namespace in ("place_id", "cid", "data_id"):
+    for namespace in _IDENTIFIER_NAMESPACES:
         value = _text(raw.get(namespace))
         if value:
             return f"{namespace}:{value}"
     return None
+
+
+def _phase3_identifier_snapshot(business: dict[str, Any]) -> list[dict[str, str]]:
+    snapshot: list[dict[str, str]] = []
+    for namespace in _IDENTIFIER_NAMESPACES:
+        value = _text(business.get(namespace))
+        if value:
+            snapshot.append({"namespace": namespace, "value": value})
+    return snapshot
+
+
+def _parse_phase3_identifier_snapshot(
+    evidence_id: object, metadata: dict[str, Any]
+) -> list[dict[str, str]]:
+    raw_snapshot = metadata.get("phase3_external_identifiers")
+    if not isinstance(raw_snapshot, list):
+        raise MapsBackfillError(
+            f"backfill evidence {evidence_id} has no valid Phase-3 identifier snapshot"
+        )
+
+    snapshot: list[dict[str, str]] = []
+    seen_namespaces: set[str] = set()
+    for item in raw_snapshot:
+        if not isinstance(item, dict) or set(item) != {"namespace", "value"}:
+            raise MapsBackfillError(
+                f"backfill evidence {evidence_id} has malformed Phase-3 identifier snapshot"
+            )
+        namespace = item.get("namespace")
+        value = item.get("value")
+        if (
+            namespace not in _IDENTIFIER_NAMESPACES
+            or namespace in seen_namespaces
+            or not isinstance(value, str)
+            or not value
+            or value != value.strip()
+        ):
+            raise MapsBackfillError(
+                f"backfill evidence {evidence_id} has malformed Phase-3 identifier snapshot"
+            )
+        seen_namespaces.add(namespace)
+        snapshot.append({"namespace": namespace, "value": value})
+
+    expected_order = [
+        namespace for namespace in _IDENTIFIER_NAMESPACES if namespace in seen_namespaces
+    ]
+    if [item["namespace"] for item in snapshot] != expected_order:
+        raise MapsBackfillError(
+            f"backfill evidence {evidence_id} has non-canonical Phase-3 identifier snapshot"
+        )
+    return snapshot
 
 
 def _parse_raw(business: dict[str, Any]) -> dict[str, Any]:
@@ -397,10 +448,9 @@ def _insert_identifiers(
     created_at: str,
 ) -> int:
     count = 0
-    for namespace in ("place_id", "cid", "data_id"):
-        value = _text(business.get(namespace))
-        if not value:
-            continue
+    for identifier in _phase3_identifier_snapshot(business):
+        namespace = identifier["namespace"]
+        value = identifier["value"]
         identifier_id = _external_identifier_id(namespace, value)
         if conn.execute(
             "SELECT 1 FROM external_identifiers "
@@ -447,6 +497,7 @@ def _insert_provenance(
             "legacy_business_id": business_id,
             "legacy_canonical_key": business["canonical_key"],
             "legacy_run_id": run["id"],
+            "phase3_external_identifiers": _phase3_identifier_snapshot(business),
             "raw_json": raw_json,
         }
     )
@@ -523,7 +574,7 @@ def _backfill_evidence_by_business(
     conn: sqlite3.Connection,
 ) -> dict[int, dict[str, Any]]:
     cursor = conn.execute(
-        "SELECT e.id,e.content_sha256,e.metadata_json,e.retrieved_at,a.legacy_run_id "
+        "SELECT e.id,e.content_sha256,e.metadata_json,e.retrieved_at,e.created_at,a.legacy_run_id "
         "FROM evidence_items e "
         "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
         "WHERE e.source_id=? AND a.source_id=? AND a.collector_name=? "
@@ -574,6 +625,9 @@ def _backfill_evidence_by_business(
             raise MapsBackfillError(
                 f"multiple immutable Phase-3 evidence items claim Maps business {legacy_business_id}"
             )
+        item["phase3_external_identifiers"] = _parse_phase3_identifier_snapshot(
+            item["id"], metadata
+        )
         item["raw_json"] = raw_json
         result[legacy_business_id] = item
     return result
@@ -635,6 +689,31 @@ def _verify_complete_coverage(
             raise MapsBackfillError(
                 f"existing Maps backfill provenance is incomplete for business {business_id}"
             )
+
+        for identifier in evidence["phase3_external_identifiers"]:
+            namespace = identifier["namespace"]
+            value = identifier["value"]
+            identifier_id = _external_identifier_id(namespace, value)
+            identifier_row = _fetch_one(
+                conn,
+                "SELECT id,subject_id,source_id,namespace,value,first_observed_at,created_at "
+                "FROM external_identifiers WHERE id=?",
+                (identifier_id,),
+            )
+            expected_identifier_row = {
+                "id": identifier_id,
+                "subject_id": expected_location,
+                "source_id": GOOGLE_MAPS_SOURCE_ID,
+                "namespace": namespace,
+                "value": value,
+                "first_observed_at": evidence["created_at"],
+                "created_at": evidence["created_at"],
+            }
+            if identifier_row != expected_identifier_row:
+                raise MapsBackfillError(
+                    f"existing Maps backfill external identifier provenance is incomplete or "
+                    f"inconsistent for business {business_id}, namespace {namespace}"
+                )
 
         expected_observations = _expected_backfill_observations(business_id, evidence)
         expected_observation_rows: list[dict[str, Any]] = []
