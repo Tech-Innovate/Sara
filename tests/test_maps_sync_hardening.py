@@ -81,17 +81,18 @@ def _phase4_fixture(tmp_path: Path):
     return conn
 
 
-def test_sync_fails_closed_on_google_maps_source_registry_drift(tmp_path: Path) -> None:
+def test_sync_fails_closed_on_google_maps_source_identity_drift(tmp_path: Path) -> None:
     conn = _prepared(tmp_path / "source-drift.sqlite")
     _ingest_complete(conn, "r1", "seed", "2026-09-23T10:00:00+00:00")
     mb.backfill_maps_business_understanding(conn)
+    conn.execute("DROP TRIGGER sources_identity_immutable")
     conn.execute(
-        "UPDATE sources SET name='Unexpected Maps Registry Name' WHERE id=?",
+        "UPDATE sources SET source_type='other_web' WHERE id=?",
         (mb.GOOGLE_MAPS_SOURCE_ID,),
     )
     conn.commit()
 
-    with pytest.raises(MapsSyncError, match="source registry drift"):
+    with pytest.raises(MapsSyncError, match="source identity/type drift"):
         sync_maps_business_understanding(conn)
 
 
