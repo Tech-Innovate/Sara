@@ -265,6 +265,38 @@ def test_rerun_accepts_later_support_enrichment_on_original_fact(tmp_path: Path)
     assert rerun.facts_created == 0
 
 
+def test_rerun_accepts_mutable_source_registry_metadata(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "mutable-source-metadata.sqlite")
+    add_complete_business(conn)
+    mb.backfill_maps_business_understanding(conn)
+
+    conn.execute(
+        "UPDATE sources SET name=?,base_url=?,active=0 WHERE id=?",
+        (
+            "Google Maps (retired display label)",
+            "https://maps.example.test",
+            mb.GOOGLE_MAPS_SOURCE_ID,
+        ),
+    )
+    conn.commit()
+
+    source = conn.execute(
+        "SELECT source_type,name,base_url,active FROM sources WHERE id=?",
+        (mb.GOOGLE_MAPS_SOURCE_ID,),
+    ).fetchone()
+    assert tuple(source) == (
+        "google_maps",
+        "Google Maps (retired display label)",
+        "https://maps.example.test",
+        0,
+    )
+
+    rerun = mb.backfill_maps_business_understanding(conn)
+    assert rerun.already_backfilled is True
+    assert rerun.business_count == 1
+    assert rerun.facts_created == 0
+
+
 def test_external_identifier_timestamps_record_import_observation_time(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
