@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from sara.maps_backfill import backfill_maps_business_understanding
+from sara import maps_backfill as mb
+from sara import maps_sync as ms
 from sara.maps_source import MapsSourceShapeError, official_website
 from sara.migrations import apply_migrations
 from sara.storage import connect, ingest_records
@@ -53,6 +54,47 @@ def _verbatim_v1181_shape() -> dict:
     }
 
 
+def _insert_legacy_business(conn, record: dict) -> int:
+    raw_json = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    conn.execute(
+        "INSERT INTO businesses("
+        "canonical_key,place_id,cid,title,category,address,latitude,longitude,phone,website,"
+        "review_rating,review_count,status,first_seen_at,last_seen_at,first_run_id,last_run_id,raw_json"
+        ") VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
+        (
+            f"place:{record['place_id']}",
+            record["place_id"],
+            record.get("cid"),
+            record.get("title"),
+            record.get("category"),
+            record.get("address"),
+            record.get("latitude"),
+            record.get("longitude"),
+            record.get("phone"),
+            record.get("review_rating"),
+            record.get("review_count"),
+            record.get("status"),
+            "2026-09-26T00:00:00+00:00",
+            "2026-09-26T00:00:00+00:00",
+            "r1",
+            "r1",
+            raw_json,
+        ),
+    )
+    business_id = int(conn.execute("SELECT id FROM businesses").fetchone()[0])
+    conn.execute(
+        "INSERT INTO run_businesses(run_id,business_id,first_observed_at) VALUES (?,?,?)",
+        ("r1", business_id, "2026-09-26T00:00:00+00:00"),
+    )
+    conn.execute(
+        "UPDATE runs SET status='complete',finished_at=?,exit_code=0,raw_records=1,accepted_records=1,"
+        "unique_seen=1,new_businesses=1 WHERE id='r1'",
+        ("2026-09-26T00:01:00+00:00",),
+    )
+    conn.commit()
+    return business_id
+
+
 def test_official_website_accepts_pinned_and_canonical_spellings() -> None:
     assert official_website({"web_site": " https://legacy.example/ "}) == "https://legacy.example/"
     assert official_website({"website": "https://canonical.example/"}) == "https://canonical.example/"
@@ -67,6 +109,13 @@ def test_official_website_conflict_fails_closed() -> None:
         official_website(
             {"website": "https://one.example/", "web_site": "https://two.example/"}
         )
+
+
+def test_maps_extraction_versions_advance_with_source_shape_semantics() -> None:
+    assert mb.BACKFILL_VERSION == "2"
+    assert mb.RECONCILIATION_VERSION == "maps-backfill-v2"
+    assert ms.SYNC_VERSION == "2"
+    assert ms.SYNC_RECONCILIATION_VERSION == "maps-sync-v2"
 
 
 def test_storage_normalizes_v1181_web_site_and_fallback_identity(tmp_path: Path) -> None:
@@ -108,48 +157,12 @@ def test_backfill_reads_legacy_web_site_without_mutating_legacy_business_row(tmp
     conn = connect(tmp_path / "legacy.sqlite")
     _add_run(conn, "r1")
     record = _verbatim_v1181_shape()
-    raw_json = json.dumps(record, ensure_ascii=False, sort_keys=True)
-    conn.execute(
-        "INSERT INTO businesses("
-        "canonical_key,place_id,cid,title,category,address,latitude,longitude,phone,website,"
-        "review_rating,review_count,status,first_seen_at,last_seen_at,first_run_id,last_run_id,raw_json"
-        ") VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?,?)",
-        (
-            "place:ChIJ-real-shape",
-            record["place_id"],
-            record["cid"],
-            record["title"],
-            record["category"],
-            record["address"],
-            record["latitude"],
-            record["longitude"],
-            record["phone"],
-            record["review_rating"],
-            record["review_count"],
-            record["status"],
-            "2026-09-26T00:00:00+00:00",
-            "2026-09-26T00:00:00+00:00",
-            "r1",
-            "r1",
-            raw_json,
-        ),
-    )
-    business_id = int(conn.execute("SELECT id FROM businesses").fetchone()[0])
-    conn.execute(
-        "INSERT INTO run_businesses(run_id,business_id,first_observed_at) VALUES (?,?,?)",
-        ("r1", business_id, "2026-09-26T00:00:00+00:00"),
-    )
-    conn.execute(
-        "UPDATE runs SET status='complete',finished_at=?,exit_code=0,raw_records=1,accepted_records=1,"
-        "unique_seen=1,new_businesses=1 WHERE id='r1'",
-        ("2026-09-26T00:01:00+00:00",),
-    )
-    conn.commit()
+    business_id = _insert_legacy_business(conn, record)
 
     assert apply_migrations(conn) == (1,)
     seed_business_understanding_vocabulary(conn)
     before = tuple(conn.execute("SELECT website,raw_json FROM businesses WHERE id=?", (business_id,)).fetchone())
-    backfill_maps_business_understanding(conn)
+    mb.backfill_maps_business_understanding(conn)
     after = tuple(conn.execute("SELECT website,raw_json FROM businesses WHERE id=?", (business_id,)).fetchone())
     assert after == before
     fact = conn.execute(
@@ -158,4 +171,24 @@ def test_backfill_reads_legacy_web_site_without_mutating_legacy_business_row(tmp
     assert fact is not None
     assert json.loads(fact["value_json"]) == "https://example.test/"
     assert fact["status"] == "single_source"
+    conn.close()
+
+
+def test_backfill_conflicting_website_aliases_rolls_back_understanding_bootstrap(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "legacy-conflict.sqlite")
+    _add_run(conn, "r1")
+    record = _verbatim_v1181_shape()
+    record["website"] = "https://different.example/"
+    _insert_legacy_business(conn, record)
+    assert apply_migrations(conn) == (1,)
+    seed_business_understanding_vocabulary(conn)
+
+    with pytest.raises(MapsSourceShapeError):
+        mb.backfill_maps_business_understanding(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM maps_business_location_links").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM acquisition_sessions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM evidence_items").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
     conn.close()
