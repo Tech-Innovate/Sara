@@ -81,6 +81,10 @@ def collect_official_website(
             max_response_bytes=config.max_response_bytes,
             request_interval_seconds=config.request_interval_seconds,
             max_policy_delay_seconds=config.max_policy_delay_seconds,
+            retry_attempt_limit=config.retry_attempt_limit,
+            retry_base_delay_seconds=config.retry_base_delay_seconds,
+            retry_max_delay_seconds=config.retry_max_delay_seconds,
+            retry_delay_budget_seconds=config.retry_delay_budget_seconds,
             obey_robots=config.obey_robots,
         )
         result = crawl_official_site(
@@ -207,6 +211,30 @@ def _parser() -> argparse.ArgumentParser:
         default=30.0,
         help="maximum robots pacing delay accepted before the source is blocked",
     )
+    parser.add_argument(
+        "--retry-attempt-limit",
+        type=_positive_int,
+        default=4,
+        help="maximum outbound attempts for one logical URL request, including IP failover",
+    )
+    parser.add_argument(
+        "--retry-base-delay",
+        type=float,
+        default=1.0,
+        help="initial exponential retry delay in seconds",
+    )
+    parser.add_argument(
+        "--retry-max-delay",
+        type=float,
+        default=30.0,
+        help="maximum accepted delay for one retry, including Retry-After",
+    )
+    parser.add_argument(
+        "--retry-delay-budget",
+        type=float,
+        default=60.0,
+        help="maximum cumulative explicit retry delay per logical URL request",
+    )
     parser.add_argument("--user-agent", default="SaraBusinessUnderstanding/1.0")
     parser.add_argument("--pretty", action="store_true")
     return parser
@@ -232,6 +260,10 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout,
                 request_interval_seconds=args.request_interval,
                 max_policy_delay_seconds=args.max_policy_delay,
+                retry_attempt_limit=args.retry_attempt_limit,
+                retry_base_delay_seconds=args.retry_base_delay,
+                retry_max_delay_seconds=args.retry_max_delay,
+                retry_delay_budget_seconds=args.retry_delay_budget,
                 user_agent=args.user_agent,
             ),
         )
