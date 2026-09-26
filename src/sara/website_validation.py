@@ -391,6 +391,17 @@ def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
             value_statuses,
         )
     ]
+    support_observation_semantic_mismatch = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT f.id FROM facts f "
+            "JOIN fact_observation_support fos ON fos.fact_id=f.id "
+            "JOIN observations o ON o.id=fos.observation_id "
+            f"WHERE f.status IN ({placeholders}) AND fos.support_role='supports' "
+            "AND (o.subject_id<>f.subject_id OR o.predicate<>f.predicate) ORDER BY f.id",
+            value_statuses,
+        )
+    ]
     single_source_mismatches = [
         {
             "fact_id": str(row[0]),
@@ -419,7 +430,8 @@ def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
             "  JOIN sources s ON s.id=a.source_id "
             "  WHERE fas.fact_id=f.id "
             "    AND fas.support_role='supports_absence' "
-            "    AND a.status='complete'"
+            "    AND a.status='complete' "
+            "    AND a.target_subject_id=f.subject_id"
             ") ORDER BY f.id"
         )
     ]
@@ -429,6 +441,7 @@ def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
             not value_facts_without_full_chain
             and not value_facts_without_usable_support
             and not value_facts_with_nonusable_support
+            and not support_observation_semantic_mismatch
             and not single_source_mismatches
             and not unsupported_not_observed
         ),
@@ -436,6 +449,7 @@ def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
             "value_facts_without_full_chain": value_facts_without_full_chain,
             "value_facts_without_usable_support": value_facts_without_usable_support,
             "value_facts_with_nonusable_support": value_facts_with_nonusable_support,
+            "support_observation_semantic_mismatch": support_observation_semantic_mismatch,
             "single_source_usable_source_count_mismatch": single_source_mismatches,
             "not_observed_without_complete_absence_support": unsupported_not_observed,
         },
