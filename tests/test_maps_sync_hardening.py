@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from sara import maps_backfill as mb
-from sara.maps_sync import MapsSyncError, sync_maps_business_understanding
+from sara.maps_sync import SYNC_VERSION, MapsSyncError, sync_maps_business_understanding
 from sara.migrations import apply_migrations
 from sara.storage import connect, ingest_records
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
@@ -118,7 +118,7 @@ def test_sync_rejects_existing_snapshot_with_missing_fact_support(tmp_path: Path
         "FROM fact_observation_support fos "
         "JOIN observations o ON o.id=fos.observation_id "
         "WHERE o.extractor_name='sara.maps_sync' "
-        "AND o.extractor_version='1' "
+        f"AND o.extractor_version='{SYNC_VERSION}' "
         "ORDER BY o.id LIMIT 1"
     ).fetchone()
     assert row is not None

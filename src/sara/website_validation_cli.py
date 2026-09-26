@@ -18,6 +18,7 @@ from .website.model import (
     CrawlConfig,
 )
 from .website.surface import collect_official_website
+from .website_validation_merge_probe import run_controlled_merge_survival_probe
 from .website_validation import (
     REPORT_SCHEMA,
     CheckResult,
@@ -575,6 +576,7 @@ def _write_fatal_report(args: Any, exc: Exception, *, allow_nonempty: bool) -> N
             "single_location_business_ids": [int(v) for v in args.single_location_business_id],
             "multi_branch_groups": [list(group) for group in args.multi_branch_group],
             "merge_pair": None if args.merge_pair is None else list(args.merge_pair),
+            "merge_probe_business_id": getattr(args, "merge_probe_business_id", None),
             "passes_per_business": args.passes,
         },
         "acquisitions": [],
@@ -595,6 +597,7 @@ def run_validation_gate(
     single_location_business_ids: Sequence[int],
     multi_branch_groups: Sequence[Sequence[int]],
     merge_pair: tuple[int, int] | None,
+    merge_probe_business_id: int | None = None,
     passes: int = 2,
     config: CrawlConfig | None = None,
     collector: Callable[..., Any] = collect_official_website,
@@ -664,7 +667,14 @@ def run_validation_gate(
     finally:
         conn.close()
 
-    checks.append(_run_merge_survival_probe(working_db, probe_db, merge_pair))
+    if merge_probe_business_id is not None:
+        checks.append(
+            run_controlled_merge_survival_probe(
+                Path(source_db), probe_db, merge_probe_business_id
+            )
+        )
+    else:
+        checks.append(_run_merge_survival_probe(working_db, probe_db, merge_pair))
     schema_check = _legacy_schema_check(source_db, working_db)
     dossier_check, dossier_summaries = _representative_dossier_check(
         working_db, selected
@@ -688,6 +698,7 @@ def run_validation_gate(
                 [int(v) for v in group] for group in multi_branch_groups
             ],
             "merge_pair": None if merge_pair is None else list(merge_pair),
+            "merge_probe_business_id": merge_probe_business_id,
             "passes_per_business": passes,
         },
         "acquisitions": acquisitions,
@@ -712,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
             single_location_business_ids=args.single_location_business_id,
             multi_branch_groups=args.multi_branch_group,
             merge_pair=args.merge_pair,
+            merge_probe_business_id=args.merge_probe_business_id,
             passes=args.passes,
         )
     except KeyboardInterrupt:

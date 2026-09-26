@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from .maps_source import MapsSourceShapeError, official_website
 from .understanding_vocabulary import (
     PREDICATE_SEEDS,
     VocabularySeedError,
@@ -34,8 +35,8 @@ class MapsBackfillStats:
 
 GOOGLE_MAPS_SOURCE_ID = "src_google_maps"
 BACKFILL_COLLECTOR_NAME = "sara.maps_backfill"
-BACKFILL_VERSION = "1"
-RECONCILIATION_VERSION = "maps-backfill-v1"
+BACKFILL_VERSION = "2"
+RECONCILIATION_VERSION = "maps-backfill-v2"
 _ID_NAMESPACE = "sara.business-understanding.maps-backfill.v1"
 _IDENTIFIER_NAMESPACES = ("place_id", "cid", "data_id")
 
@@ -146,6 +147,10 @@ def _source_values(raw: dict[str, Any]) -> dict[str, Any]:
     longitude = raw.get("longitude")
     if longitude is None:
         longitude = raw.get("longtitude")
+    try:
+        website = official_website(raw)
+    except MapsSourceShapeError as exc:
+        raise MapsBackfillError(str(exc)) from exc
     return {
         "title": _text(raw.get("title")),
         "category": _text(raw.get("category")),
@@ -153,7 +158,7 @@ def _source_values(raw: dict[str, Any]) -> dict[str, Any]:
         "latitude": _float(raw.get("latitude")),
         "longitude": _float(longitude),
         "phone": _text(raw.get("phone")),
-        "website": _text(raw.get("website")),
+        "website": website,
         "review_rating": _float(raw.get("review_rating")),
         "review_count": _int(raw.get("review_count")),
         "status": _text(raw.get("status")),
