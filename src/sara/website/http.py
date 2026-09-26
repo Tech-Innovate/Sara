@@ -416,6 +416,11 @@ class SafeHttpClient:
                 response = connection.getresponse()
                 status = int(response.status)
                 headers = response.headers
+                if status in {429, 503}:
+                    # Retryable responses do not contribute usable evidence. Do
+                    # not let an irrelevant oversized error body preempt the
+                    # status-based retry policy.
+                    return status, headers, b""
                 body = response.read(max_bytes + 1)
                 if len(body) > max_bytes:
                     raise WebsiteFetchError(
@@ -430,9 +435,16 @@ class SafeHttpClient:
                 raise WebsiteFetchError(
                     f"TLS protocol failure for {url}: {exc}"
                 ) from exc
-            except (OSError, http.client.HTTPException) as exc:
+            except http.client.IncompleteRead as exc:
                 last_error = exc
                 transient_error = exc
+            except OSError as exc:
+                last_error = exc
+                transient_error = exc
+            except http.client.HTTPException as exc:
+                raise WebsiteFetchError(
+                    f"HTTP protocol failure for {url}: {exc}"
+                ) from exc
             finally:
                 connection.close()
 
