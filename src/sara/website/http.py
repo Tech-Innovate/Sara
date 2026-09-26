@@ -98,6 +98,24 @@ class SafeHttpClient:
     def _assert_allowed_site(self, url: str) -> None:
         if not same_site(url, self.site_url):
             raise WebsiteBlockedError(f"cross-site fetch blocked: {url}")
+        site = urlsplit(self.site_url)
+        candidate = urlsplit(url)
+        site_port = self._port(site)
+        candidate_port = self._port(candidate)
+        if site.scheme == "https" and candidate.scheme != "https":
+            raise WebsiteBlockedError(f"HTTPS downgrade blocked: {url}")
+        if candidate.scheme == site.scheme:
+            if candidate_port != site_port:
+                raise WebsiteBlockedError(f"same-site port shift blocked: {url}")
+            return
+        if (
+            site.scheme == "http"
+            and candidate.scheme == "https"
+            and site_port == 80
+            and candidate_port == 443
+        ):
+            return
+        raise WebsiteBlockedError(f"same-site scheme/port transition blocked: {url}")
 
     @staticmethod
     def _port(parsed) -> int:  # noqa: ANN001
@@ -274,10 +292,11 @@ class SafeHttpClient:
                     f"robots redirect for {origin} has no Location header"
                 )
             redirected = normalize_http_url(location, robots_url)
-            if redirected is None or not same_site(redirected, self.site_url):
+            if redirected is None:
                 raise WebsiteBlockedError(
-                    f"cross-site robots redirect blocked: {location}"
+                    f"invalid robots redirect target: {location}"
                 )
+            self._assert_allowed_site(redirected)
             status, headers, body = self._request_once(
                 redirected, min(262_144, self.max_response_bytes)
             )
