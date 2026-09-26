@@ -11,6 +11,7 @@ from sara.website.http import SafeHttpClient, WebsiteFetchError
 def test_validated_ip_failover_uses_shared_exponential_backoff(monkeypatch) -> None:
     attempts: list[str] = []
     sleeps: list[float] = []
+    open_connections = 0
 
     def lookup(_host, _port, **_kwargs):
         return [
@@ -27,14 +28,24 @@ def test_validated_ip_failover_uses_shared_exponential_backoff(monkeypatch) -> N
             _timeout: float,
             _context,
         ) -> None:
+            nonlocal open_connections
             self.address = address
+            self.closed = False
+            open_connections += 1
 
         def request(self, _method: str, _target: str, *, headers) -> None:
             attempts.append(self.address)
             raise OSError("simulated transport failure")
 
         def close(self) -> None:
-            pass
+            nonlocal open_connections
+            if not self.closed:
+                self.closed = True
+                open_connections -= 1
+
+    def sleep(seconds: float) -> None:
+        assert open_connections == 0
+        sleeps.append(seconds)
 
     monkeypatch.setattr(website_http, "_PinnedHTTPSConnection", Connection)
     client = SafeHttpClient(
@@ -49,7 +60,7 @@ def test_validated_ip_failover_uses_shared_exponential_backoff(monkeypatch) -> N
         retry_max_delay_seconds=30.0,
         retry_delay_budget_seconds=60.0,
         dns_lookup=lookup,
-        sleep=sleeps.append,
+        sleep=sleep,
     )
     monkeypatch.setattr(client, "_pace", lambda _url: None)
 
@@ -58,3 +69,4 @@ def test_validated_ip_failover_uses_shared_exponential_backoff(monkeypatch) -> N
 
     assert len(attempts) == 3
     assert sleeps == pytest.approx([1.0, 2.0])
+    assert open_connections == 0
