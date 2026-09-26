@@ -215,15 +215,13 @@ def test_branch_page_channel_is_retained_as_evidence_without_entity_scope_promot
     conn.close()
 
 
-def test_deep_start_uses_fetched_root_as_home_and_does_not_promote_branch_contact(tmp_path: Path) -> None:
-    conn = prepared(
-        tmp_path / "deep.sqlite",
-        website="https://seed.example/location/jeddah",
-    )
+def test_path_hosted_self_canonical_stays_scoped_even_when_origin_root_is_fetched(tmp_path: Path) -> None:
+    deep_url = "https://seed.example/location/jeddah"
+    conn = prepared(tmp_path / "deep.sqlite", website=deep_url)
     entity_id = business_entity_id_for_maps_business(1)
     client = FakeClient({
-        "https://seed.example/location/jeddah": """
-            <link rel="canonical" href="https://seed.example/location/jeddah">
+        deep_url: f"""
+            <link rel="canonical" href="{deep_url}">
             <a href="tel:+966503333333">Jeddah branch</a>
         """,
         "https://seed.example/": """
@@ -240,31 +238,35 @@ def test_deep_start_uses_fetched_root_as_home_and_does_not_promote_branch_contac
         client_factory=factory(client),
     )
     assert stats.status == "complete"
-    assert stats.canonical_home_url == "https://seed.example/"
-    assert json.loads(fact(conn, entity_id, "business.website.official")[1]) == "https://seed.example/"
+    assert stats.canonical_home_url == deep_url
+    assert json.loads(fact(conn, entity_id, "business.website.official")[1]) == deep_url
+    assert stats.not_observed_facts_created == 0
     assert conn.execute(
-        "SELECT COUNT(*) FROM channels WHERE business_entity_id=? AND channel_type='phone'",
+        "SELECT COUNT(*) FROM channels WHERE business_entity_id=? AND channel_type IN ('phone','instagram')",
         (entity_id,),
     ).fetchone()[0] == 0
     metadata = [json.loads(row[0]) for row in conn.execute(
         "SELECT metadata_json FROM evidence_items WHERE acquisition_session_id=?", (stats.session_id,)
     )]
-    deep = next(item for item in metadata if item["final_url"].endswith("/location/jeddah"))
+    deep = next(item for item in metadata if item["final_url"] == deep_url)
     phone = next(item for item in deep["channels"] if item["channel_type"] == "phone")
-    assert deep["home_page"] is False
+    assert deep["home_page"] is True
+    assert deep["business_wide_scope_eligible"] is False
     assert phone["canonicalized_channel_id"] is None
+    root = next(item for item in metadata if item["final_url"] == "https://seed.example/")
+    assert root["home_page"] is False
+    assert root["business_wide_scope_eligible"] is False
     conn.close()
 
 
-def test_deep_start_without_home_capture_stays_partial_and_emits_no_absence(tmp_path: Path) -> None:
-    conn = prepared(
-        tmp_path / "deep-partial.sqlite",
-        website="https://seed.example/location/jeddah",
-    )
+def test_path_hosted_complete_acquisition_emits_positive_facts_but_no_business_wide_absence(tmp_path: Path) -> None:
+    deep_url = "https://seed.example/location/jeddah"
+    conn = prepared(tmp_path / "deep-complete.sqlite", website=deep_url)
     entity_id = business_entity_id_for_maps_business(1)
     client = FakeClient({
-        "https://seed.example/location/jeddah": """
-            <link rel="canonical" href="https://seed.example/location/jeddah">
+        deep_url: f"""
+            <link rel="canonical" href="{deep_url}">
+            <a href="/book">Book appointment</a>
         """,
     })
     stats = collect_official_website(
@@ -275,10 +277,71 @@ def test_deep_start_without_home_capture_stays_partial_and_emits_no_absence(tmp_
         now=Clock(),
         client_factory=factory(client),
     )
-    assert stats.status == "partial"
-    assert stats.canonical_home_url is None
+    assert stats.status == "complete"
+    assert stats.canonical_home_url == deep_url
     assert stats.not_observed_facts_created == 0
-    assert "capability.online_booking" in stats.unresolved_predicates
+    assert json.loads(fact(conn, entity_id, "capability.online_booking")[1]) is True
+    assert "capability.online_ordering" in stats.unresolved_predicates
+    conn.close()
+
+
+def test_fetched_declared_root_canonical_can_promote_business_wide_scope(tmp_path: Path) -> None:
+    deep_url = "https://seed.example/location/jeddah"
+    root_url = "https://seed.example/"
+    conn = prepared(tmp_path / "canonical-root.sqlite", website=deep_url)
+    entity_id = business_entity_id_for_maps_business(1)
+    client = FakeClient({
+        deep_url: f'<link rel="canonical" href="{root_url}">',
+        root_url: """
+            <link rel="canonical" href="https://seed.example/">
+            <a href="https://instagram.com/seed">Instagram</a>
+        """,
+    })
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "evidence",
+        entity_id=entity_id,
+        config=CrawlConfig(page_limit=2, depth_limit=0),
+        now=Clock(),
+        client_factory=factory(client),
+    )
+    assert stats.status == "complete"
+    assert stats.canonical_home_url == root_url
+    assert json.loads(fact(conn, entity_id, "business.website.official")[1]) == root_url
+    assert conn.execute(
+        "SELECT COUNT(*) FROM channels WHERE business_entity_id=? AND channel_type='instagram'",
+        (entity_id,),
+    ).fetchone()[0] == 1
+    assert stats.not_observed_facts_created == 3
+    metadata = [json.loads(row[0]) for row in conn.execute(
+        "SELECT metadata_json FROM evidence_items WHERE acquisition_session_id=?", (stats.session_id,)
+    )]
+    root = next(item for item in metadata if item["final_url"] == root_url)
+    assert root["home_page"] is True
+    assert root["business_wide_scope_eligible"] is True
+    conn.close()
+
+
+def test_unfetched_declared_canonical_falls_back_to_verified_fetched_url(tmp_path: Path) -> None:
+    deep_url = "https://seed.example/location/jeddah"
+    root_url = "https://seed.example/"
+    conn = prepared(tmp_path / "canonical-unfetched.sqlite", website=deep_url)
+    entity_id = business_entity_id_for_maps_business(1)
+    client = FakeClient({
+        deep_url: f'<link rel="canonical" href="{root_url}">',
+    })
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "evidence",
+        entity_id=entity_id,
+        config=CrawlConfig(page_limit=1, depth_limit=0),
+        now=Clock(),
+        client_factory=factory(client),
+    )
+    assert stats.status == "complete"
+    assert stats.canonical_home_url == deep_url
+    assert json.loads(fact(conn, entity_id, "business.website.official")[1]) == deep_url
+    assert stats.not_observed_facts_created == 0
     conn.close()
 
 
