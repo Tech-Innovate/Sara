@@ -29,17 +29,18 @@ def page_role(url: str) -> str:
     return "home" if path in {"", "/"} else "other"
 
 
-def _origin(url: str) -> str:
+def origin_url(url: str) -> str:
     parsed = urlsplit(url)
     host = parsed.hostname or ""
+    display_host = f"[{host}]" if ":" in host else host
     port = parsed.port
     if port and not (
         (parsed.scheme == "http" and port == 80)
         or (parsed.scheme == "https" and port == 443)
     ):
-        netloc = f"{host}:{port}"
+        netloc = f"{display_host}:{port}"
     else:
-        netloc = host
+        netloc = display_host
     return urlunsplit((parsed.scheme, netloc, "/", "", ""))
 
 
@@ -74,6 +75,35 @@ def _write_artifact(path: Path, body: bytes) -> None:
         raise
 
 
+def _is_home_capture(capture: PageCapture, *, start_url: str) -> bool:
+    root = origin_url(start_url)
+    requested = normalize_http_url(capture.requested_url)
+    final = normalize_http_url(capture.final_url)
+    return requested == root or final == root
+
+
+def _canonical_home(capture: PageCapture, *, start_url: str) -> str:
+    final = normalize_http_url(capture.final_url)
+    if final is None:
+        return capture.final_url
+    candidate = capture.parsed.canonical_url
+    if candidate is None or not same_site(candidate, start_url):
+        return final
+    normalized_candidate = normalize_http_url(candidate)
+    if normalized_candidate is None:
+        return final
+    candidate_parts = urlsplit(normalized_candidate)
+    final_parts = urlsplit(final)
+    if final_parts.scheme == "https" and candidate_parts.scheme != "https":
+        return final
+    if (candidate_parts.path, candidate_parts.query) != (
+        final_parts.path,
+        final_parts.query,
+    ):
+        return final
+    return normalized_candidate
+
+
 def crawl_official_site(
     *,
     entity_id: str,
@@ -92,14 +122,13 @@ def crawl_official_site(
     """
     queue: list[tuple[int, int, str]] = []
     heapq.heappush(queue, (-10_000, 0, start_url))
-    root = _origin(start_url)
+    root = origin_url(start_url)
     if root != start_url:
         heapq.heappush(queue, (-9_000, 0, root))
 
     seen: set[str] = set()
     captures: list[PageCapture] = []
     errors: list[str] = []
-    canonical_home: str | None = None
 
     while queue and len(captures) < config.page_limit:
         _negative_priority, depth, raw_url = heapq.heappop(queue)
@@ -141,20 +170,25 @@ def crawl_official_site(
             )
         )
 
-        if len(captures) == 1:
-            candidate = parsed.canonical_url
-            canonical_home = (
-                candidate
-                if candidate is not None and same_site(candidate, start_url)
-                else response.final_url
-            )
-
         if depth >= config.depth_limit:
             continue
         for link in parsed.links:
             if same_site(link.url, start_url) and link.url not in seen:
                 heapq.heappush(queue, (-link.priority, depth + 1, link.url))
 
+    home_capture = next(
+        (
+            capture
+            for capture in captures
+            if _is_home_capture(capture, start_url=start_url)
+        ),
+        None,
+    )
+    canonical_home = (
+        None
+        if home_capture is None
+        else _canonical_home(home_capture, start_url=start_url)
+    )
     return CrawlResult(
         captures=tuple(captures),
         errors=tuple(errors),
