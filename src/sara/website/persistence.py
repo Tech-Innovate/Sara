@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from ..maps_backfill import _fetch_one
-from .crawl import page_role
+from .crawl import origin_url, page_role
 from .model import (
     CAPABILITY_PREDICATES,
     COLLECTOR_NAME,
@@ -17,8 +18,24 @@ from .model import (
     opaque_id,
     sha256_text,
 )
-from .parser import ChannelCandidate
+from .parser import ChannelCandidate, normalize_http_url
 from .reconcile import reconcile_not_observed, reconcile_observation_group
+
+
+_BUSINESS_WIDE_HOME_CHANNEL_TYPES = {
+    "instagram",
+    "facebook",
+    "linkedin",
+    "x",
+    "tiktok",
+    "youtube",
+    "email",
+    "phone",
+    "whatsapp",
+    "booking",
+    "ordering",
+    "support",
+}
 
 
 def _website_channel(home_url: str) -> ChannelCandidate:
@@ -31,28 +48,36 @@ def _website_channel(home_url: str) -> ChannelCandidate:
     )
 
 
+def _timestamp_key(value: str, *, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise WebsiteAcquisitionError(
+            f"{field} is not a valid ISO-8601 timestamp: {value!r}"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise WebsiteAcquisitionError(f"{field} must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _latest_timestamp(values: list[str], *, field: str) -> str:
+    if not values:
+        raise WebsiteAcquisitionError(f"{field} has no timestamps")
+    return max(values, key=lambda value: _timestamp_key(value, field=field))
+
+
+def _is_home_capture(capture: PageCapture, *, start_url: str) -> bool:
+    root = origin_url(start_url)
+    return (
+        normalize_http_url(capture.requested_url) == root
+        or normalize_http_url(capture.final_url) == root
+    )
+
+
 def _candidate_is_business_wide(
-    candidate: ChannelCandidate, *, role: str, first_page: bool
+    candidate: ChannelCandidate, *, home_page: bool
 ) -> bool:
-    if candidate.channel_type in {
-        "instagram",
-        "facebook",
-        "linkedin",
-        "x",
-        "tiktok",
-        "youtube",
-        "email",
-        "phone",
-        "whatsapp",
-    }:
-        return first_page or role in {"contact", "support"}
-    if candidate.channel_type == "booking":
-        return first_page or role in {"booking", "contact"}
-    if candidate.channel_type == "ordering":
-        return first_page or role in {"ordering", "contact"}
-    if candidate.channel_type == "support":
-        return first_page or role in {"support", "contact"}
-    return False
+    return home_page and candidate.channel_type in _BUSINESS_WIDE_HOME_CHANNEL_TYPES
 
 
 def _ensure_channel(
@@ -159,10 +184,10 @@ def _observations_for_page(
     evidence_id: str,
     capture: PageCapture,
     canonical_home_url: str | None,
-    first_page: bool,
+    home_page: bool,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
-    if first_page and canonical_home_url is not None:
+    if home_page and canonical_home_url is not None:
         result.append(
             _observation(
                 entity_id=entity_id,
@@ -249,9 +274,8 @@ def _page_channels(
     *,
     entity_id: str,
     capture: PageCapture,
-    first_page: bool,
+    home_page: bool,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    role = page_role(capture.final_url)
     metadata: list[dict[str, Any]] = []
     created = refreshed = 0
     for candidate in capture.parsed.channels:
@@ -264,7 +288,7 @@ def _page_channels(
             "canonicalized_channel_id": None,
             "canonicalized_scope": None,
         }
-        if _candidate_is_business_wide(candidate, role=role, first_page=first_page):
+        if _candidate_is_business_wide(candidate, home_page=home_page):
             channel_id, was_created, was_refreshed = _ensure_channel(
                 conn,
                 entity_id=entity_id,
@@ -290,7 +314,11 @@ def ingest_crawl_result(
 ) -> dict[str, Any]:
     if not result.captures:
         raise WebsiteAcquisitionError("cannot ingest an empty website crawl")
-    status = "partial" if result.errors else "complete"
+    status = (
+        "partial"
+        if result.errors or result.canonical_home_url is None
+        else "complete"
+    )
     evidence_created = observations_created = channels_created = channels_refreshed = 0
     facts_created = facts_replaced = supports_created = absence_created = 0
     observed_predicates: set[str] = set()
@@ -309,13 +337,14 @@ def ingest_crawl_result(
 
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         observed_times: dict[tuple[str, str], list[str]] = {}
-        for index, capture in enumerate(result.captures):
+        for capture in result.captures:
             evidence_id = _evidence_id(session_id, capture)
+            home_page = _is_home_capture(capture, start_url=start_url)
             channel_metadata, created, refreshed = _page_channels(
                 conn,
                 entity_id=entity_id,
                 capture=capture,
-                first_page=index == 0,
+                home_page=home_page,
             )
             channels_created += created
             channels_refreshed += refreshed
@@ -324,7 +353,7 @@ def ingest_crawl_result(
                 evidence_id=evidence_id,
                 capture=capture,
                 canonical_home_url=result.canonical_home_url,
-                first_page=index == 0,
+                home_page=home_page,
             )
             metadata_json = canonical_json(
                 {
@@ -335,6 +364,8 @@ def ingest_crawl_result(
                     "final_url": capture.final_url,
                     "crawl_depth": capture.depth,
                     "page_role": page_role(capture.final_url),
+                    "home_page": home_page,
+                    "crawl_frontier_exhausted": result.frontier_exhausted,
                     "title": capture.parsed.title,
                     "canonical_url": capture.parsed.canonical_url,
                     "channels": channel_metadata,
@@ -398,7 +429,10 @@ def ingest_crawl_result(
                 predicate=predicate,
                 fact_slot=fact_slot,
                 observations=specs,
-                observed_at=max(observed_times[(predicate, fact_slot)]),
+                observed_at=_latest_timestamp(
+                    observed_times[(predicate, fact_slot)],
+                    field=f"{predicate} observation group",
+                ),
                 reconciled_at=finished_at,
             )
             facts_created += created
@@ -419,7 +453,10 @@ def ingest_crawl_result(
                 absence_created += created
                 supports_created += support
 
-        error = None if not result.errors else "; ".join(result.errors)[:4000]
+        partial_reasons = list(result.errors)
+        if result.canonical_home_url is None:
+            partial_reasons.append("canonical home page was not established")
+        error = None if status == "complete" else "; ".join(partial_reasons)[:4000]
         cursor = conn.execute(
             "UPDATE acquisition_sessions SET status=?,finished_at=?,error=?,evidence_count=?,"
             "observation_count=? WHERE id=? AND status='running'",
@@ -446,14 +483,16 @@ def ingest_crawl_result(
         conn.rollback()
         raise
 
-    unresolved = tuple(
-        predicate
-        for predicate in (
-            "business.offering.service",
-            "business.customer_segment.stated",
-        )
-        if predicate not in observed_predicates
-    )
+    unresolved_candidates = [
+        "business.offering.service",
+        "business.customer_segment.stated",
+        *(
+            predicate
+            for predicate in CAPABILITY_PREDICATES
+            if predicate not in observed_predicates
+        ),
+    ]
+    unresolved = tuple(dict.fromkeys(unresolved_candidates))
     return {
         "status": status,
         "evidence_items_created": evidence_created,
