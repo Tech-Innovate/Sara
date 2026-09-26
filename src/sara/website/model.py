@@ -15,7 +15,7 @@ class WebsiteAcquisitionError(RuntimeError):
 
 OFFICIAL_WEB_SOURCE_ID = "src_official_web"
 COLLECTOR_NAME = "sara.website"
-COLLECTOR_VERSION = "2"
+COLLECTOR_VERSION = "3"
 RECONCILIATION_VERSION = "official-web-v1"
 ID_NAMESPACE = "sara.business-understanding.official-web.v1"
 CAPABILITY_PREDICATES = (
@@ -33,6 +33,10 @@ class CrawlConfig:
     timeout_seconds: float = 10.0
     request_interval_seconds: float = 1.0
     max_policy_delay_seconds: float = 30.0
+    retry_attempt_limit: int = 4
+    retry_base_delay_seconds: float = 1.0
+    retry_max_delay_seconds: float = 30.0
+    retry_delay_budget_seconds: float = 60.0
     user_agent: str = "SaraBusinessUnderstanding/1.0"
     obey_robots: bool = True
 
@@ -64,6 +68,37 @@ class CrawlConfig:
         ):
             raise ValueError(
                 "max_policy_delay_seconds must be finite, at least request_interval_seconds and at most 300"
+            )
+        if (
+            isinstance(self.retry_attempt_limit, bool)
+            or not isinstance(self.retry_attempt_limit, int)
+            or self.retry_attempt_limit < 1
+            or self.retry_attempt_limit > 8
+        ):
+            raise ValueError("retry_attempt_limit must be an integer between 1 and 8")
+        if (
+            not math.isfinite(self.retry_base_delay_seconds)
+            or self.retry_base_delay_seconds <= 0
+            or self.retry_base_delay_seconds > 60
+        ):
+            raise ValueError(
+                "retry_base_delay_seconds must be finite, greater than zero and at most 60"
+            )
+        if (
+            not math.isfinite(self.retry_max_delay_seconds)
+            or self.retry_max_delay_seconds < self.retry_base_delay_seconds
+            or self.retry_max_delay_seconds > 300
+        ):
+            raise ValueError(
+                "retry_max_delay_seconds must be finite, at least retry_base_delay_seconds and at most 300"
+            )
+        if (
+            not math.isfinite(self.retry_delay_budget_seconds)
+            or self.retry_delay_budget_seconds < self.retry_max_delay_seconds
+            or self.retry_delay_budget_seconds > 900
+        ):
+            raise ValueError(
+                "retry_delay_budget_seconds must be finite, at least retry_max_delay_seconds and at most 900"
             )
         if not self.user_agent.strip():
             raise ValueError("user_agent must not be blank")

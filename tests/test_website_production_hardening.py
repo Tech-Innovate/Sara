@@ -15,7 +15,7 @@ from sara.website.model import COLLECTOR_VERSION, CrawlConfig
 from sara.website.target import begin_session
 
 
-def test_acquisition_session_freezes_pacing_configuration_and_collector_version(
+def test_acquisition_session_freezes_transport_configuration_and_collector_version(
     tmp_path: Path,
 ) -> None:
     conn = connect(tmp_path / "pacing.sqlite")
@@ -36,6 +36,10 @@ def test_acquisition_session_freezes_pacing_configuration_and_collector_version(
     config = CrawlConfig(
         request_interval_seconds=1.5,
         max_policy_delay_seconds=25.0,
+        retry_attempt_limit=5,
+        retry_base_delay_seconds=2.0,
+        retry_max_delay_seconds=20.0,
+        retry_delay_budget_seconds=50.0,
     )
     config.validate()
     session_id = begin_session(
@@ -51,10 +55,14 @@ def test_acquisition_session_freezes_pacing_configuration_and_collector_version(
         (session_id,),
     ).fetchone()
     frozen = json.loads(row[1])
-    assert COLLECTOR_VERSION == "2"
-    assert row[0] == "2"
+    assert COLLECTOR_VERSION == "3"
+    assert row[0] == "3"
     assert frozen["request_interval_seconds"] == 1.5
     assert frozen["max_policy_delay_seconds"] == 25.0
+    assert frozen["retry_attempt_limit"] == 5
+    assert frozen["retry_base_delay_seconds"] == 2.0
+    assert frozen["retry_max_delay_seconds"] == 20.0
+    assert frozen["retry_delay_budget_seconds"] == 50.0
     conn.close()
 
 
@@ -122,6 +130,12 @@ def test_each_validated_address_request_attempt_is_paced(monkeypatch) -> None:
         ({"max_policy_delay_seconds": float("nan")}, "max_policy_delay_seconds"),
         ({"request_interval_seconds": float("inf")}, "request_interval_seconds"),
         ({"max_policy_delay_seconds": float("inf")}, "max_policy_delay_seconds"),
+        ({"retry_base_delay_seconds": float("nan")}, "retry_base_delay_seconds"),
+        ({"retry_max_delay_seconds": float("nan")}, "retry_max_delay_seconds"),
+        ({"retry_delay_budget_seconds": float("nan")}, "retry_delay_budget_seconds"),
+        ({"retry_base_delay_seconds": float("inf")}, "retry_base_delay_seconds"),
+        ({"retry_max_delay_seconds": float("inf")}, "retry_max_delay_seconds"),
+        ({"retry_delay_budget_seconds": float("inf")}, "retry_delay_budget_seconds"),
     ],
 )
 def test_crawl_config_rejects_non_finite_timing_values(kwargs, match: str) -> None:
@@ -129,7 +143,7 @@ def test_crawl_config_rejects_non_finite_timing_values(kwargs, match: str) -> No
         CrawlConfig(**kwargs).validate()
 
 
-def test_http_client_rejects_non_finite_pacing_values() -> None:
+def test_http_client_rejects_non_finite_timing_values() -> None:
     common = {
         "site_url": "https://example.com/",
         "user_agent": "SaraBusinessUnderstanding/1.0",
@@ -140,3 +154,9 @@ def test_http_client_rejects_non_finite_pacing_values() -> None:
         SafeHttpClient(**common, request_interval_seconds=float("nan"))
     with pytest.raises(ValueError, match="max_policy_delay_seconds"):
         SafeHttpClient(**common, max_policy_delay_seconds=float("nan"))
+    with pytest.raises(ValueError, match="retry_base_delay_seconds"):
+        SafeHttpClient(**common, retry_base_delay_seconds=float("nan"))
+    with pytest.raises(ValueError, match="retry_max_delay_seconds"):
+        SafeHttpClient(**common, retry_max_delay_seconds=float("nan"))
+    with pytest.raises(ValueError, match="retry_delay_budget_seconds"):
+        SafeHttpClient(**common, retry_delay_budget_seconds=float("nan"))
