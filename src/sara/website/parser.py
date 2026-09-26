@@ -274,7 +274,7 @@ def classify_channel(
         if normalized is None:
             return None
         return ChannelCandidate(
-            "phone", original, normalized, f"tel:{normalized}", "direct_link"
+            "phone", normalized, normalized, f"tel:{normalized}", "direct_link"
         )
 
     url = normalize_http_url(raw, page_url)
@@ -291,12 +291,12 @@ def classify_channel(
 
     if host == "wa.me" or host.endswith(".whatsapp.com") or host == "whatsapp.com":
         return ChannelCandidate(
-            "whatsapp", url, url.lower(), url, "direct_link"
+            "whatsapp", url, url, url, "direct_link"
         )
 
     social = _social_type(host)
     if social and _is_social_profile(url, social):
-        return ChannelCandidate(social, url, url.lower(), url, "direct_link")
+        return ChannelCandidate(social, url, url, url, "direct_link")
 
     explicit_booking_text = bool(text_tokens & _BOOKING_TERMS) or (
         "book" in text_tokens and bool(text_tokens & _BOOKING_ACTION_TERMS)
@@ -304,13 +304,13 @@ def classify_channel(
     if _domain_matches(host, _BOOKING_DOMAINS) or (
         bool(combined & (_BOOKING_TERMS | {"book"})) and explicit_booking_text
     ):
-        return ChannelCandidate("booking", url, url.lower(), url, "action_link")
+        return ChannelCandidate("booking", url, url, url, "action_link")
     if _domain_matches(host, _ORDERING_DOMAINS) or (
         bool(combined & _ORDERING_TERMS) and bool(text_tokens & _ORDERING_TERMS)
     ):
-        return ChannelCandidate("ordering", url, url.lower(), url, "action_link")
+        return ChannelCandidate("ordering", url, url, url, "action_link")
     if bool(combined & _SUPPORT_TERMS) and bool(text_tokens & _SUPPORT_TERMS):
-        return ChannelCandidate("support", url, url.lower(), url, "action_link")
+        return ChannelCandidate("support", url, url, url, "action_link")
     return None
 
 
