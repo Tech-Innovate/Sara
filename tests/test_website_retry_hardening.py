@@ -253,3 +253,25 @@ def test_validated_ip_failover_consumes_attempt_budget(monkeypatch) -> None:
         client._request_with_retries("https://example.com/page", 65536)
 
     assert len(attempts) == 3
+
+
+def test_repeated_dns_failures_are_bounded(monkeypatch) -> None:
+    lookups = 0
+    sleeps: list[float] = []
+
+    def lookup(_host, _port, **_kwargs):
+        nonlocal lookups
+        lookups += 1
+        raise socket.gaierror("temporary resolver failure")
+
+    client = _client(
+        retry_attempt_limit=3,
+        dns_lookup=lookup,
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(WebsiteFetchError, match="attempt limit exhausted"):
+        client._request_with_retries("https://example.com/page", 65536)
+
+    assert lookups == 3
+    assert sleeps == pytest.approx([1.0, 2.0])
