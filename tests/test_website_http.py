@@ -3,7 +3,7 @@ import socket
 import pytest
 
 from sara.website import CrawlConfig
-from sara.website.http import SafeHttpClient, WebsiteBlockedError
+from sara.website.http import SafeHttpClient, WebsiteBlockedError, _PinnedHTTPConnection
 
 
 def _client(address: str) -> SafeHttpClient:
@@ -31,7 +31,44 @@ def test_private_or_local_resolution_is_blocked(address: str) -> None:
 
 def test_public_resolution_passes_ssrf_guard() -> None:
     client = _client("93.184.216.34")
-    client._assert_public_host("https://example.com/")
+    assert client._resolve_public_addresses("https://example.com/") == (
+        "93.184.216.34",
+    )
+
+
+def test_mixed_public_and_private_dns_answers_fail_closed() -> None:
+    def lookup(_host, _port, **_kwargs):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ]
+
+    client = SafeHttpClient(
+        site_url="https://example.com/",
+        user_agent="SaraBusinessUnderstanding/1.0",
+        timeout_seconds=2,
+        max_response_bytes=65536,
+        dns_lookup=lookup,
+    )
+    with pytest.raises(WebsiteBlockedError, match="non-public"):
+        client._resolve_public_addresses("https://example.com/")
+
+
+def test_connection_uses_validated_address_not_hostname_dns(monkeypatch) -> None:
+    called = []
+    sentinel = object()
+
+    def connect(address, timeout):
+        called.append((address, timeout))
+        return sentinel
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    connection = _PinnedHTTPConnection(
+        "example.com", 80, "93.184.216.34", 2.5
+    )
+    connection.connect()
+    assert connection.sock is sentinel
+    assert called == [(('93.184.216.34', 80), 2.5)]
 
 
 def test_cross_site_fetch_target_is_blocked_before_request() -> None:
