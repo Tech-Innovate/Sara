@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..maps_backfill import _fetch_one
-from .crawl import page_role
+from .crawl import origin_url, page_role
 from .model import (
     CAPABILITY_PREDICATES,
     COLLECTOR_NAME,
@@ -76,10 +76,27 @@ def _is_home_capture(
     )
 
 
-def _candidate_is_business_wide(
-    candidate: ChannelCandidate, *, home_page: bool
+def _business_wide_scope_eligible(
+    *, start_url: str, canonical_home_url: str | None
 ) -> bool:
-    return home_page and candidate.channel_type in _BUSINESS_WIDE_HOME_CHANNEL_TYPES
+    start = normalize_http_url(start_url)
+    if start is None:
+        return False
+    if start == origin_url(start):
+        return True
+    if canonical_home_url is None:
+        return False
+    return page_role(canonical_home_url) == "home"
+
+
+def _candidate_is_business_wide(
+    candidate: ChannelCandidate, *, home_page: bool, scope_eligible: bool
+) -> bool:
+    return (
+        home_page
+        and scope_eligible
+        and candidate.channel_type in _BUSINESS_WIDE_HOME_CHANNEL_TYPES
+    )
 
 
 def _ensure_channel(
@@ -277,6 +294,7 @@ def _page_channels(
     entity_id: str,
     capture: PageCapture,
     home_page: bool,
+    scope_eligible: bool,
 ) -> tuple[list[dict[str, Any]], int, int]:
     metadata: list[dict[str, Any]] = []
     created = refreshed = 0
@@ -290,7 +308,9 @@ def _page_channels(
             "canonicalized_channel_id": None,
             "canonicalized_scope": None,
         }
-        if _candidate_is_business_wide(candidate, home_page=home_page):
+        if _candidate_is_business_wide(
+            candidate, home_page=home_page, scope_eligible=scope_eligible
+        ):
             channel_id, was_created, was_refreshed = _ensure_channel(
                 conn,
                 entity_id=entity_id,
@@ -321,6 +341,9 @@ def ingest_crawl_result(
         if result.errors or result.canonical_home_url is None
         else "complete"
     )
+    scope_eligible = _business_wide_scope_eligible(
+        start_url=start_url, canonical_home_url=result.canonical_home_url
+    )
     evidence_created = observations_created = channels_created = channels_refreshed = 0
     facts_created = facts_replaced = supports_created = absence_created = 0
     observed_predicates: set[str] = set()
@@ -349,6 +372,7 @@ def ingest_crawl_result(
                 entity_id=entity_id,
                 capture=capture,
                 home_page=home_page,
+                scope_eligible=scope_eligible,
             )
             channels_created += created
             channels_refreshed += refreshed
@@ -369,6 +393,7 @@ def ingest_crawl_result(
                     "crawl_depth": capture.depth,
                     "page_role": page_role(capture.final_url),
                     "home_page": home_page,
+                    "business_wide_scope_eligible": scope_eligible,
                     "crawl_frontier_exhausted": result.frontier_exhausted,
                     "title": capture.parsed.title,
                     "canonical_url": capture.parsed.canonical_url,
@@ -443,7 +468,7 @@ def ingest_crawl_result(
             facts_replaced += replaced
             supports_created += links
 
-        if status == "complete":
+        if status == "complete" and scope_eligible:
             for predicate in CAPABILITY_PREDICATES:
                 if predicate in observed_predicates:
                     continue
