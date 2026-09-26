@@ -75,6 +75,7 @@ def test_controlled_merge_probe_partitions_one_real_business_and_preserves_histo
     assert result.details["source_business_id"] == 1
     assert result.details["survivor_business_id"] == 1
     assert result.details["synthetic_duplicate_business_id"] != 1
+    assert result.details["synthetic_partition_run_id"] == "validation-merge-probe-partition-1"
     assert result.details["synthetic_bridge_run_id"] == "validation-merge-probe-1"
     assert result.details["durable_evidence_count_before"] >= 2
     assert result.details["durable_evidence_count_after"] == result.details["durable_evidence_count_before"]
@@ -87,6 +88,27 @@ def test_controlled_merge_probe_partitions_one_real_business_and_preserves_histo
 
     check = sqlite3.connect(probe)
     check.row_factory = sqlite3.Row
+    partition = check.execute(
+        "SELECT area_name,queries_json,scraper_image,config_json,raw_path,raw_records,"
+        "accepted_records,unique_seen,new_businesses "
+        "FROM runs WHERE id='validation-merge-probe-partition-1'"
+    ).fetchone()
+    assert partition is not None
+    assert partition["area_name"] == "controlled-validation-merge-probe-partition"
+    assert partition["queries_json"] == "[]"
+    assert partition["scraper_image"] == "sara-controlled-merge-probe"
+    assert partition["raw_path"] is None
+    assert tuple(
+        partition[field]
+        for field in ("raw_records", "accepted_records", "unique_seen", "new_businesses")
+    ) == (2, 2, 2, 1)
+    assert json.loads(partition["config_json"]) == {
+        "validation_kind": "controlled_maps_identity_partition_probe",
+        "source_business_id": 1,
+        "source_run_id": "r1",
+        "synthetic_record": True,
+    }
+
     bridge = check.execute(
         "SELECT area_name,queries_json,scraper_image,config_json,raw_path "
         "FROM runs WHERE id='validation-merge-probe-1'"
@@ -100,17 +122,40 @@ def test_controlled_merge_probe_partitions_one_real_business_and_preserves_histo
         "validation_kind": "controlled_maps_identity_merge_probe",
         "source_business_id": 1,
         "source_run_id": "r1",
+        "synthetic_partition_run_id": "validation-merge-probe-partition-1",
         "synthetic_record": True,
     }
-    bridge_artifact_refs = {
-        row[0]
+
+    for synthetic_run_id in (
+        "validation-merge-probe-partition-1",
+        "validation-merge-probe-1",
+    ):
+        artifact_refs = {
+            row[0]
+            for row in check.execute(
+                "SELECT e.artifact_ref FROM evidence_items e "
+                "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+                "WHERE a.legacy_run_id=?",
+                (synthetic_run_id,),
+            )
+        }
+        assert artifact_refs == {None}
+
+    # The real acquisition run remains historical provenance for the original row only;
+    # the validation-generated duplicate is never inserted into it.
+    real_run_members = {
+        int(row[0])
         for row in check.execute(
-            "SELECT e.artifact_ref FROM evidence_items e "
-            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
-            "WHERE a.legacy_run_id='validation-merge-probe-1'"
+            "SELECT business_id FROM run_businesses WHERE run_id='r1' ORDER BY business_id"
         )
     }
-    assert bridge_artifact_refs == {None}
+    assert real_run_members == {1}
+    real_run_session_count = int(
+        check.execute(
+            "SELECT COUNT(*) FROM acquisition_sessions WHERE legacy_run_id='r1'"
+        ).fetchone()[0]
+    )
+    assert real_run_session_count == 0
     check.close()
 
 
