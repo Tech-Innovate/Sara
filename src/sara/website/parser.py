@@ -33,7 +33,7 @@ _HIGH_VALUE_TERMS = {
     "support": 85,
     "help": 75,
 }
-_BOOKING_TERMS = {"book", "booking", "reserve", "reservation", "appointment", "appointments"}
+_BOOKING_TERMS = {"booking", "reserve", "reservation", "appointment", "appointments"}
 _ORDERING_TERMS = {"order", "ordering", "delivery", "deliver", "pickup", "takeaway", "takeout"}
 _SUPPORT_TERMS = {"support", "help", "helpdesk"}
 _SOCIAL_HOSTS = {
@@ -116,7 +116,10 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         return None
     host = parsed.hostname.lower().rstrip(".")
     port = parsed.port
-    if port and not ((parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443)):
+    if port and not (
+        (parsed.scheme.lower() == "http" and port == 80)
+        or (parsed.scheme.lower() == "https" and port == 443)
+    ):
         netloc = f"{host}:{port}"
     else:
         netloc = host
@@ -125,7 +128,9 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         (key, item)
         for key, item in parse_qsl(parsed.query, keep_blank_values=True)
         if key.lower() not in _TRACKING_QUERY_KEYS
-        and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
+        and not any(
+            key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES
+        )
     ]
     query = urlencode(pairs, doseq=True)
     return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
@@ -141,7 +146,9 @@ def _priority(url: str, text: str) -> int:
     score = 0
     for token in tokens:
         score = max(score, _HIGH_VALUE_TERMS.get(token, 0))
-    depth_penalty = max(0, len([part for part in parsed.path.split("/") if part]) - 1) * 3
+    depth_penalty = max(
+        0, len([part for part in parsed.path.split("/") if part]) - 1
+    ) * 3
     return score - depth_penalty
 
 
@@ -162,20 +169,26 @@ def _social_type(host: str) -> str | None:
     return None
 
 
-def classify_channel(href: str, text: str, page_url: str) -> ChannelCandidate | None:
+def classify_channel(
+    href: str, text: str, page_url: str
+) -> ChannelCandidate | None:
     raw = html.unescape(href).strip()
     lower = raw.lower()
     if lower.startswith("mailto:"):
         address = raw[7:].split("?", 1)[0].strip().lower()
         if not address or "@" not in address:
             return None
-        return ChannelCandidate("email", address, address, f"mailto:{address}", "direct_link")
+        return ChannelCandidate(
+            "email", address, address, f"mailto:{address}", "direct_link"
+        )
     if lower.startswith("tel:"):
         original = raw[4:].split("?", 1)[0].strip()
         normalized = _normalize_phone(original)
         if normalized is None:
             return None
-        return ChannelCandidate("phone", original, normalized, f"tel:{normalized}", "direct_link")
+        return ChannelCandidate(
+            "phone", original, normalized, f"tel:{normalized}", "direct_link"
+        )
 
     url = normalize_http_url(raw, page_url)
     if url is None:
@@ -187,8 +200,9 @@ def classify_channel(href: str, text: str, page_url: str) -> ChannelCandidate | 
     combined = path_tokens | text_tokens
 
     if host == "wa.me" or host.endswith(".whatsapp.com") or host == "whatsapp.com":
-        identifier = url
-        return ChannelCandidate("whatsapp", identifier, identifier.lower(), url, "direct_link")
+        return ChannelCandidate(
+            "whatsapp", url, url.lower(), url, "direct_link"
+        )
 
     social = _social_type(host)
     if social:
@@ -220,7 +234,9 @@ class _PageParser(HTMLParser):
         self._links: list[tuple[str, str, tuple[str, ...]]] = []
         self.canonical_url: str | None = None
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
         values = {key.lower(): (value or "") for key, value in attrs}
         name = tag.lower()
         if name == "title":
@@ -233,7 +249,9 @@ class _PageParser(HTMLParser):
                     self.canonical_url = candidate
         elif name == "a":
             self._anchor_href = values.get("href") or None
-            self._anchor_rel = tuple(sorted(token.lower() for token in values.get("rel", "").split()))
+            self._anchor_rel = tuple(
+                sorted(token.lower() for token in values.get("rel", "").split())
+            )
             self._anchor_text = []
 
     def handle_endtag(self, tag: str) -> None:
@@ -267,18 +285,23 @@ class _PageParser(HTMLParser):
                 whatsapp = whatsapp or channel.channel_type == "whatsapp"
 
             url = normalize_http_url(href, self.page_url)
-            if url is None:
+            if url is None or "nofollow" in rel:
                 continue
-            if "nofollow" in rel:
-                continue
-            candidate = LinkCandidate(url=url, text=text, rel=rel, priority=_priority(url, text))
+            candidate = LinkCandidate(
+                url=url, text=text, rel=rel, priority=_priority(url, text)
+            )
             previous = link_map.get(url)
             if previous is None or candidate.priority > previous.priority:
                 link_map[url] = candidate
 
-        links = tuple(sorted(link_map.values(), key=lambda item: (-item.priority, item.url)))
+        links = tuple(
+            sorted(link_map.values(), key=lambda item: (-item.priority, item.url))
+        )
         channels = tuple(
-            sorted(channel_map.values(), key=lambda item: (item.channel_type, item.normalized_identifier))
+            sorted(
+                channel_map.values(),
+                key=lambda item: (item.channel_type, item.normalized_identifier),
+            )
         )
         return ParsedPage(
             title=title,
