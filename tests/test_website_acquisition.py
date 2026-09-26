@@ -106,6 +106,8 @@ def test_complete_acquisition_is_dossier_clean_and_preserves_absence_semantics(t
             <a href="/book">Book appointment</a>
             <a href="/contact">Contact</a>
             <a href="https://wa.me/966501234567">WhatsApp</a>
+            <a href="mailto:home@seed.example">Email</a>
+            <a href="tel:+966509999999">Call</a>
             <a href="https://instagram.com/seed">Instagram</a>
         """,
         "https://seed.example/book": "<h1>Book</h1>",
@@ -136,8 +138,8 @@ def test_complete_acquisition_is_dossier_clean_and_preserves_absence_semantics(t
     channel_types = {row[0] for row in conn.execute(
         "SELECT channel_type FROM channels WHERE business_entity_id=?", (entity_id,)
     )}
-    assert {"website", "booking", "whatsapp", "instagram"} <= channel_types
-    assert not ({"email", "phone"} & channel_types)
+    assert {"website", "booking", "instagram"} <= channel_types
+    assert not ({"email", "phone", "whatsapp"} & channel_types)
     metadata = [json.loads(row[0]) for row in conn.execute(
         "SELECT metadata_json FROM evidence_items WHERE acquisition_session_id=?", (stats.session_id,)
     )]
@@ -149,6 +151,19 @@ def test_complete_acquisition_is_dossier_clean_and_preserves_absence_semantics(t
     ]
     assert {item["channel_type"] for item in contact_channels} == {"email", "phone"}
     assert all(item["canonicalized_channel_id"] is None for item in contact_channels)
+    home_channels = [
+        channel
+        for item in metadata
+        if item["home_page"]
+        for channel in item["channels"]
+    ]
+    scoped_types = {"email", "phone", "whatsapp"}
+    assert scoped_types <= {item["channel_type"] for item in home_channels}
+    assert all(
+        item["canonicalized_channel_id"] is None
+        for item in home_channels
+        if item["channel_type"] in scoped_types
+    )
 
     dossier = build_business_dossier(
         conn, entity_id=entity_id, evaluated_at="2026-09-26T07:00:00+00:00"
@@ -282,6 +297,40 @@ def test_path_hosted_complete_acquisition_emits_positive_facts_but_no_business_w
     assert stats.not_observed_facts_created == 0
     assert json.loads(fact(conn, entity_id, "capability.online_booking")[1]) is True
     assert "capability.online_ordering" in stats.unresolved_predicates
+    conn.close()
+
+
+def test_query_scoped_root_does_not_unlock_business_wide_scope(tmp_path: Path) -> None:
+    scoped_url = "https://seed.example/?branch=jeddah"
+    conn = prepared(tmp_path / "query-root.sqlite", website=scoped_url)
+    entity_id = business_entity_id_for_maps_business(1)
+    client = FakeClient({
+        scoped_url: f"""
+            <link rel="canonical" href="{scoped_url}">
+            <a href="https://instagram.com/seed">Instagram</a>
+        """,
+    })
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "evidence",
+        entity_id=entity_id,
+        config=CrawlConfig(page_limit=1, depth_limit=0),
+        now=Clock(),
+        client_factory=factory(client),
+    )
+    assert stats.status == "complete"
+    assert stats.canonical_home_url == scoped_url
+    assert stats.not_observed_facts_created == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM channels WHERE business_entity_id=? AND channel_type='instagram'",
+        (entity_id,),
+    ).fetchone()[0] == 0
+    metadata = json.loads(conn.execute(
+        "SELECT metadata_json FROM evidence_items WHERE acquisition_session_id=?",
+        (stats.session_id,),
+    ).fetchone()[0])
+    assert metadata["home_page"] is True
+    assert metadata["business_wide_scope_eligible"] is False
     conn.close()
 
 
