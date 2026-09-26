@@ -139,9 +139,9 @@ def reconcile_observation_group(
 ) -> tuple[int, int, int]:
     """Reconcile one official-site value without rewriting history.
 
-    Returns (facts_created, facts_replaced, support_links_created). Late-arriving
-    evidence older than the current fact is retained as an Observation but is not
-    allowed to corrupt the current fact's immutable status/provenance semantics.
+    Semantic URL equivalence avoids representation-only conflicts, but support
+    edges remain exact-value claims. A historical observation is therefore never
+    attached as support to a differently serialized current value.
     """
     if not observations:
         return 0, 0, 0
@@ -216,11 +216,14 @@ def reconcile_observation_group(
 
     previous = _usable_supports(conn, str(current["id"]))
     previous_sources = {item["source_id"] for item in previous}
-    same_value = values_equivalent(predicate, current["value_json"], value_json)
+    exact_same = (
+        current["value_json"] == value_json and current["value_hash"] == value_hash
+    )
+    semantically_same = values_equivalent(predicate, current["value_json"], value_json)
     last_verified = str(current["last_verified_at"] or current["valid_from"])
 
     if str(observed_at) < str(current["valid_from"]):
-        if same_value and (
+        if exact_same and (
             current["status"] == "confirmed"
             or previous_sources == {OFFICIAL_WEB_SOURCE_ID}
         ):
@@ -236,7 +239,7 @@ def reconcile_observation_group(
             return 0, 0, links
         return 0, 0, 0
 
-    if same_value and str(observed_at) <= last_verified:
+    if exact_same and str(observed_at) <= last_verified:
         if current["status"] == "confirmed" or previous_sources == {OFFICIAL_WEB_SOURCE_ID}:
             links = sum(
                 _link_observation(
@@ -254,16 +257,12 @@ def reconcile_observation_group(
     fact_id = opaque_id(
         "fact", entity_id, predicate, fact_slot, value_hash, observed_at
     )
-    same_value_old = [
-        item
-        for item in previous
-        if values_equivalent(predicate, item["value_json"], value_json)
-    ]
-    support_sources = {item["source_id"] for item in same_value_old}
+    exact_same_old = [item for item in previous if item["value_json"] == value_json]
+    support_sources = {item["source_id"] for item in exact_same_old}
     support_sources.add(OFFICIAL_WEB_SOURCE_ID)
     status = (
         "confirmed"
-        if (same_value and current["status"] == "confirmed")
+        if (exact_same and current["status"] == "confirmed")
         or len(support_sources) >= 2
         else "single_source"
     )
@@ -280,7 +279,7 @@ def reconcile_observation_group(
         reconciled_at=reconciled_at,
     )
     links = 0
-    for item in same_value_old:
+    for item in exact_same_old:
         links += _link_observation(
             conn,
             fact_id=fact_id,
@@ -294,7 +293,7 @@ def reconcile_observation_group(
             observation_id=observation_id,
             role="supports",
         )
-    if not same_value:
+    if not semantically_same:
         for item in previous:
             if not values_equivalent(predicate, item["value_json"], value_json):
                 links += _link_observation(
