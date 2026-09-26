@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
+from sara.maps_backfill import backfill_maps_business_understanding
+from sara.migrations import apply_migrations
 from sara.storage import connect, ingest_records
+from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 from sara.website_validation import _parser, _validate_arguments
 from sara.website_validation_merge_probe import run_controlled_merge_survival_probe
 
@@ -49,20 +53,27 @@ def _source_database(path: Path, *, with_cid: bool = True) -> None:
     conn.close()
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_controlled_merge_probe_partitions_one_real_business_and_preserves_history(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.sqlite"
     probe = tmp_path / "probe.sqlite"
     _source_database(source)
+    source_hash_before = _sha256(source)
 
     result = run_controlled_merge_survival_probe(source, probe, 1)
 
     assert result.passed is True, result.details
+    assert _sha256(source) == source_hash_before
     assert result.details["probe_kind"] == "controlled_complementary_identifier_partition"
     assert result.details["source_business_id"] == 1
     assert result.details["survivor_business_id"] == 1
     assert result.details["synthetic_duplicate_business_id"] != 1
+    assert result.details["synthetic_bridge_run_id"] == "validation-merge-probe-1"
     assert result.details["durable_evidence_count_before"] >= 2
     assert result.details["durable_evidence_count_after"] == result.details["durable_evidence_count_before"]
     assert result.details["missing_evidence_ids"] == []
@@ -82,6 +93,24 @@ def test_controlled_merge_probe_requires_two_real_strong_identifiers(tmp_path: P
 
     assert result.passed is False
     assert "needs at least two strong Maps identifiers" in result.details["error"]
+
+
+def test_controlled_merge_probe_rejects_already_bootstrapped_source_copy(tmp_path: Path) -> None:
+    source = tmp_path / "source.sqlite"
+    probe = tmp_path / "probe.sqlite"
+    _source_database(source)
+    conn = connect(source)
+    apply_migrations(conn)
+    seed_business_understanding_vocabulary(conn)
+    backfill_maps_business_understanding(conn)
+    conn.close()
+    source_hash_before = _sha256(source)
+
+    result = run_controlled_merge_survival_probe(source, probe, 1)
+
+    assert result.passed is False
+    assert _sha256(source) == source_hash_before
+    assert "requires the representative source snapshot before Business Understanding bootstrap" in result.details["error"]
 
 
 def test_validation_cli_accepts_controlled_probe_without_natural_merge_pair(tmp_path: Path) -> None:
