@@ -77,6 +77,27 @@ def test_cross_site_fetch_target_is_blocked_before_request() -> None:
         client._assert_allowed_site("https://evil.example.net/")
 
 
+def test_same_site_boundary_blocks_https_downgrade_and_port_shift() -> None:
+    client = _client("93.184.216.34")
+    client._assert_allowed_site("https://www.example.com/path")
+    with pytest.raises(WebsiteBlockedError, match="downgrade"):
+        client._assert_allowed_site("http://example.com/path")
+    with pytest.raises(WebsiteBlockedError, match="port shift"):
+        client._assert_allowed_site("https://example.com:8443/path")
+
+
+def test_same_site_boundary_allows_default_http_to_https_upgrade() -> None:
+    client = SafeHttpClient(
+        site_url="http://example.com/",
+        user_agent="SaraBusinessUnderstanding/1.0",
+        timeout_seconds=2,
+        max_response_bytes=65536,
+    )
+    client._assert_allowed_site("https://www.example.com/path")
+    with pytest.raises(WebsiteBlockedError, match="transition"):
+        client._assert_allowed_site("https://example.com:8443/path")
+
+
 def test_phase6_config_cannot_disable_robots_compliance() -> None:
     with pytest.raises(ValueError, match="robots"):
         CrawlConfig(obey_robots=False).validate()
