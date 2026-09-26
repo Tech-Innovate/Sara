@@ -30,6 +30,8 @@ class CrawlConfig:
     depth_limit: int = 2
     max_response_bytes: int = 1_048_576
     timeout_seconds: float = 10.0
+    request_interval_seconds: float = 1.0
+    max_policy_delay_seconds: float = 30.0
     user_agent: str = "SaraBusinessUnderstanding/1.0"
     obey_robots: bool = True
 
@@ -42,6 +44,17 @@ class CrawlConfig:
             raise ValueError("max_response_bytes must be between 16384 and 10485760")
         if self.timeout_seconds <= 0 or self.timeout_seconds > 120:
             raise ValueError("timeout_seconds must be greater than zero and at most 120")
+        if self.request_interval_seconds <= 0 or self.request_interval_seconds > 60:
+            raise ValueError(
+                "request_interval_seconds must be greater than zero and at most 60"
+            )
+        if (
+            self.max_policy_delay_seconds < self.request_interval_seconds
+            or self.max_policy_delay_seconds > 300
+        ):
+            raise ValueError(
+                "max_policy_delay_seconds must be at least request_interval_seconds and at most 300"
+            )
         if not self.user_agent.strip():
             raise ValueError("user_agent must not be blank")
         if not self.obey_robots:
