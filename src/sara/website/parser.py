@@ -119,7 +119,9 @@ class ParsedPage:
 
 def _host(value: str) -> str:
     try:
-        host = (urlsplit(value).hostname or "").lower().rstrip(".")
+        parsed = urlsplit(value)
+        _ = parsed.port
+        host = (parsed.hostname or "").lower().rstrip(".")
     except ValueError:
         return ""
     return host[4:] if host.startswith("www.") else host
