@@ -348,7 +348,7 @@ def validate_multi_branch_groups(
 def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
     value_statuses = ("confirmed", "single_source", "conflicted", "stale")
     placeholders = ",".join("?" for _ in value_statuses)
-    unsupported_value_facts = [
+    value_facts_without_full_chain = [
         str(row[0])
         for row in conn.execute(
             "SELECT f.id FROM facts f "
@@ -362,6 +362,50 @@ def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
             "  WHERE fos.fact_id=f.id AND fos.support_role='supports'"
             ") ORDER BY f.id",
             value_statuses,
+        )
+    ]
+    value_facts_without_usable_support = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT f.id FROM facts f "
+            f"WHERE f.status IN ({placeholders}) "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM fact_observation_support fos "
+            "  JOIN observations o ON o.id=fos.observation_id "
+            "  JOIN evidence_items e ON e.id=o.evidence_id "
+            "  JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "  JOIN sources s ON s.id=a.source_id "
+            "  WHERE fos.fact_id=f.id AND fos.support_role='supports' AND e.status='usable'"
+            ") ORDER BY f.id",
+            value_statuses,
+        )
+    ]
+    value_facts_with_nonusable_support = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT f.id FROM facts f "
+            "JOIN fact_observation_support fos ON fos.fact_id=f.id "
+            "JOIN observations o ON o.id=fos.observation_id "
+            "JOIN evidence_items e ON e.id=o.evidence_id "
+            f"WHERE f.status IN ({placeholders}) AND e.status<>'usable' ORDER BY f.id",
+            value_statuses,
+        )
+    ]
+    single_source_mismatches = [
+        {
+            "fact_id": str(row[0]),
+            "usable_source_count": int(row[1]),
+        }
+        for row in conn.execute(
+            "SELECT f.id,COUNT(DISTINCT CASE "
+            "WHEN fos.support_role='supports' AND e.status='usable' THEN e.source_id END) "
+            "AS usable_source_count "
+            "FROM facts f "
+            "LEFT JOIN fact_observation_support fos ON fos.fact_id=f.id "
+            "LEFT JOIN observations o ON o.id=fos.observation_id "
+            "LEFT JOIN evidence_items e ON e.id=o.evidence_id "
+            "WHERE f.status='single_source' GROUP BY f.id "
+            "HAVING usable_source_count<>1 ORDER BY f.id"
         )
     ]
     unsupported_not_observed = [
@@ -381,9 +425,18 @@ def validate_fact_provenance(conn: sqlite3.Connection) -> CheckResult:
     ]
     return CheckResult(
         name="fact_provenance_is_complete",
-        passed=not unsupported_value_facts and not unsupported_not_observed,
+        passed=(
+            not value_facts_without_full_chain
+            and not value_facts_without_usable_support
+            and not value_facts_with_nonusable_support
+            and not single_source_mismatches
+            and not unsupported_not_observed
+        ),
         details={
-            "value_facts_without_full_chain": unsupported_value_facts,
+            "value_facts_without_full_chain": value_facts_without_full_chain,
+            "value_facts_without_usable_support": value_facts_without_usable_support,
+            "value_facts_with_nonusable_support": value_facts_with_nonusable_support,
+            "single_source_usable_source_count_mismatch": single_source_mismatches,
             "not_observed_without_complete_absence_support": unsupported_not_observed,
         },
     )
