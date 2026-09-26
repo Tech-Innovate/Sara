@@ -1,13 +1,9 @@
-name: Apply fallback identity compatibility patch
-
+name: Patch legacy fallback identity compatibility
 on:
   push:
-    branches:
-      - fix/maps-source-shape-merge-probe
-
+    branches: [fix/maps-source-shape-merge-probe]
 permissions:
   contents: write
-
 jobs:
   patch:
     if: github.actor != 'github-actions[bot]'
@@ -15,155 +11,170 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Preserve historical fallback identities
+          ref: fix/maps-source-shape-merge-probe
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply compatibility patch
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          path = Path('src/sara/storage.py')
-          text = path.read_text(encoding='utf-8')
+          storage = Path('src/sara/storage.py')
+          text = storage.read_text()
+          text = text.replace(
+              'from .maps_source import official_website\n',
+              'from .maps_source import MapsSourceShapeError, official_website\n',
+              1,
+          )
+          old_identity = '''def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:\n    website = official_website(record)\n    place_id = _text(record.get("place_id"))\n    cid = _text(record.get("cid"))\n    data_id = _text(record.get("data_id"))\n    if place_id:\n        return place_id, cid, data_id, f"place:{place_id}"\n    if cid:\n        return place_id, cid, data_id, f"cid:{cid}"\n    if data_id:\n        return place_id, cid, data_id, f"data:{data_id}"\n\n    latitude, longitude = _coordinates(record)\n    values = (\n        _text(record.get("link")),\n        _text(record.get("title")),\n        _text(record.get("address")),\n        _text(record.get("phone")),\n        website,\n        None if latitude is None else str(latitude),\n        None if longitude is None else str(longitude),\n    )\n    normalized = [value.strip().lower() if value else "" for value in values]\n    if not any(normalized):\n        raise UnidentifiableRecord("record has no usable identity fields")\n    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()\n    return place_id, cid, data_id, f"fallback:{digest}"\n'''
+          new_identity = '''def _fallback_identity_key(record: dict[str, Any], website: str | None) -> str:\n    latitude, longitude = _coordinates(record)\n    values = (\n        _text(record.get("link")),\n        _text(record.get("title")),\n        _text(record.get("address")),\n        _text(record.get("phone")),\n        website,\n        None if latitude is None else str(latitude),\n        None if longitude is None else str(longitude),\n    )\n    normalized = [value.strip().lower() if value else "" for value in values]\n    if not any(normalized):\n        raise UnidentifiableRecord("record has no usable identity fields")\n    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()\n    return f"fallback:{digest}"\n\n\ndef _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:\n    website = official_website(record)\n    place_id = _text(record.get("place_id"))\n    cid = _text(record.get("cid"))\n    data_id = _text(record.get("data_id"))\n    if place_id:\n        return place_id, cid, data_id, f"place:{place_id}"\n    if cid:\n        return place_id, cid, data_id, f"cid:{cid}"\n    if data_id:\n        return place_id, cid, data_id, f"data:{data_id}"\n    return place_id, cid, data_id, _fallback_identity_key(record, website)\n'''
+          if text.count(old_identity) != 1:
+              raise SystemExit('storage identity block not found exactly once')
+          text = text.replace(old_identity, new_identity, 1)
 
-          old = '''def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
-    website = official_website(record)
-    place_id = _text(record.get("place_id"))
-    cid = _text(record.get("cid"))
-    data_id = _text(record.get("data_id"))
-    if place_id:
-        return place_id, cid, data_id, f"place:{place_id}"
-    if cid:
-        return place_id, cid, data_id, f"cid:{cid}"
-    if data_id:
-        return place_id, cid, data_id, f"data:{data_id}"
+          marker = '''def _merge_matches(conn: sqlite3.Connection, matches: list[sqlite3.Row]) -> sqlite3.Row | None:\n'''
+          alias_helper = '''def _legacy_fallback_alias_match(\n    conn: sqlite3.Connection,\n    record: dict[str, Any],\n    canonical_key: str,\n) -> sqlite3.Row | None:\n    website = official_website(record)\n    if website is None:\n        return None\n    legacy_key = _fallback_identity_key(record, None)\n    if legacy_key == canonical_key:\n        return None\n    row = conn.execute(\n        "SELECT * FROM businesses WHERE canonical_key = ?", (legacy_key,)\n    ).fetchone()\n    if row is None:\n        return None\n    try:\n        raw = json.loads(str(row["raw_json"]))\n    except (TypeError, json.JSONDecodeError):\n        return None\n    if not isinstance(raw, dict):\n        return None\n    try:\n        historical_website = official_website(raw)\n    except MapsSourceShapeError:\n        return None\n    if historical_website != website:\n        return None\n    return row\n\n\n'''
+          if text.count(marker) != 1:
+              raise SystemExit('merge marker not found exactly once')
+          text = text.replace(marker, alias_helper + marker, 1)
 
-    latitude, longitude = _coordinates(record)
+          old_upsert = '''    place_id, cid, data_id, canonical_key = _identity(record)\n    matches = _find_matches(conn, place_id, cid, data_id, canonical_key)\n    existing = _merge_matches(conn, matches)\n'''
+          new_upsert = '''    place_id, cid, data_id, canonical_key = _identity(record)\n    matches = _find_matches(conn, place_id, cid, data_id, canonical_key)\n    if not any((place_id, cid, data_id)):\n        legacy_match = _legacy_fallback_alias_match(conn, record, canonical_key)\n        if legacy_match is not None and all(\n            int(row["id"]) != int(legacy_match["id"]) for row in matches\n        ):\n            matches.append(legacy_match)\n            matches.sort(key=lambda row: int(row["id"]))\n    existing = _merge_matches(conn, matches)\n'''
+          if text.count(old_upsert) != 1:
+              raise SystemExit('upsert block not found exactly once')
+          text = text.replace(old_upsert, new_upsert, 1)
+          storage.write_text(text)
+
+          tests = Path('tests/test_maps_source_shape.py')
+          t = tests.read_text()
+          if 'import hashlib\n' not in t:
+              t = t.replace('import json\n', 'import hashlib\nimport json\n', 1)
+          addition = r'''
+
+
+def _pre_alias_fallback_key(record: dict) -> str:
+    longitude = record.get("longitude")
+    if longitude is None:
+        longitude = record.get("longtitude")
     values = (
-        _text(record.get("link")),
-        _text(record.get("title")),
-        _text(record.get("address")),
-        _text(record.get("phone")),
-        website,
-        None if latitude is None else str(latitude),
-        None if longitude is None else str(longitude),
+        record.get("link"),
+        record.get("title"),
+        record.get("address"),
+        record.get("phone"),
+        record.get("website"),
+        None if record.get("latitude") is None else str(float(record["latitude"])),
+        None if longitude is None else str(float(longitude)),
     )
-    normalized = [value.strip().lower() if value else "" for value in values]
-    if not any(normalized):
-        raise UnidentifiableRecord("record has no usable identity fields")
-    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
-    return place_id, cid, data_id, f"fallback:{digest}"
-'''
-          new = '''def _fallback_canonical_key(record: dict[str, Any], website: str | None) -> str:
-    latitude, longitude = _coordinates(record)
-    values = (
-        _text(record.get("link")),
-        _text(record.get("title")),
-        _text(record.get("address")),
-        _text(record.get("phone")),
-        website,
-        None if latitude is None else str(latitude),
-        None if longitude is None else str(longitude),
-    )
-    normalized = [value.strip().lower() if value else "" for value in values]
-    if not any(normalized):
-        raise UnidentifiableRecord("record has no usable identity fields")
+    normalized = [str(value).strip().lower() if value not in (None, "") else "" for value in values]
     digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
     return f"fallback:{digest}"
 
 
-def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
-    website = official_website(record)
-    place_id = _text(record.get("place_id"))
-    cid = _text(record.get("cid"))
-    data_id = _text(record.get("data_id"))
-    if place_id:
-        return place_id, cid, data_id, f"place:{place_id}"
-    if cid:
-        return place_id, cid, data_id, f"cid:{cid}"
-    if data_id:
-        return place_id, cid, data_id, f"data:{data_id}"
-    return place_id, cid, data_id, _fallback_canonical_key(record, website)
-
-
-def _fallback_compatibility_keys(record: dict[str, Any], canonical_key: str) -> tuple[str, ...]:
-    # Before source-shape normalization, a ``web_site``-only record contributed no
-    # website value to fallback identity while a literal ``website`` record did.
-    # Search both historical forms so upgrades do not duplicate strong-ID-less
-    # businesses. New rows still use the normalized canonical key.
-    keys = [
-        canonical_key,
-        _fallback_canonical_key(record, _text(record.get("website"))),
-        _fallback_canonical_key(record, None),
-    ]
-    return tuple(dict.fromkeys(keys))
-'''
-          if text.count(old) != 1:
-              raise SystemExit('storage.py: identity block did not match exactly once')
-          text = text.replace(old, new)
-
-          old = '''def _find_matches(
-    conn: sqlite3.Connection,
-    place_id: str | None,
-    cid: str | None,
-    data_id: str | None,
-    canonical_key: str,
-) -> list[sqlite3.Row]:
-    matches: dict[int, sqlite3.Row] = {}
-    for column, value in (("place_id", place_id), ("cid", cid), ("data_id", data_id), ("canonical_key", canonical_key)):
-        if value:
-            row = conn.execute(f"SELECT * FROM businesses WHERE {column} = ?", (value,)).fetchone()
-            if row:
-                matches[int(row["id"])] = row
-    return [matches[key] for key in sorted(matches)]
-'''
-          new = '''def _find_matches(
-    conn: sqlite3.Connection,
-    place_id: str | None,
-    cid: str | None,
-    data_id: str | None,
-    canonical_keys: Iterable[str],
-) -> list[sqlite3.Row]:
-    matches: dict[int, sqlite3.Row] = {}
-    for column, value in (("place_id", place_id), ("cid", cid), ("data_id", data_id)):
-        if value:
-            row = conn.execute(f"SELECT * FROM businesses WHERE {column} = ?", (value,)).fetchone()
-            if row:
-                matches[int(row["id"])] = row
-    for canonical_key in canonical_keys:
-        row = conn.execute(
-            "SELECT * FROM businesses WHERE canonical_key = ?", (canonical_key,)
-        ).fetchone()
-        if row:
-            matches[int(row["id"])] = row
-    return [matches[key] for key in sorted(matches)]
-'''
-          if text.count(old) != 1:
-              raise SystemExit('storage.py: find-matches block did not match exactly once')
-          text = text.replace(old, new)
-
-          old = '''    place_id, cid, data_id, canonical_key = _identity(record)
-    matches = _find_matches(conn, place_id, cid, data_id, canonical_key)
-'''
-          new = '''    place_id, cid, data_id, canonical_key = _identity(record)
-    canonical_keys = (
-        (canonical_key,)
-        if any((place_id, cid, data_id))
-        else _fallback_compatibility_keys(record, canonical_key)
+def _insert_pre_alias_weak_row(conn, record: dict, *, run_id: str = "r1") -> int:
+    canonical_key = _pre_alias_fallback_key(record)
+    raw_json = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    cursor = conn.execute(
+        "INSERT INTO businesses("
+        "canonical_key,title,address,latitude,longitude,phone,website,first_seen_at,last_seen_at,"
+        "first_run_id,last_run_id,raw_json"
+        ") VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?)",
+        (
+            canonical_key,
+            record.get("title"),
+            record.get("address"),
+            record.get("latitude"),
+            record.get("longitude"),
+            record.get("phone"),
+            "2026-09-26T00:00:00+00:00",
+            "2026-09-26T00:00:00+00:00",
+            run_id,
+            run_id,
+            raw_json,
+        ),
     )
-    matches = _find_matches(conn, place_id, cid, data_id, canonical_keys)
-'''
-          if text.count(old) != 1:
-              raise SystemExit('storage.py: upsert identity wiring did not match exactly once')
-          text = text.replace(old, new)
+    business_id = int(cursor.lastrowid)
+    conn.execute(
+        "INSERT INTO run_businesses(run_id,business_id,first_observed_at) VALUES (?,?,?)",
+        (run_id, business_id, "2026-09-26T00:00:00+00:00"),
+    )
+    conn.execute(
+        "UPDATE runs SET status='complete',finished_at=?,exit_code=0,raw_records=1,accepted_records=1,"
+        "unique_seen=1,new_businesses=1 WHERE id=?",
+        ("2026-09-26T00:01:00+00:00", run_id),
+    )
+    conn.commit()
+    return business_id
 
-          path.write_text(text, encoding='utf-8')
-          Path('.github/workflows/_fallback_identity_patch.yml').unlink()
+
+def test_storage_reuses_pre_alias_fallback_identity_when_raw_website_agrees(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "legacy-fallback.sqlite")
+    _add_run(conn, "r1")
+    record = _verbatim_v1181_shape()
+    record.pop("place_id")
+    record.pop("cid")
+    business_id = _insert_pre_alias_weak_row(conn, record)
+    legacy_key = _pre_alias_fallback_key(record)
+
+    _add_run(conn, "r2", "2026-09-26T01:00:00+00:00")
+    ingest_records(conn, "r2", [record], finalize_run=("complete", 0, None))
+
+    canonical_shape = dict(record)
+    canonical_shape["website"] = canonical_shape.pop("web_site")
+    _add_run(conn, "r3", "2026-09-26T02:00:00+00:00")
+    ingest_records(conn, "r3", [canonical_shape], finalize_run=("complete", 0, None))
+
+    rows = list(conn.execute("SELECT id,canonical_key,website FROM businesses ORDER BY id"))
+    assert len(rows) == 1
+    assert int(rows[0]["id"]) == business_id
+    assert rows[0]["canonical_key"] == legacy_key
+    assert rows[0]["website"] == "https://example.test/"
+    conn.close()
+
+
+def test_storage_does_not_reuse_legacy_fallback_collision_with_different_raw_website(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path / "legacy-fallback-collision.sqlite")
+    _add_run(conn, "r1")
+    incoming = _verbatim_v1181_shape()
+    incoming.pop("place_id")
+    incoming.pop("cid")
+    historical = dict(incoming)
+    historical["web_site"] = "https://different.example/"
+    old_id = _insert_pre_alias_weak_row(conn, historical)
+
+    _add_run(conn, "r2", "2026-09-26T01:00:00+00:00")
+    ingest_records(conn, "r2", [incoming], finalize_run=("complete", 0, None))
+
+    rows = list(conn.execute("SELECT id,website FROM businesses ORDER BY id"))
+    assert len(rows) == 2
+    assert int(rows[0]["id"]) == old_id
+    assert rows[0]["website"] is None
+    assert rows[1]["website"] == "https://example.test/"
+    conn.close()
+'''
+          if '_pre_alias_fallback_key' in t:
+              raise SystemExit('legacy fallback tests already present')
+          tests.write_text(t.rstrip() + addition + '\n')
+
+          docs = Path('docs/website-operational-validation.md')
+          d = docs.read_text()
+          needle = ('Existing legacy `businesses` rows are not rewritten merely to populate the denormalized '
+                    '`website` column during Understanding bootstrap; historical `raw_json.web_site` can support '
+                    'the website fact while the legacy-table preservation checks remain meaningful.\n')
+          replacement = needle + ('For weak-ID historical rows created before this compatibility adapter, Sara also recognizes the old '
+                                  'fallback key that omitted `web_site`, but only when the retained historical `raw_json` resolves to the '
+                                  'same official website as the incoming record. This prevents source-shape normalization from duplicating '
+                                  'a known row without broadening weak-identity merges.\n')
+          if d.count(needle) != 1:
+              raise SystemExit('runbook insertion point not found exactly once')
+          docs.write_text(d.replace(needle, replacement, 1))
           PY
-      - name: Commit branch patch
-        shell: bash
-        run: |
+          git rm .github/workflows/_fallback_identity_patch.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'Preserve historical fallback identity keys'
+          git add src/sara/storage.py tests/test_maps_source_shape.py docs/website-operational-validation.md
+          git commit -m 'Preserve legacy Maps fallback identity safely'
           git push origin HEAD:fix/maps-source-shape-merge-probe
