@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
@@ -21,6 +22,34 @@ class WebsiteFetchError(RuntimeError):
 
 class WebsiteBlockedError(WebsiteFetchError):
     """A source policy or safety rule blocked a website request."""
+
+
+class _WebsiteTransientError(WebsiteFetchError):
+    """A transport-level failure that may be retried within the configured budget."""
+
+
+@dataclass
+class _RequestBudget:
+    attempt_limit: int
+    retry_delay_budget_seconds: float
+    attempts_started: int = 0
+    retry_delay_used: float = 0.0
+
+    def start_attempt(self, url: str) -> None:
+        if self.attempts_started >= self.attempt_limit:
+            raise WebsiteFetchError(
+                f"request attempt limit exhausted ({self.attempt_limit}) for {url}"
+            )
+        self.attempts_started += 1
+
+    def reserve_retry_delay(self, delay: float, url: str) -> None:
+        projected = self.retry_delay_used + delay
+        if projected > self.retry_delay_budget_seconds:
+            raise WebsiteFetchError(
+                "retry delay budget exhausted "
+                f"({projected:g}s > {self.retry_delay_budget_seconds:g}s) for {url}"
+            )
+        self.retry_delay_used = projected
 
 
 @dataclass(frozen=True)
@@ -80,11 +109,16 @@ class SafeHttpClient:
         max_response_bytes: int,
         request_interval_seconds: float = 1.0,
         max_policy_delay_seconds: float = 30.0,
+        retry_attempt_limit: int = 4,
+        retry_base_delay_seconds: float = 1.0,
+        retry_max_delay_seconds: float = 30.0,
+        retry_delay_budget_seconds: float = 60.0,
         obey_robots: bool = True,
         dns_lookup=socket.getaddrinfo,
         ssl_context: ssl.SSLContext | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        wall_time: Callable[[], float] = time.time,
     ) -> None:
         normalized = normalize_http_url(site_url)
         if normalized is None:
@@ -108,17 +142,48 @@ class SafeHttpClient:
             raise ValueError(
                 "max_policy_delay_seconds must be finite, at least request_interval_seconds and at most 300"
             )
+        if retry_attempt_limit < 1 or retry_attempt_limit > 8:
+            raise ValueError("retry_attempt_limit must be between 1 and 8")
+        if (
+            not math.isfinite(retry_base_delay_seconds)
+            or retry_base_delay_seconds <= 0
+            or retry_base_delay_seconds > 60
+        ):
+            raise ValueError(
+                "retry_base_delay_seconds must be finite, greater than zero and at most 60"
+            )
+        if (
+            not math.isfinite(retry_max_delay_seconds)
+            or retry_max_delay_seconds < retry_base_delay_seconds
+            or retry_max_delay_seconds > 300
+        ):
+            raise ValueError(
+                "retry_max_delay_seconds must be finite, at least retry_base_delay_seconds and at most 300"
+            )
+        if (
+            not math.isfinite(retry_delay_budget_seconds)
+            or retry_delay_budget_seconds < retry_max_delay_seconds
+            or retry_delay_budget_seconds > 900
+        ):
+            raise ValueError(
+                "retry_delay_budget_seconds must be finite, at least retry_max_delay_seconds and at most 900"
+            )
         self.site_url = normalized
         self.user_agent = user_agent
         self.timeout_seconds = float(timeout_seconds)
         self.max_response_bytes = int(max_response_bytes)
         self.request_interval_seconds = float(request_interval_seconds)
         self.max_policy_delay_seconds = float(max_policy_delay_seconds)
+        self.retry_attempt_limit = int(retry_attempt_limit)
+        self.retry_base_delay_seconds = float(retry_base_delay_seconds)
+        self.retry_max_delay_seconds = float(retry_max_delay_seconds)
+        self.retry_delay_budget_seconds = float(retry_delay_budget_seconds)
         self.obey_robots = bool(obey_robots)
         self._dns_lookup = dns_lookup
         self._ssl_context = ssl_context or ssl.create_default_context()
         self._monotonic = monotonic
         self._sleep = sleep
+        self._wall_time = wall_time
         self._robots: dict[str, RobotFileParser | None] = {}
         self._last_request_started: dict[str, float] = {}
 
@@ -174,7 +239,7 @@ class SafeHttpClient:
                     lowered, self._port(parsed), type=socket.SOCK_STREAM
                 )
             except OSError as exc:
-                raise WebsiteFetchError(
+                raise _WebsiteTransientError(
                     f"DNS resolution failed for {lowered}: {exc}"
                 ) from exc
             for row in rows:
@@ -182,7 +247,7 @@ class SafeHttpClient:
                 if sockaddr:
                     addresses.add(str(sockaddr[0]))
         if not addresses:
-            raise WebsiteFetchError(
+            raise _WebsiteTransientError(
                 f"DNS resolution returned no addresses for {lowered}"
             )
 
@@ -284,7 +349,13 @@ class SafeHttpClient:
             return f"{display_host}:{port}"
         return display_host
 
-    def _request_once(self, url: str, max_bytes: int) -> tuple[int, Message, bytes]:
+    def _request_once(
+        self,
+        url: str,
+        max_bytes: int,
+        *,
+        budget: _RequestBudget | None = None,
+    ) -> tuple[int, Message, bytes]:
         self._assert_allowed_site(url)
         parsed = urlsplit(url)
         addresses = self._resolve_public_addresses(url)
@@ -311,6 +382,8 @@ class SafeHttpClient:
                 )
             try:
                 self._pace(url)
+                if budget is not None:
+                    budget.start_attempt(url)
                 connection.request(
                     "GET",
                     target,
@@ -335,16 +408,130 @@ class SafeHttpClient:
             finally:
                 connection.close()
 
-        raise WebsiteFetchError(
+        raise _WebsiteTransientError(
             f"request failed for {url}: {last_error or 'all validated addresses failed'}"
         )
+
+    def _retry_after_seconds(self, headers: Message, url: str) -> float | None:
+        raw = headers.get("Retry-After")
+        if raw is None:
+            return None
+        value = raw.strip()
+        if not value:
+            raise WebsiteFetchError(f"malformed Retry-After header for {url}")
+        try:
+            seconds = int(value, 10)
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise WebsiteFetchError(
+                    f"malformed Retry-After header for {url}: {value!r}"
+                ) from exc
+            if parsed is None or parsed.tzinfo is None:
+                raise WebsiteFetchError(
+                    f"malformed Retry-After header for {url}: {value!r}"
+                )
+            try:
+                delay = max(0.0, float(parsed.timestamp()) - float(self._wall_time()))
+            except (OverflowError, OSError, ValueError) as exc:
+                raise WebsiteFetchError(
+                    f"malformed Retry-After header for {url}: {value!r}"
+                ) from exc
+        else:
+            if seconds < 0:
+                raise WebsiteFetchError(
+                    f"malformed Retry-After header for {url}: {value!r}"
+                )
+            try:
+                delay = float(seconds)
+            except OverflowError as exc:
+                raise WebsiteFetchError(
+                    f"Retry-After exceeds configured maximum for {url}"
+                ) from exc
+        if not math.isfinite(delay):
+            raise WebsiteFetchError(f"malformed Retry-After header for {url}")
+        if delay > self.retry_max_delay_seconds:
+            raise WebsiteFetchError(
+                "Retry-After exceeds configured maximum "
+                f"({delay:g}s > {self.retry_max_delay_seconds:g}s) for {url}"
+            )
+        return delay
+
+    def _retry_delay_seconds(
+        self,
+        *,
+        retry_number: int,
+        headers: Message | None,
+        url: str,
+    ) -> float:
+        backoff = min(
+            self.retry_max_delay_seconds,
+            self.retry_base_delay_seconds * (2 ** max(0, retry_number - 1)),
+        )
+        retry_after = None if headers is None else self._retry_after_seconds(headers, url)
+        return max(backoff, retry_after or 0.0)
+
+    def _sleep_for_retry(
+        self,
+        *,
+        budget: _RequestBudget,
+        delay: float,
+        url: str,
+    ) -> None:
+        budget.reserve_retry_delay(delay, url)
+        if delay > 0:
+            self._sleep(delay)
+
+    def _request_with_retries(
+        self, url: str, max_bytes: int
+    ) -> tuple[int, Message, bytes]:
+        budget = _RequestBudget(
+            attempt_limit=self.retry_attempt_limit,
+            retry_delay_budget_seconds=self.retry_delay_budget_seconds,
+        )
+        retry_number = 0
+        while True:
+            try:
+                status, headers, body = self._request_once(
+                    url, max_bytes, budget=budget
+                )
+            except _WebsiteTransientError as exc:
+                if budget.attempts_started >= budget.attempt_limit:
+                    raise WebsiteFetchError(
+                        "request attempt limit exhausted after transport failures "
+                        f"({budget.attempt_limit}) for {url}"
+                    ) from exc
+                retry_number += 1
+                delay = self._retry_delay_seconds(
+                    retry_number=retry_number,
+                    headers=None,
+                    url=url,
+                )
+                self._sleep_for_retry(budget=budget, delay=delay, url=url)
+                continue
+
+            if status not in {429, 503}:
+                return status, headers, body
+            if budget.attempts_started >= budget.attempt_limit:
+                raise WebsiteFetchError(
+                    f"request attempt limit exhausted after HTTP {status} "
+                    f"({budget.attempt_limit}) for {url}"
+                )
+            retry_number += 1
+            delay = self._retry_delay_seconds(
+                retry_number=retry_number,
+                headers=headers,
+                url=url,
+            )
+            self._sleep_for_retry(budget=budget, delay=delay, url=url)
 
     def _robots_for(self, url: str) -> RobotFileParser | None:
         origin = self._origin(url)
         if origin in self._robots:
             return self._robots[origin]
         robots_url = urljoin(origin, "robots.txt")
-        status, headers, body = self._request_once(
+        status, headers, body = self._request_with_retries(
             robots_url, min(262_144, self.max_response_bytes)
         )
         if status in {404, 410}:
@@ -368,7 +555,7 @@ class SafeHttpClient:
                     f"invalid robots redirect target: {location}"
                 )
             self._assert_allowed_site(redirected)
-            status, headers, body = self._request_once(
+            status, headers, body = self._request_with_retries(
                 redirected, min(262_144, self.max_response_bytes)
             )
             if status in {404, 410}:
@@ -410,7 +597,7 @@ class SafeHttpClient:
         if not self.robots_allowed(current):
             raise WebsiteBlockedError(f"robots policy disallows {current}")
         for _ in range(max_redirects + 1):
-            status, headers, body = self._request_once(
+            status, headers, body = self._request_with_retries(
                 current, self.max_response_bytes
             )
             if 300 <= status < 400:
