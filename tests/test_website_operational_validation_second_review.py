@@ -6,6 +6,7 @@ from sara.migrations import apply_migrations
 from sara.storage import connect
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 from sara.website_validation import (
+    validate_fact_provenance,
     validate_multi_branch_groups,
     validate_one_to_one_maps_anchors,
 )
@@ -99,4 +100,59 @@ def test_anchor_check_rejects_link_that_resolves_to_another_business_location(tm
         and failure.get("error") == "Maps link points to a non-canonical location"
         for failure in result.details["failures"]
     )
+    conn.close()
+
+
+def test_global_fact_provenance_rejects_nonusable_support(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path)
+    _insert_business_and_anchor(conn, 1, "be1", "loc1")
+    created = "2026-01-01T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO sources(id,source_type,name,created_at) "
+        "VALUES ('src_bad','official_website','Bad evidence source',?)",
+        (created,),
+    )
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,evidence_count,observation_count"
+        ") VALUES ('acq_bad','be1','src_bad','test','1','{}',?,'complete',?,?,1,1)",
+        ("0" * 64, created, created),
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_role,status,retrieved_at,metadata_json,created_at"
+        ") VALUES ('ev_bad','acq_bad','src_bad','official','incomplete',?,'{}',?)",
+        (created, created),
+    )
+    value_hash = "1" * 64
+    conn.execute(
+        "INSERT INTO observations("
+        "id,subject_id,predicate,evidence_id,value_json,normalized_value_json,value_hash,"
+        "observation_kind,observed_at,extracted_at,extraction_method,extractor_name,extractor_version,created_at"
+        ") VALUES ('obs_bad','be1','business.name.trading','ev_bad','\"One\"','\"One\"',?,"
+        "'structured_value',?,?,'deterministic_parser','test','1',?)",
+        (value_hash, created, created, created),
+    )
+    conn.execute(
+        "INSERT INTO facts("
+        "id,subject_id,predicate,fact_slot,value_json,normalized_value_json,value_hash,status,"
+        "valid_from,last_verified_at,reconciled_at,reconciliation_version,created_at"
+        ") VALUES ('fact_bad','be1','business.name.trading','__single__','\"One\"','\"One\"',?,"
+        "'single_source',?,?,?,?,?)",
+        (value_hash, created, created, created, "test-v1", created),
+    )
+    conn.execute(
+        "INSERT INTO fact_observation_support(fact_id,observation_id,support_role) "
+        "VALUES ('fact_bad','obs_bad','supports')"
+    )
+    conn.commit()
+
+    result = validate_fact_provenance(conn)
+    assert result.passed is False
+    assert result.details["value_facts_without_usable_support"] == ["fact_bad"]
+    assert result.details["value_facts_with_nonusable_support"] == ["fact_bad"]
+    assert result.details["single_source_usable_source_count_mismatch"] == [
+        {"fact_id": "fact_bad", "usable_source_count": 0}
+    ]
     conn.close()
