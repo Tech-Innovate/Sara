@@ -15,7 +15,8 @@ from ..understanding_vocabulary import VocabularySeedError, seed_business_unders
 from .crawl import crawl_official_site
 from .http import SafeHttpClient, WebsiteBlockedError, WebsiteFetchError
 from .model import CrawlConfig, WebsiteAcquisitionError, WebsiteAcquisitionStats
-from .store import begin_session, fail_session, ingest_crawl_result, resolve_verified_site
+from .persistence import ingest_crawl_result
+from .target import begin_session, fail_session, resolve_verified_site
 
 
 def _utc_now() -> str:
