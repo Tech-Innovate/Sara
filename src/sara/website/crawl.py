@@ -104,6 +104,13 @@ def _canonical_home(capture: PageCapture, *, start_url: str) -> str:
     return normalized_candidate
 
 
+def _decode_page(response: HttpResponse) -> str:
+    try:
+        return response.body.decode(response.charset, errors="replace")
+    except LookupError:
+        return response.body.decode("utf-8", errors="replace")
+
+
 def crawl_official_site(
     *,
     entity_id: str,
@@ -116,9 +123,9 @@ def crawl_official_site(
 ) -> CrawlResult:
     """Crawl one verified official site within an explicit page/depth budget.
 
-    Raw page bytes are durably written before this function returns a capture.
-    A failed page is recorded as an error and does not abort already-fetched
-    evidence; the caller decides whether the acquisition is complete or partial.
+    Raw page bytes are durably written before parsing. Failed or malformed pages
+    are recorded as errors and do not discard already-fetched artifacts; the
+    caller decides whether the acquisition is complete or partial.
     """
     queue: list[tuple[int, int, str]] = []
     heapq.heappush(queue, (-10_000, 0, start_url))
@@ -127,6 +134,7 @@ def crawl_official_site(
         heapq.heappush(queue, (-9_000, 0, root))
 
     seen: set[str] = set()
+    captured_final_urls: set[str] = set()
     captures: list[PageCapture] = []
     errors: list[str] = []
 
@@ -142,21 +150,35 @@ def crawl_official_site(
             errors.append(f"{url}: {exc}")
             continue
 
-        parsed = parse_html(response.final_url, response.text)
+        final_url = normalize_http_url(response.final_url)
+        if final_url is None:
+            errors.append(f"{url}: response returned an invalid final URL")
+            continue
+        seen.add(final_url)
+        if final_url in captured_final_urls:
+            continue
+
         content_hash = sha256_bytes(response.body)
         artifact = _artifact_path(
             evidence_root,
             entity_id=entity_id,
             session_id=session_id,
-            final_url=response.final_url,
+            final_url=final_url,
             content_sha256=content_hash,
         )
         _write_artifact(artifact, response.body)
+        try:
+            parsed = parse_html(final_url, _decode_page(response))
+        except Exception as exc:  # HTML is untrusted input; retain bytes and fail this page closed.
+            errors.append(f"{final_url}: HTML parsing failed: {exc}")
+            continue
+
         retrieved_at = now()
+        captured_final_urls.add(final_url)
         captures.append(
             PageCapture(
                 requested_url=response.requested_url,
-                final_url=response.final_url,
+                final_url=final_url,
                 depth=depth,
                 retrieved_at=retrieved_at,
                 status=response.status,
