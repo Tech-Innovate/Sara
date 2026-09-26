@@ -121,11 +121,12 @@ def _canonical_home_from_verified_start(
     desired = declared or final
 
     # A declared canonical that points elsewhere on the site is only promoted if
-    # that exact page was also fetched and retained. This prevents a path-hosted
-    # business URL from being rewritten to an unrelated generic origin root.
-    if desired != final:
-        if not any(normalize_http_url(capture.final_url) == desired for capture in captures):
-            return None
+    # that exact page was also fetched and retained. Otherwise the verified,
+    # successfully fetched start/redirect target remains authoritative.
+    if desired != final and not any(
+        normalize_http_url(capture.final_url) == desired for capture in captures
+    ):
+        return final
     return desired
 
 
