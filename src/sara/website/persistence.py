@@ -4,7 +4,6 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from ..maps_backfill import _fetch_one
 from .crawl import origin_url, page_role
 from .model import (
     CAPABILITY_PREDICATES,
