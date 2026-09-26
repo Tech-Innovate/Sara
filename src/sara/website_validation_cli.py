@@ -158,6 +158,12 @@ def _selected_business_ids(
     return sorted(result)
 
 
+def _website_acquisition_business_ids(
+    single_location_business_ids: Sequence[int],
+) -> list[int]:
+    return sorted({int(value) for value in single_location_business_ids})
+
+
 def _run_acquisition_samples(
     conn: sqlite3.Connection,
     *,
@@ -619,8 +625,11 @@ def run_validation_gate(
     checks: list[CheckResult] = []
     acquisitions: list[dict[str, Any]] = []
     bootstrap: dict[str, Any] = {}
-    selected = _selected_business_ids(
+    representative_selected = _selected_business_ids(
         single_location_business_ids, multi_branch_groups
+    )
+    acquisition_selected = _website_acquisition_business_ids(
+        single_location_business_ids
     )
     try:
         copy_snapshot = legacy_snapshot(conn)
@@ -638,7 +647,7 @@ def run_validation_gate(
         acquisition_check, acquisitions = _run_acquisition_samples(
             conn,
             evidence_root=evidence_root,
-            business_ids=selected,
+            business_ids=acquisition_selected,
             passes=passes,
             config=config or CrawlConfig(),
             collector=collector,
@@ -677,7 +686,7 @@ def run_validation_gate(
         checks.append(_run_merge_survival_probe(working_db, probe_db, merge_pair))
     schema_check = _legacy_schema_check(source_db, working_db)
     dossier_check, dossier_summaries = _representative_dossier_check(
-        working_db, selected
+        working_db, representative_selected
     )
     single_location_check = _single_location_check(
         dossier_summaries, single_location_business_ids

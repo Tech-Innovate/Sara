@@ -7,7 +7,7 @@ from typing import Any
 
 from ..maps_backfill import _fetch_one
 from .model import OFFICIAL_WEB_SOURCE_ID, RECONCILIATION_VERSION, WebsiteAcquisitionError, opaque_id
-from .parser import normalize_http_url
+from .parser import normalize_http_url, same_site
 
 
 def _parse_json(value: object) -> Any:
@@ -41,6 +41,58 @@ def values_equivalent(predicate: str, left_json: object, right_json: object) -> 
     if not isinstance(left, str) or not isinstance(right, str):
         return False
     return normalize_http_url(left) == normalize_http_url(right)
+
+
+def _verified_website_alias_from_new_evidence(
+    conn: sqlite3.Connection,
+    observations: list[dict[str, Any]],
+    left_json: object,
+    right_json: object,
+) -> bool:
+    """Return true only for an alias proven by this acquisition's retained home evidence.
+
+    This is intentionally directional: the prior fact value must equal the acquisition
+    start URL, and the newly reconciled value must equal the verified home capture's
+    final URL. Merely sharing a host, differing by ``www`` or switching schemes is not
+    sufficient.
+    """
+    left = _parse_json(left_json)
+    right = _parse_json(right_json)
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    left_url = normalize_http_url(left)
+    right_url = normalize_http_url(right)
+    if left_url is None or right_url is None:
+        return False
+
+    for item in observations:
+        evidence_id = item.get("evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            continue
+        row = conn.execute(
+            "SELECT source_id,status,metadata_json FROM evidence_items WHERE id=?",
+            (evidence_id,),
+        ).fetchone()
+        if row is None or row[0] != OFFICIAL_WEB_SOURCE_ID or row[1] != "usable":
+            continue
+        metadata = _parse_json(row[2])
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("acquisition_kind") != "bounded_official_website":
+            continue
+        if metadata.get("home_page") is not True:
+            continue
+        start_value = metadata.get("start_url")
+        final_value = metadata.get("final_url")
+        if not isinstance(start_value, str) or not isinstance(final_value, str):
+            continue
+        start_url = normalize_http_url(start_value)
+        final_url = normalize_http_url(final_value)
+        if start_url is None or final_url is None or not same_site(start_url, final_url):
+            continue
+        if start_url == left_url and final_url == right_url:
+            return True
+    return False
 
 
 def _current_fact(
@@ -244,7 +296,14 @@ def reconcile_observation_group(
     exact_same = (
         current["value_json"] == value_json and current["value_hash"] == value_hash
     )
-    semantically_same = values_equivalent(predicate, current["value_json"], value_json)
+    semantically_same = values_equivalent(
+        predicate, current["value_json"], value_json
+    ) or (
+        predicate == "business.website.official"
+        and _verified_website_alias_from_new_evidence(
+            conn, observations, current["value_json"], value_json
+        )
+    )
 
     if observed_instant < current_valid_from:
         if exact_same and (
@@ -319,7 +378,15 @@ def reconcile_observation_group(
         )
     if not semantically_same:
         for item in previous:
-            if not values_equivalent(predicate, item["value_json"], value_json):
+            equivalent = values_equivalent(
+                predicate, item["value_json"], value_json
+            ) or (
+                predicate == "business.website.official"
+                and _verified_website_alias_from_new_evidence(
+                    conn, observations, item["value_json"], value_json
+                )
+            )
+            if not equivalent:
                 links += _link_observation(
                     conn,
                     fact_id=fact_id,

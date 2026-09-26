@@ -27,6 +27,12 @@ maps-sync reconciliation version      maps-sync-v2
 
 Disposable Business Understanding prep/validation copies created before this change should be discarded and rebuilt from the original representative Sara database. They are not rewritten in place to pretend the earlier v1 extraction produced the newly recognized website observation. The production enablement gate had not authorized primary-database enablement before this correction.
 
+## Evidence-backed official-site URL convergence
+
+Website reconciliation does not globally collapse `http`/`https` or `www` variants. When a bounded official-site acquisition begins from the currently supported website fact and its retained usable home evidence records that exact `start_url` resolving to the verified home capture `final_url`, reconciliation may treat those two serialized URLs as representations of the same official site for that reconciliation event. The historical observation remains attached to its historical fact; it is not rewritten or attached as exact-value support to the new URL. Without that retained event-local evidence, differing URLs remain distinct and may contradict.
+
+This reconciliation behavior is versioned as `official-web-v2`; the website collector version remains unchanged because request/extraction behavior did not change.
+
 ## What the gate proves
 
 A successful run demonstrates, on a representative database copy, that:
@@ -35,7 +41,7 @@ A successful run demonstrates, on a representative database copy, that:
 2. Business Understanding migration, vocabulary seeding, Maps backfill/synchronization, and website acquisition do not mutate legacy collection or recovery rows, table definitions, indexes, foreign keys, or triggers.
 3. Every current Maps business retains exactly one Understanding location anchor before and after website acquisition.
 4. Known branches of the same brand remain deliberately separated before and after website acquisition unless strong identity convergence justifies a merge.
-5. Selected official websites can be acquired repeatedly with the bounded production collector, with at least one representative acquisition completing successfully; partial outcomes remain visible rather than being treated as success-by-omission.
+5. Declared single-location acquisition samples can be acquired repeatedly with the bounded production collector, with at least one representative acquisition completing successfully; partial outcomes remain visible rather than being treated as success-by-omission. Multi-branch groups are identity-separation samples and are not implicitly crawled.
 6. Validation-run acquisition sessions retain immutable configuration hashes, terminal lifecycle states, and database counters that agree with their persisted evidence/observations.
 7. Every retained validation evidence artifact remains beneath the validation evidence root, exists on disk, and matches its stored SHA-256.
 8. Value facts retain a Fact → Observation → Evidence → Acquisition Session → Source chain.
@@ -58,7 +64,7 @@ Provide:
 - at least one known multi-branch brand represented by two or more Maps business IDs;
 - one real Maps business for `--merge-probe-business-id` that carries at least two non-empty strong provider identifiers from `place_id`, `cid`, and `data_id`.
 
-Every selected acquisition target must already have a supported `business.website.official` fact. Domain discovery is outside this gate and outside the Phase-6 collector.
+Each declared single-location acquisition target must already have a supported `business.website.official` fact. Multi-branch groups are used to prove canonical identity/location separation before and after acquisition and do not need crawlable websites. Domain discovery is outside this gate and outside the Phase-6 collector.
 
 The merge-probe business is not asserted to be a natural duplicate. Only in `merge-probe.sqlite`, the harness partitions that one real business's strong identifiers into two temporary complementary Maps rows under an explicitly synthetic partition run before Understanding bootstrap. That partition run has no retained raw artifact reference, so validation-generated JSON is never attributed to the original Maps artifact. The harness then creates separate Understanding anchors/evidence for those synthetic partition rows, reconnects them with the combined source record through Sara's normal `upsert_business` path under a later synthetic bridge run, and runs the normal Maps synchronizer. Both validation-generated runs are explicitly marked synthetic and have `raw_path=NULL`; neither is represented as a real scraper execution. The original source run remains untouched historical provenance, and the source database and `validation.sqlite` are never mutated by this synthetic setup.
 
@@ -99,7 +105,7 @@ evidence/             retained official-website evidence for validation runs
 report.json            machine-readable readiness report
 ```
 
-By default, every representative website is acquired twice. The repeat run is deliberate: it exercises historical acquisition/session creation and reconciliation without requiring the collector to pretend that a new acquisition is a no-op.
+By default, every declared single-location acquisition target is acquired twice. Multi-branch group members are not acquisition targets unless they are separately supplied as single-location samples. The repeat run is deliberate: it exercises historical acquisition/session creation and reconciliation without requiring the collector to pretend that a new acquisition is a no-op.
 
 ## Interpreting the report
 
