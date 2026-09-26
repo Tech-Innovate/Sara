@@ -69,8 +69,13 @@ class CrawlConfig:
             raise ValueError(
                 "max_policy_delay_seconds must be finite, at least request_interval_seconds and at most 300"
             )
-        if self.retry_attempt_limit < 1 or self.retry_attempt_limit > 8:
-            raise ValueError("retry_attempt_limit must be between 1 and 8")
+        if (
+            isinstance(self.retry_attempt_limit, bool)
+            or not isinstance(self.retry_attempt_limit, int)
+            or self.retry_attempt_limit < 1
+            or self.retry_attempt_limit > 8
+        ):
+            raise ValueError("retry_attempt_limit must be an integer between 1 and 8")
         if (
             not math.isfinite(self.retry_base_delay_seconds)
             or self.retry_base_delay_seconds <= 0
