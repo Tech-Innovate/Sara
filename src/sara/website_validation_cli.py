@@ -296,6 +296,7 @@ def _representative_dossier_check(
             item = {
                 "business_id": business_id,
                 "business_entity_id": dossier["business_entity"]["id"],
+                "maps_business_count": len(dossier["maps_businesses"]),
                 "location_count": len(dossier["locations"]),
                 "fact_count": len(dossier["facts"]),
                 "evidence_count": len(dossier["evidence"]),
@@ -334,6 +335,39 @@ def _representative_dossier_check(
     )
 
 
+def _single_location_check(
+    dossier_summaries: Sequence[dict[str, Any]],
+    business_ids: Sequence[int],
+) -> dict[str, Any]:
+    by_business = {
+        int(item["business_id"]): item
+        for item in dossier_summaries
+        if "business_id" in item
+    }
+    failures: list[dict[str, Any]] = []
+    for business_id in business_ids:
+        item = by_business.get(int(business_id))
+        if item is None or "maps_business_count" not in item:
+            failures.append({"business_id": int(business_id), "error": "dossier unavailable"})
+            continue
+        if int(item["maps_business_count"]) != 1 or int(item["location_count"]) != 1:
+            failures.append(
+                {
+                    "business_id": int(business_id),
+                    "maps_business_count": int(item["maps_business_count"]),
+                    "location_count": int(item["location_count"]),
+                }
+            )
+    return {
+        "name": "single_location_samples_have_one_current_location",
+        "passed": bool(business_ids) and not failures,
+        "details": {
+            "business_ids": [int(value) for value in business_ids],
+            "failures": failures,
+        },
+    }
+
+
 def _write_report(report: dict[str, Any]) -> None:
     report_path = Path(report["working_db"]).parent / "report.json"
     report_path.write_text(
@@ -342,9 +376,9 @@ def _write_report(report: dict[str, Any]) -> None:
     )
 
 
-def _write_fatal_report(args: Any, exc: Exception) -> None:
+def _write_fatal_report(args: Any, exc: Exception, *, allow_nonempty: bool) -> None:
     workspace = Path(args.workspace)
-    if workspace.exists() and any(workspace.iterdir()):
+    if workspace.exists() and any(workspace.iterdir()) and not allow_nonempty:
         return
     workspace.mkdir(parents=True, exist_ok=True)
     report = {
@@ -445,8 +479,11 @@ def run_validation_gate(
     dossier_check, dossier_summaries = _representative_dossier_check(
         working_db, selected
     )
+    single_location_check = _single_location_check(
+        dossier_summaries, single_location_business_ids
+    )
     report_checks = [asdict(check) for check in checks]
-    report_checks.extend([schema_check, dossier_check])
+    report_checks.extend([schema_check, dossier_check, single_location_check])
     report = {
         "schema": REPORT_SCHEMA,
         "generated_at": _utc_now(),
@@ -475,8 +512,10 @@ def run_validation_gate(
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    arguments_validated = False
     try:
         _validate_arguments(args)
+        arguments_validated = True
         report = run_validation_gate(
             source_db=args.source_db,
             workspace=args.workspace,
@@ -488,8 +527,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("website operational validation interrupted", file=sys.stderr)
         return 130
-    except (OperationalValidationError, FileNotFoundError, sqlite3.Error, ValueError) as exc:
-        _write_fatal_report(args, exc)
+    except Exception as exc:
+        _write_fatal_report(args, exc, allow_nonempty=arguments_validated)
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(
