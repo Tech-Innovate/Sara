@@ -130,6 +130,8 @@ def begin_session(
             "depth_limit": config.depth_limit,
             "max_response_bytes": config.max_response_bytes,
             "timeout_seconds": config.timeout_seconds,
+            "request_interval_seconds": config.request_interval_seconds,
+            "max_policy_delay_seconds": config.max_policy_delay_seconds,
             "user_agent": config.user_agent,
             "obey_robots": config.obey_robots,
             "evidence_root": str(evidence_root),
