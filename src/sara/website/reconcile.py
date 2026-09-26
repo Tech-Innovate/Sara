@@ -6,7 +6,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..maps_backfill import _fetch_one
-from .model import OFFICIAL_WEB_SOURCE_ID, RECONCILIATION_VERSION, WebsiteAcquisitionError, opaque_id
+from .model import (
+    COLLECTOR_NAME,
+    OFFICIAL_WEB_SOURCE_ID,
+    RECONCILIATION_VERSION,
+    WebsiteAcquisitionError,
+    opaque_id,
+    sha256_text,
+)
 from .parser import normalize_http_url, same_site
 
 
@@ -46,6 +53,8 @@ def values_equivalent(predicate: str, left_json: object, right_json: object) -> 
 def _verified_website_alias_from_new_evidence(
     conn: sqlite3.Connection,
     observations: list[dict[str, Any]],
+    *,
+    entity_id: str,
     left_json: object,
     right_json: object,
 ) -> bool:
@@ -66,29 +75,74 @@ def _verified_website_alias_from_new_evidence(
         return False
 
     for item in observations:
+        observation_id = item.get("id")
         evidence_id = item.get("evidence_id")
-        if not isinstance(evidence_id, str) or not evidence_id:
+        if (
+            not isinstance(observation_id, str)
+            or not observation_id
+            or not isinstance(evidence_id, str)
+            or not evidence_id
+        ):
             continue
         row = conn.execute(
-            "SELECT source_id,status,metadata_json FROM evidence_items WHERE id=?",
-            (evidence_id,),
+            "SELECT e.source_id,e.status,e.source_locator,e.metadata_json,"
+            "a.target_subject_id,a.source_id,a.collector_name,a.config_json,a.config_hash,"
+            "o.subject_id,o.predicate,o.value_json "
+            "FROM observations o "
+            "JOIN evidence_items e ON e.id=o.evidence_id "
+            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "WHERE o.id=? AND e.id=?",
+            (observation_id, evidence_id),
         ).fetchone()
-        if row is None or row[0] != OFFICIAL_WEB_SOURCE_ID or row[1] != "usable":
+        if row is None:
             continue
-        metadata = _parse_json(row[2])
-        if not isinstance(metadata, dict):
+        if (
+            row[0] != OFFICIAL_WEB_SOURCE_ID
+            or row[1] != "usable"
+            or row[4] != entity_id
+            or row[5] != OFFICIAL_WEB_SOURCE_ID
+            or row[6] != COLLECTOR_NAME
+            or row[9] != entity_id
+            or row[10] != "business.website.official"
+            or row[11] != right_json
+        ):
+            continue
+        config_json = row[7]
+        if (
+            not isinstance(config_json, str)
+            or str(row[8]) != sha256_text(config_json)
+        ):
+            continue
+        config = _parse_json(config_json)
+        metadata = _parse_json(row[3])
+        if not isinstance(config, dict) or not isinstance(metadata, dict):
             continue
         if metadata.get("acquisition_kind") != "bounded_official_website":
             continue
-        if metadata.get("home_page") is not True:
+        if metadata.get("entity_id") != entity_id or metadata.get("home_page") is not True:
             continue
         start_value = metadata.get("start_url")
         final_value = metadata.get("final_url")
-        if not isinstance(start_value, str) or not isinstance(final_value, str):
+        configured_start = config.get("start_url")
+        source_locator = row[2]
+        if not all(
+            isinstance(value, str)
+            for value in (start_value, final_value, configured_start, source_locator)
+        ):
             continue
         start_url = normalize_http_url(start_value)
         final_url = normalize_http_url(final_value)
-        if start_url is None or final_url is None or not same_site(start_url, final_url):
+        config_start_url = normalize_http_url(configured_start)
+        locator_url = normalize_http_url(source_locator)
+        if (
+            start_url is None
+            or final_url is None
+            or config_start_url is None
+            or locator_url is None
+            or config_start_url != start_url
+            or locator_url != final_url
+            or not same_site(start_url, final_url)
+        ):
             continue
         if start_url == left_url and final_url == right_url:
             return True
@@ -301,7 +355,11 @@ def reconcile_observation_group(
     ) or (
         predicate == "business.website.official"
         and _verified_website_alias_from_new_evidence(
-            conn, observations, current["value_json"], value_json
+            conn,
+            observations,
+            entity_id=entity_id,
+            left_json=current["value_json"],
+            right_json=value_json,
         )
     )
 
@@ -383,7 +441,11 @@ def reconcile_observation_group(
             ) or (
                 predicate == "business.website.official"
                 and _verified_website_alias_from_new_evidence(
-                    conn, observations, item["value_json"], value_json
+                    conn,
+                    observations,
+                    entity_id=entity_id,
+                    left_json=item["value_json"],
+                    right_json=value_json,
                 )
             )
             if not equivalent:

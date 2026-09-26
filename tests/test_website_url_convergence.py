@@ -74,13 +74,24 @@ def _setup(path: Path):
     return conn
 
 
-def _official_observation(conn, *, start_url: str, final_url: str, home_page: bool = True):
+def _official_observation(
+    conn,
+    *,
+    start_url: str,
+    final_url: str,
+    home_page: bool = True,
+    session_start_url: str | None = None,
+):
     value_json = canonical_json(final_url)
     value_hash = sha256_text(value_json)
-    config_hash = sha256_text("{}")
+    config_json = canonical_json(
+        {"entity_id": "be", "start_url": session_start_url or start_url}
+    )
+    config_hash = sha256_text(config_json)
     metadata = canonical_json(
         {
             "acquisition_kind": "bounded_official_website",
+            "entity_id": "be",
             "start_url": start_url,
             "requested_url": start_url,
             "final_url": final_url,
@@ -90,13 +101,13 @@ def _official_observation(conn, *, start_url: str, final_url: str, home_page: bo
     conn.execute(
         "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,evidence_count,observation_count) "
-        "VALUES ('web','be',?,'sara.website','3','{}',?,'complete',?,?,1,1)",
-        (OFFICIAL_WEB_SOURCE_ID, config_hash, OBSERVED, OBSERVED),
+        "VALUES ('web','be',?,'sara.website','3',?,?, 'complete',?,?,1,1)",
+        (OFFICIAL_WEB_SOURCE_ID, config_json, config_hash, OBSERVED, OBSERVED),
     )
     conn.execute(
         "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,"
-        "metadata_json,created_at) VALUES ('ev_web','web',?,'official','usable',?,?,?)",
-        (OFFICIAL_WEB_SOURCE_ID, OBSERVED, metadata, OBSERVED),
+        "source_locator,metadata_json,created_at) VALUES ('ev_web','web',?,'official','usable',?,?,?,?)",
+        (OFFICIAL_WEB_SOURCE_ID, OBSERVED, final_url, metadata, OBSERVED),
     )
     conn.execute(
         "INSERT INTO observations(id,subject_id,predicate,evidence_id,value_json,normalized_value_json,"
@@ -167,6 +178,22 @@ def test_url_variant_without_matching_home_evidence_still_contradicts(tmp_path: 
         conn,
         start_url="http://different-start.example/",
         final_url=NEW_URL,
+    )
+    assert _reconcile(conn, observation) == (1, 1, 2)
+    assert _current_links(conn) == [
+        ("contradicts", "src_google_maps"),
+        ("supports", OFFICIAL_WEB_SOURCE_ID),
+    ]
+    conn.close()
+
+
+def test_session_start_mismatch_cannot_suppress_contradiction(tmp_path: Path) -> None:
+    conn = _setup(tmp_path / "session-mismatch.sqlite")
+    observation = _official_observation(
+        conn,
+        start_url=OLD_URL,
+        final_url=NEW_URL,
+        session_start_url="http://different-start.example/",
     )
     assert _reconcile(conn, observation) == (1, 1, 2)
     assert _current_links(conn) == [
