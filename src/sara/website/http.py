@@ -142,8 +142,13 @@ class SafeHttpClient:
             raise ValueError(
                 "max_policy_delay_seconds must be finite, at least request_interval_seconds and at most 300"
             )
-        if retry_attempt_limit < 1 or retry_attempt_limit > 8:
-            raise ValueError("retry_attempt_limit must be between 1 and 8")
+        if (
+            isinstance(retry_attempt_limit, bool)
+            or not isinstance(retry_attempt_limit, int)
+            or retry_attempt_limit < 1
+            or retry_attempt_limit > 8
+        ):
+            raise ValueError("retry_attempt_limit must be an integer between 1 and 8")
         if (
             not math.isfinite(retry_base_delay_seconds)
             or retry_base_delay_seconds <= 0
@@ -174,7 +179,7 @@ class SafeHttpClient:
         self.max_response_bytes = int(max_response_bytes)
         self.request_interval_seconds = float(request_interval_seconds)
         self.max_policy_delay_seconds = float(max_policy_delay_seconds)
-        self.retry_attempt_limit = int(retry_attempt_limit)
+        self.retry_attempt_limit = retry_attempt_limit
         self.retry_base_delay_seconds = float(retry_base_delay_seconds)
         self.retry_max_delay_seconds = float(retry_max_delay_seconds)
         self.retry_delay_budget_seconds = float(retry_delay_budget_seconds)
@@ -238,9 +243,17 @@ class SafeHttpClient:
                 rows = self._dns_lookup(
                     lowered, self._port(parsed), type=socket.SOCK_STREAM
                 )
+            except socket.gaierror as exc:
+                if exc.errno == getattr(socket, "EAI_AGAIN", None):
+                    raise _WebsiteTransientError(
+                        f"temporary DNS resolution failure for {lowered}: {exc}"
+                    ) from exc
+                raise WebsiteFetchError(
+                    f"DNS resolution failed for {lowered}: {exc}"
+                ) from exc
             except OSError as exc:
                 raise _WebsiteTransientError(
-                    f"DNS resolution failed for {lowered}: {exc}"
+                    f"temporary DNS resolution failure for {lowered}: {exc}"
                 ) from exc
             for row in rows:
                 sockaddr = row[4]
@@ -381,9 +394,9 @@ class SafeHttpClient:
                     self.timeout_seconds,
                 )
             try:
-                self._pace(url)
                 if budget is not None:
                     budget.start_attempt(url)
+                self._pace(url)
                 connection.request(
                     "GET",
                     target,
@@ -403,6 +416,10 @@ class SafeHttpClient:
                         f"response exceeded configured byte limit ({max_bytes}) for {url}"
                     )
                 return status, headers, body
+            except ssl.SSLCertVerificationError as exc:
+                raise WebsiteFetchError(
+                    f"TLS certificate verification failed for {url}: {exc}"
+                ) from exc
             except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
                 last_error = exc
             finally:
