@@ -141,3 +141,29 @@ def test_older_contradictory_observation_is_retained_but_not_current_support(tmp
         "SELECT id FROM facts WHERE subject_id='be' AND predicate='capability.online_booking' AND valid_to IS NULL"
     ).fetchone()[0] == "fact_prior"
     conn.close()
+
+
+def test_timestamp_offsets_are_compared_by_instant_not_lexical_text(tmp_path: Path) -> None:
+    # 09:30+03:00 is 06:30Z. The new 07:00Z observation is later even though
+    # its ISO text sorts before "09:30..." lexically.
+    conn = setup_fact_db(
+        tmp_path / "offset.sqlite",
+        current_value=True,
+        valid_from="2026-09-26T09:30:00+03:00",
+    )
+    observation = insert_official_observation(
+        conn, value=True, observed_at="2026-09-26T07:00:00+00:00"
+    )
+    created, replaced, _links = reconcile_observation_group(
+        conn,
+        entity_id="be",
+        predicate="capability.online_booking",
+        fact_slot="__single__",
+        observations=[observation],
+        observed_at="2026-09-26T07:00:00+00:00",
+        reconciled_at="2026-09-26T07:00:01+00:00",
+    )
+    conn.commit()
+    assert (created, replaced) == (1, 1)
+    assert conn.execute("SELECT valid_to FROM facts WHERE id='fact_prior'").fetchone()[0] == "2026-09-26T07:00:00+00:00"
+    conn.close()
