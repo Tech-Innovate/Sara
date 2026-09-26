@@ -25,6 +25,14 @@ class Clock:
         return value
 
 
+class SequenceClock:
+    def __init__(self, values: list[str]) -> None:
+        self.values = iter(values)
+
+    def __call__(self) -> str:
+        return next(self.values)
+
+
 class FakeClient:
     def __init__(self, pages: dict[str, str], failures: set[str] | None = None) -> None:
         self.pages = pages
@@ -49,7 +57,7 @@ def factory(client: FakeClient):
     return lambda **_kwargs: client
 
 
-def prepared(path: Path):
+def prepared(path: Path, *, website: str = "https://seed.example"):
     conn = connect(path)
     assert apply_migrations(conn) == (1,)
     seed_business_understanding_vocabulary(conn)
@@ -71,7 +79,7 @@ def prepared(path: Path):
             "place_id": "place-seed", "cid": "cid-seed", "data_id": "data-seed",
             "title": "Business seed", "category": "Restaurant", "address": "Seed Street",
             "latitude": 21.55, "longitude": 39.18, "phone": "+966500000000",
-            "website": "https://seed.example", "review_rating": 4.4, "review_count": 120,
+            "website": website, "review_rating": 4.4, "review_count": 120,
             "status": "Open", "link": "https://maps.example/seed",
         }],
         finalize_run=("complete", 0, None),
@@ -125,9 +133,22 @@ def test_complete_acquisition_is_dossier_clean_and_preserves_absence_semantics(t
     assert conn.execute(
         "SELECT support_role FROM fact_acquisition_support WHERE fact_id=?", (ordering[0],)
     ).fetchone()[0] == "supports_absence"
-    assert {row[0] for row in conn.execute(
+    channel_types = {row[0] for row in conn.execute(
         "SELECT channel_type FROM channels WHERE business_entity_id=?", (entity_id,)
-    )} >= {"website", "booking", "whatsapp", "instagram", "email", "phone"}
+    )}
+    assert {"website", "booking", "whatsapp", "instagram"} <= channel_types
+    assert not ({"email", "phone"} & channel_types)
+    metadata = [json.loads(row[0]) for row in conn.execute(
+        "SELECT metadata_json FROM evidence_items WHERE acquisition_session_id=?", (stats.session_id,)
+    )]
+    contact_channels = [
+        channel
+        for item in metadata
+        if item["page_role"] == "contact"
+        for channel in item["channels"]
+    ]
+    assert {item["channel_type"] for item in contact_channels} == {"email", "phone"}
+    assert all(item["canonicalized_channel_id"] is None for item in contact_channels)
 
     dossier = build_business_dossier(
         conn, entity_id=entity_id, evaluated_at="2026-09-26T07:00:00+00:00"
@@ -191,6 +212,104 @@ def test_branch_page_channel_is_retained_as_evidence_without_entity_scope_promot
     )]
     phone = [c for item in metadata for c in item["channels"] if c["channel_type"] == "phone"][0]
     assert phone["canonicalized_channel_id"] is None
+    conn.close()
+
+
+def test_deep_start_uses_fetched_root_as_home_and_does_not_promote_branch_contact(tmp_path: Path) -> None:
+    conn = prepared(
+        tmp_path / "deep.sqlite",
+        website="https://seed.example/location/jeddah",
+    )
+    entity_id = business_entity_id_for_maps_business(1)
+    client = FakeClient({
+        "https://seed.example/location/jeddah": """
+            <link rel="canonical" href="https://seed.example/location/jeddah">
+            <a href="tel:+966503333333">Jeddah branch</a>
+        """,
+        "https://seed.example/": """
+            <link rel="canonical" href="https://seed.example/">
+            <a href="https://instagram.com/seed">Instagram</a>
+        """,
+    })
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "evidence",
+        entity_id=entity_id,
+        config=CrawlConfig(page_limit=2, depth_limit=0),
+        now=Clock(),
+        client_factory=factory(client),
+    )
+    assert stats.status == "complete"
+    assert stats.canonical_home_url == "https://seed.example/"
+    assert json.loads(fact(conn, entity_id, "business.website.official")[1]) == "https://seed.example/"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM channels WHERE business_entity_id=? AND channel_type='phone'",
+        (entity_id,),
+    ).fetchone()[0] == 0
+    metadata = [json.loads(row[0]) for row in conn.execute(
+        "SELECT metadata_json FROM evidence_items WHERE acquisition_session_id=?", (stats.session_id,)
+    )]
+    deep = next(item for item in metadata if item["final_url"].endswith("/location/jeddah"))
+    phone = next(item for item in deep["channels"] if item["channel_type"] == "phone")
+    assert deep["home_page"] is False
+    assert phone["canonicalized_channel_id"] is None
+    conn.close()
+
+
+def test_deep_start_without_home_capture_stays_partial_and_emits_no_absence(tmp_path: Path) -> None:
+    conn = prepared(
+        tmp_path / "deep-partial.sqlite",
+        website="https://seed.example/location/jeddah",
+    )
+    entity_id = business_entity_id_for_maps_business(1)
+    client = FakeClient({
+        "https://seed.example/location/jeddah": """
+            <link rel="canonical" href="https://seed.example/location/jeddah">
+        """,
+    })
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "evidence",
+        entity_id=entity_id,
+        config=CrawlConfig(page_limit=1, depth_limit=0),
+        now=Clock(),
+        client_factory=factory(client),
+    )
+    assert stats.status == "partial"
+    assert stats.canonical_home_url is None
+    assert stats.not_observed_facts_created == 0
+    assert "capability.online_booking" in stats.unresolved_predicates
+    conn.close()
+
+
+def test_group_reconciliation_uses_actual_instants_across_offsets(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "offset-group.sqlite")
+    entity_id = business_entity_id_for_maps_business(1)
+    client = FakeClient({
+        "https://seed.example/": '<a href="/book">Book now</a>',
+        "https://seed.example/book": '<a href="/reserve">Reserve appointment</a>',
+    })
+    clock = SequenceClock([
+        "2026-09-26T06:00:00+00:00",
+        "2026-09-26T09:30:00+03:00",
+        "2026-09-26T07:00:00+00:00",
+        "2026-09-26T07:00:01+00:00",
+    ])
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "evidence",
+        entity_id=entity_id,
+        config=CrawlConfig(page_limit=2, depth_limit=1),
+        now=clock,
+        client_factory=factory(client),
+    )
+    assert stats.status == "complete"
+    current = conn.execute(
+        "SELECT last_verified_at FROM facts WHERE subject_id=? "
+        "AND predicate='capability.online_booking' AND valid_to IS NULL",
+        (entity_id,),
+    ).fetchone()
+    assert current[0] == "2026-09-26T07:00:00+00:00"
     conn.close()
 
 
