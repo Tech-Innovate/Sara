@@ -151,18 +151,79 @@ def bootstrap_understanding(conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
+def _canonical_subject_id(
+    conn: sqlite3.Connection,
+    subject_id: str,
+    expected_kind: str,
+) -> tuple[str, list[str]]:
+    current = subject_id
+    seen: set[str] = set()
+    chain: list[str] = []
+    while True:
+        if current in seen:
+            raise OperationalValidationError(
+                f"Understanding subject redirect cycle detected from {subject_id!r}"
+            )
+        seen.add(current)
+        chain.append(current)
+        row = conn.execute(
+            "SELECT kind,record_state,merged_into_subject_id FROM knowledge_subjects WHERE id=?",
+            (current,),
+        ).fetchone()
+        if row is None:
+            raise OperationalValidationError(
+                f"missing Understanding subject {current!r} while resolving {subject_id!r}"
+            )
+        if str(row["kind"]) != expected_kind:
+            raise OperationalValidationError(
+                f"Understanding subject {current!r} has kind {row['kind']!r}, "
+                f"expected {expected_kind!r}"
+            )
+        state = str(row["record_state"])
+        target = row["merged_into_subject_id"]
+        if state == "merged":
+            if not isinstance(target, str) or not target:
+                raise OperationalValidationError(
+                    f"merged Understanding subject {current!r} has no merge target"
+                )
+            current = target
+            continue
+        if state != "active" or target is not None:
+            raise OperationalValidationError(
+                f"current Maps state resolves through non-active Understanding subject {current!r}"
+            )
+        return current, chain
+
+
+def _canonical_location_owner(
+    conn: sqlite3.Connection,
+    location_id: str,
+) -> tuple[str, str, list[str], list[str]]:
+    canonical_location, location_chain = _canonical_subject_id(
+        conn, location_id, "location"
+    )
+    row = conn.execute(
+        "SELECT business_entity_id FROM business_locations WHERE id=?",
+        (canonical_location,),
+    ).fetchone()
+    if row is None:
+        raise OperationalValidationError(
+            f"missing business location row for {canonical_location!r}"
+        )
+    canonical_entity, entity_chain = _canonical_subject_id(
+        conn, str(row["business_entity_id"]), "business_entity"
+    )
+    return canonical_location, canonical_entity, location_chain, entity_chain
+
+
 def validate_one_to_one_maps_anchors(conn: sqlite3.Connection) -> CheckResult:
     business_count = int(conn.execute("SELECT COUNT(*) FROM businesses").fetchone()[0])
     rows = list(
         conn.execute(
-            "SELECT m.business_id,m.location_id,bl.business_entity_id "
-            "FROM maps_business_location_links m "
-            "JOIN business_locations bl ON bl.id=m.location_id "
-            "ORDER BY m.business_id"
+            "SELECT m.business_id,m.location_id "
+            "FROM maps_business_location_links m ORDER BY m.business_id"
         )
     )
-    distinct_businesses = len({int(row[0]) for row in rows})
-    distinct_locations = len({str(row[1]) for row in rows})
     missing = [
         int(row[0])
         for row in conn.execute(
@@ -171,11 +232,46 @@ def validate_one_to_one_maps_anchors(conn: sqlite3.Connection) -> CheckResult:
             "WHERE m.business_id IS NULL ORDER BY b.id"
         )
     ]
+    failures: list[dict[str, Any]] = []
+    canonical_locations: dict[int, str] = {}
+    for row in rows:
+        business_id = int(row["business_id"])
+        linked_location = str(row["location_id"])
+        try:
+            canonical_location, canonical_entity, location_chain, entity_chain = (
+                _canonical_location_owner(conn, linked_location)
+            )
+        except OperationalValidationError as exc:
+            failures.append({"business_id": business_id, "error": str(exc)})
+            continue
+        canonical_locations[business_id] = canonical_location
+        if canonical_location != linked_location:
+            failures.append(
+                {
+                    "business_id": business_id,
+                    "linked_location_id": linked_location,
+                    "canonical_location_id": canonical_location,
+                    "location_resolution_chain": location_chain,
+                    "canonical_entity_id": canonical_entity,
+                    "entity_resolution_chain": entity_chain,
+                    "error": "Maps link points to a non-canonical location",
+                }
+            )
+
+    duplicate_canonical_locations: dict[str, list[int]] = {}
+    for business_id, location_id in canonical_locations.items():
+        duplicate_canonical_locations.setdefault(location_id, []).append(business_id)
+    duplicate_canonical_locations = {
+        location_id: sorted(ids)
+        for location_id, ids in duplicate_canonical_locations.items()
+        if len(ids) > 1
+    }
     passed = (
         len(rows) == business_count
-        and distinct_businesses == business_count
-        and distinct_locations == business_count
+        and len(canonical_locations) == business_count
         and not missing
+        and not failures
+        and not duplicate_canonical_locations
     )
     return CheckResult(
         name="maps_one_to_one_understanding_anchors",
@@ -183,9 +279,11 @@ def validate_one_to_one_maps_anchors(conn: sqlite3.Connection) -> CheckResult:
         details={
             "business_count": business_count,
             "link_count": len(rows),
-            "distinct_businesses": distinct_businesses,
-            "distinct_locations": distinct_locations,
+            "resolved_businesses": len(canonical_locations),
+            "distinct_canonical_locations": len(set(canonical_locations.values())),
             "missing_business_ids": missing,
+            "duplicate_canonical_locations": duplicate_canonical_locations,
+            "failures": failures,
         },
     )
 
@@ -198,24 +296,47 @@ def validate_multi_branch_groups(
     inspected: list[dict[str, Any]] = []
     for group in groups:
         ids = tuple(int(value) for value in group)
-        placeholders = ",".join("?" for _ in ids)
-        rows = list(
-            conn.execute(
-                "SELECT m.business_id,bl.business_entity_id "
-                "FROM maps_business_location_links m "
-                "JOIN business_locations bl ON bl.id=m.location_id "
-                f"WHERE m.business_id IN ({placeholders}) ORDER BY m.business_id",
-                ids,
-            )
-        )
-        mapping = {int(row[0]): str(row[1]) for row in rows}
-        distinct_entities = set(mapping.values())
+        mapping: dict[int, str] = {}
+        details: dict[str, Any] = {}
+        group_errors: list[dict[str, Any]] = []
+        for business_id in ids:
+            row = conn.execute(
+                "SELECT location_id FROM maps_business_location_links WHERE business_id=?",
+                (business_id,),
+            ).fetchone()
+            if row is None:
+                group_errors.append(
+                    {"business_id": business_id, "error": "missing Maps location link"}
+                )
+                continue
+            linked_location = str(row["location_id"])
+            try:
+                canonical_location, canonical_entity, location_chain, entity_chain = (
+                    _canonical_location_owner(conn, linked_location)
+                )
+            except OperationalValidationError as exc:
+                group_errors.append({"business_id": business_id, "error": str(exc)})
+                continue
+            mapping[business_id] = canonical_entity
+            details[str(business_id)] = {
+                "linked_location_id": linked_location,
+                "canonical_location_id": canonical_location,
+                "location_resolution_chain": location_chain,
+                "canonical_entity_id": canonical_entity,
+                "entity_resolution_chain": entity_chain,
+            }
         item = {
             "business_ids": list(ids),
-            "entity_ids": {str(key): value for key, value in mapping.items()},
+            "canonical_entity_ids": {str(key): value for key, value in mapping.items()},
+            "resolution": details,
+            "errors": group_errors,
         }
         inspected.append(item)
-        if len(mapping) != len(ids) or len(distinct_entities) != len(ids):
+        if (
+            group_errors
+            or len(mapping) != len(ids)
+            or len(set(mapping.values())) != len(ids)
+        ):
             failures.append(item)
     return CheckResult(
         name="multi_branch_samples_remain_deliberately_separated",
