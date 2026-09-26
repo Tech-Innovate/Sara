@@ -4,6 +4,8 @@ import http.client
 import ipaddress
 import socket
 import ssl
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -75,9 +77,13 @@ class SafeHttpClient:
         user_agent: str,
         timeout_seconds: float,
         max_response_bytes: int,
+        request_interval_seconds: float = 1.0,
+        max_policy_delay_seconds: float = 30.0,
         obey_robots: bool = True,
         dns_lookup=socket.getaddrinfo,
         ssl_context: ssl.SSLContext | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         normalized = normalize_http_url(site_url)
         if normalized is None:
@@ -86,14 +92,25 @@ class SafeHttpClient:
             raise ValueError("timeout_seconds must be greater than zero")
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be greater than zero")
+        if request_interval_seconds <= 0:
+            raise ValueError("request_interval_seconds must be greater than zero")
+        if max_policy_delay_seconds < request_interval_seconds:
+            raise ValueError(
+                "max_policy_delay_seconds must be at least request_interval_seconds"
+            )
         self.site_url = normalized
         self.user_agent = user_agent
         self.timeout_seconds = float(timeout_seconds)
         self.max_response_bytes = int(max_response_bytes)
+        self.request_interval_seconds = float(request_interval_seconds)
+        self.max_policy_delay_seconds = float(max_policy_delay_seconds)
         self.obey_robots = bool(obey_robots)
         self._dns_lookup = dns_lookup
         self._ssl_context = ssl_context or ssl.create_default_context()
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._robots: dict[str, RobotFileParser | None] = {}
+        self._last_request_started: dict[str, float] = {}
 
     def _assert_allowed_site(self, url: str) -> None:
         if not same_site(url, self.site_url):
@@ -195,6 +212,48 @@ class SafeHttpClient:
             netloc = display_host
         return urlunsplit((parsed.scheme, netloc, "/", "", ""))
 
+    def _policy_delay_seconds(self, url: str) -> float:
+        delay = self.request_interval_seconds
+        parser = self._robots.get(self._origin(url))
+        if parser is not None:
+            crawl_delay = parser.crawl_delay(self.user_agent)
+            if crawl_delay is not None:
+                delay = max(delay, float(crawl_delay))
+            request_rate = parser.request_rate(self.user_agent)
+            if (
+                request_rate is not None
+                and request_rate.requests > 0
+                and request_rate.seconds > 0
+            ):
+                # Evenly spacing requests at seconds/requests is conservative:
+                # it never exceeds the advertised average request rate.
+                delay = max(
+                    delay,
+                    float(request_rate.seconds) / float(request_rate.requests),
+                )
+        if delay > self.max_policy_delay_seconds:
+            raise WebsiteBlockedError(
+                "robots pacing policy exceeds configured maximum "
+                f"({delay:g}s > {self.max_policy_delay_seconds:g}s) for {self._origin(url)}"
+            )
+        return delay
+
+    def _pace(self, url: str) -> None:
+        origin = self._origin(url)
+        delay = self._policy_delay_seconds(url)
+        now = float(self._monotonic())
+        previous = self._last_request_started.get(origin)
+        if previous is not None:
+            remaining = delay - (now - previous)
+            if remaining > 0:
+                self._sleep(remaining)
+                observed = float(self._monotonic())
+                # Test clocks and unusual sleep implementations may not advance
+                # monotonically by the requested amount. Preserve the schedule
+                # conservatively rather than allowing a subsequent early request.
+                now = max(observed, previous + delay)
+        self._last_request_started[origin] = now
+
     @staticmethod
     def _request_target(parsed) -> str:  # noqa: ANN001
         target = parsed.path or "/"
@@ -222,6 +281,7 @@ class SafeHttpClient:
         target = self._request_target(parsed)
         host_header = self._host_header(parsed)
         last_error: BaseException | None = None
+        self._pace(url)
 
         for address in addresses:
             if parsed.scheme == "https":
