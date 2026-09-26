@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from .maps_source import official_website
+from .maps_source import MapsSourceShapeError, official_website
 from .understanding_vocabulary import (
     PREDICATE_SEEDS,
     VocabularySeedError,
@@ -147,6 +147,10 @@ def _source_values(raw: dict[str, Any]) -> dict[str, Any]:
     longitude = raw.get("longitude")
     if longitude is None:
         longitude = raw.get("longtitude")
+    try:
+        website = official_website(raw)
+    except MapsSourceShapeError as exc:
+        raise MapsBackfillError(str(exc)) from exc
     return {
         "title": _text(raw.get("title")),
         "category": _text(raw.get("category")),
@@ -154,7 +158,7 @@ def _source_values(raw: dict[str, Any]) -> dict[str, Any]:
         "latitude": _float(raw.get("latitude")),
         "longitude": _float(longitude),
         "phone": _text(raw.get("phone")),
-        "website": official_website(raw),
+        "website": website,
         "review_rating": _float(raw.get("review_rating")),
         "review_count": _int(raw.get("review_count")),
         "status": _text(raw.get("status")),

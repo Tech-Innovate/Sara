@@ -504,7 +504,10 @@ def _refresh_session_counts(conn: sqlite3.Connection, session_id: str) -> None:
 def _snapshot_observations(
     raw: dict[str, Any], *, entity_id: str, location_id: str
 ) -> list[dict[str, Any]]:
-    values = mb._source_values(raw)
+    try:
+        values = mb._source_values(raw)
+    except mb.MapsBackfillError as exc:
+        raise MapsSyncError(str(exc)) from exc
     result: list[dict[str, Any]] = []
     for field, subject_kind, predicate in mb._FIELD_SPECS:
         value = values[field]

@@ -183,7 +183,7 @@ def test_backfill_conflicting_website_aliases_rolls_back_understanding_bootstrap
     assert apply_migrations(conn) == (1,)
     seed_business_understanding_vocabulary(conn)
 
-    with pytest.raises(MapsSourceShapeError):
+    with pytest.raises(mb.MapsBackfillError, match="conflicting Maps website fields"):
         mb.backfill_maps_business_understanding(conn)
 
     assert conn.execute("SELECT COUNT(*) FROM maps_business_location_links").fetchone()[0] == 0

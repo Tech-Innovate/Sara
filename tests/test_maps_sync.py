@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from sara import maps_backfill as mb
-from sara.maps_sync import MapsSyncError, sync_maps_business_understanding
+from sara.maps_sync import (
+    SYNC_RECONCILIATION_VERSION,
+    MapsSyncError,
+    sync_maps_business_understanding,
+)
 from sara.migrations import apply_migrations
 from sara.storage import connect as storage_connect, ingest_records
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
@@ -308,7 +312,7 @@ def test_sync_versions_same_value_to_refresh_fact_verification_time(tmp_path: Pa
         "4.4",
         "2026-09-25T10:00:00+00:00",
         "2026-09-25T10:00:00+00:00",
-        "maps-sync-v1",
+        SYNC_RECONCILIATION_VERSION,
     )
 
 
