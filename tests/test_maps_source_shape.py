@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -192,3 +193,113 @@ def test_backfill_conflicting_website_aliases_rolls_back_understanding_bootstrap
     assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
     conn.close()
+
+
+def _pre_alias_fallback_key(record: dict) -> str:
+    longitude = record.get("longitude")
+    if longitude is None:
+        longitude = record.get("longtitude")
+    values = (
+        record.get("link"),
+        record.get("title"),
+        record.get("address"),
+        record.get("phone"),
+        record.get("website"),
+        None if record.get("latitude") is None else str(float(record["latitude"])),
+        None if longitude is None else str(float(longitude)),
+    )
+    normalized = [
+        str(value).strip().lower() if value not in (None, "") else ""
+        for value in values
+    ]
+    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
+    return f"fallback:{digest}"
+
+
+def _insert_pre_alias_weak_row(conn, record: dict, *, run_id: str = "r1") -> int:
+    canonical_key = _pre_alias_fallback_key(record)
+    raw_json = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    cursor = conn.execute(
+        "INSERT INTO businesses("
+        "canonical_key,title,address,latitude,longitude,phone,website,first_seen_at,last_seen_at,"
+        "first_run_id,last_run_id,raw_json"
+        ") VALUES (?,?,?,?,?,?,NULL,?,?,?,?,?)",
+        (
+            canonical_key,
+            record.get("title"),
+            record.get("address"),
+            record.get("latitude"),
+            record.get("longitude"),
+            record.get("phone"),
+            "2026-09-26T00:00:00+00:00",
+            "2026-09-26T00:00:00+00:00",
+            run_id,
+            run_id,
+            raw_json,
+        ),
+    )
+    business_id = int(cursor.lastrowid)
+    conn.execute(
+        "INSERT INTO run_businesses(run_id,business_id,first_observed_at) VALUES (?,?,?)",
+        (run_id, business_id, "2026-09-26T00:00:00+00:00"),
+    )
+    conn.execute(
+        "UPDATE runs SET status='complete',finished_at=?,exit_code=0,raw_records=1,accepted_records=1,"
+        "unique_seen=1,new_businesses=1 WHERE id=?",
+        ("2026-09-26T00:01:00+00:00", run_id),
+    )
+    conn.commit()
+    return business_id
+
+
+def test_storage_reuses_pre_alias_fallback_identity_when_raw_website_agrees(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path / "legacy-fallback.sqlite")
+    _add_run(conn, "r1")
+    record = _verbatim_v1181_shape()
+    record.pop("place_id")
+    record.pop("cid")
+    business_id = _insert_pre_alias_weak_row(conn, record)
+    legacy_key = _pre_alias_fallback_key(record)
+
+    _add_run(conn, "r2", "2026-09-26T01:00:00+00:00")
+    ingest_records(conn, "r2", [record], finalize_run=("complete", 0, None))
+
+    canonical_shape = dict(record)
+    canonical_shape["website"] = canonical_shape.pop("web_site")
+    _add_run(conn, "r3", "2026-09-26T02:00:00+00:00")
+    ingest_records(conn, "r3", [canonical_shape], finalize_run=("complete", 0, None))
+
+    rows = list(
+        conn.execute("SELECT id,canonical_key,website FROM businesses ORDER BY id")
+    )
+    assert len(rows) == 1
+    assert int(rows[0]["id"]) == business_id
+    assert rows[0]["canonical_key"] == legacy_key
+    assert rows[0]["website"] == "https://example.test/"
+    conn.close()
+
+
+def test_storage_does_not_reuse_legacy_fallback_collision_with_different_raw_website(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path / "legacy-fallback-collision.sqlite")
+    _add_run(conn, "r1")
+    incoming = _verbatim_v1181_shape()
+    incoming.pop("place_id")
+    incoming.pop("cid")
+    historical = dict(incoming)
+    historical["web_site"] = "https://different.example/"
+    old_id = _insert_pre_alias_weak_row(conn, historical)
+
+    _add_run(conn, "r2", "2026-09-26T01:00:00+00:00")
+    ingest_records(conn, "r2", [incoming], finalize_run=("complete", 0, None))
+
+    rows = list(conn.execute("SELECT id,website FROM businesses ORDER BY id"))
+    assert len(rows) == 2
+    assert int(rows[0]["id"]) == old_id
+    assert rows[0]["website"] is None
+    assert rows[1]["website"] == "https://example.test/"
+    conn.close()
+

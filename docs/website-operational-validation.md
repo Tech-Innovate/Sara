@@ -14,6 +14,8 @@ The pinned `gosom/google-maps-scraper:v1.18.1` data seen in Sara's real retained
 
 If both spellings are present and their nonblank values disagree after surrounding whitespace is removed, ingestion/extraction fails closed rather than silently choosing one value. Existing legacy `businesses` rows are not rewritten merely to populate the denormalized `website` column during Understanding bootstrap; historical `raw_json.web_site` can support the website fact while the legacy-table preservation checks remain meaningful.
 
+For weak-ID historical rows created before this compatibility adapter, Sara also recognizes the old fallback key that omitted `web_site`, but only when the retained historical `raw_json` resolves to the same official website as the incoming record. This prevents source-shape normalization from duplicating a known row without broadening weak-identity merges.
+
 This compatibility change alters deterministic Maps extraction semantics, so the Maps provenance versions advance rather than attributing new observations to the old algorithm:
 
 ```text

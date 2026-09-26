@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import BoundingBox
-from .maps_source import official_website
+from .maps_source import MapsSourceShapeError, official_website
 
 
 def utc_now() -> str:
@@ -190,18 +190,7 @@ def _coordinates(record: dict[str, Any]) -> tuple[float | None, float | None]:
     return _float(record.get("latitude")), _float(longitude)
 
 
-def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
-    website = official_website(record)
-    place_id = _text(record.get("place_id"))
-    cid = _text(record.get("cid"))
-    data_id = _text(record.get("data_id"))
-    if place_id:
-        return place_id, cid, data_id, f"place:{place_id}"
-    if cid:
-        return place_id, cid, data_id, f"cid:{cid}"
-    if data_id:
-        return place_id, cid, data_id, f"data:{data_id}"
-
+def _fallback_identity_key(record: dict[str, Any], website: str | None) -> str:
     latitude, longitude = _coordinates(record)
     values = (
         _text(record.get("link")),
@@ -216,7 +205,21 @@ def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | Non
     if not any(normalized):
         raise UnidentifiableRecord("record has no usable identity fields")
     digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
-    return place_id, cid, data_id, f"fallback:{digest}"
+    return f"fallback:{digest}"
+
+
+def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
+    website = official_website(record)
+    place_id = _text(record.get("place_id"))
+    cid = _text(record.get("cid"))
+    data_id = _text(record.get("data_id"))
+    if place_id:
+        return place_id, cid, data_id, f"place:{place_id}"
+    if cid:
+        return place_id, cid, data_id, f"cid:{cid}"
+    if data_id:
+        return place_id, cid, data_id, f"data:{data_id}"
+    return place_id, cid, data_id, _fallback_identity_key(record, website)
 
 
 def _order_key(seen_at: str | None, run_id: str | None) -> tuple[str, str]:
@@ -244,6 +247,37 @@ def _find_matches(
             if row:
                 matches[int(row["id"])] = row
     return [matches[key] for key in sorted(matches)]
+
+
+def _legacy_fallback_alias_match(
+    conn: sqlite3.Connection,
+    record: dict[str, Any],
+    canonical_key: str,
+) -> sqlite3.Row | None:
+    website = official_website(record)
+    if website is None:
+        return None
+    legacy_key = _fallback_identity_key(record, None)
+    if legacy_key == canonical_key:
+        return None
+    row = conn.execute(
+        "SELECT * FROM businesses WHERE canonical_key = ?", (legacy_key,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        raw = json.loads(str(row["raw_json"]))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        historical_website = official_website(raw)
+    except MapsSourceShapeError:
+        return None
+    if historical_website != website:
+        return None
+    return row
 
 
 def _merge_matches(conn: sqlite3.Connection, matches: list[sqlite3.Row]) -> sqlite3.Row | None:
@@ -350,6 +384,13 @@ def upsert_business(
 ) -> tuple[int, bool]:
     place_id, cid, data_id, canonical_key = _identity(record)
     matches = _find_matches(conn, place_id, cid, data_id, canonical_key)
+    if not any((place_id, cid, data_id)):
+        legacy_match = _legacy_fallback_alias_match(conn, record, canonical_key)
+        if legacy_match is not None and all(
+            int(row["id"]) != int(legacy_match["id"]) for row in matches
+        ):
+            matches.append(legacy_match)
+            matches.sort(key=lambda row: int(row["id"]))
     existing = _merge_matches(conn, matches)
     observed_at = run_started_at or _run_started_at(conn, run_id)
     payload = _payload(record)
