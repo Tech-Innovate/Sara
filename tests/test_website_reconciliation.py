@@ -17,7 +17,7 @@ def setup_fact_db(path: Path, *, current_value: bool, valid_from: str):
     )
     conn.execute(
         "INSERT INTO business_entities(id,display_name,entity_type,lifecycle_status,identity_confidence,created_at,updated_at) "
-        "VALUES ('be','Business','provisional','active','provisional',?,?)",
+        "VALUES ('be','Business','unknown','unknown',NULL,?,?)",
         (valid_from, valid_from),
     )
     for source_id, source_type in (("src_prior", "google_maps"), (OFFICIAL_WEB_SOURCE_ID, "official_web")):
