@@ -232,6 +232,38 @@ def _is_social_profile(url: str, channel_type: str) -> bool:
     return False
 
 
+def _valid_whatsapp_phone(value: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    return len(digits) >= 6
+
+
+def _is_whatsapp_action(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    host = _host(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    lowered_parts = [part.lower() for part in parts]
+    query = {key.lower(): value for key, value in parse_qsl(parsed.query, keep_blank_values=True)}
+
+    if host == "wa.me":
+        if len(parts) == 1 and _valid_whatsapp_phone(parts[0]):
+            return True
+        if len(parts) == 2 and lowered_parts[0] == "c" and _valid_whatsapp_phone(parts[1]):
+            return True
+        if len(parts) == 2 and lowered_parts[0] == "message" and bool(parts[1]):
+            return True
+        return False
+
+    if host in {"api.whatsapp.com", "web.whatsapp.com", "whatsapp.com"}:
+        if lowered_parts[:1] == ["send"] and _valid_whatsapp_phone(query.get("phone", "")):
+            return True
+        if host == "whatsapp.com" and len(parts) >= 2 and lowered_parts[0] == "channel":
+            return True
+    return False
+
+
 def _booking_action_text(tokens: set[str]) -> bool:
     if len(tokens) == 1 and bool(tokens & _BOOKING_TERMS):
         return True
@@ -304,7 +336,7 @@ def classify_channel(href: str, text: str, page_url: str) -> ChannelCandidate | 
     text_tokens = _tokens(text)
     combined = path_tokens | text_tokens
 
-    if host == "wa.me" or host.endswith(".whatsapp.com") or host == "whatsapp.com":
+    if _is_whatsapp_action(url):
         return ChannelCandidate("whatsapp", url, url, url, "direct_link")
 
     social = _social_type(host)
