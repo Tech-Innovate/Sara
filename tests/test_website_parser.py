@@ -97,6 +97,34 @@ def test_ordering_heuristic_requires_transactional_action_context() -> None:
         assert page.ordering_detected is True
 
 
+def test_whatsapp_detection_requires_customer_facing_action_endpoint() -> None:
+    generic = parse_html(
+        "https://example.com/",
+        """
+        <a href="https://www.whatsapp.com/">WhatsApp</a>
+        <a href="https://www.whatsapp.com/about/">About WhatsApp</a>
+        <a href="https://api.whatsapp.com/">WhatsApp API</a>
+        """,
+    )
+    assert generic.whatsapp_detected is False
+    assert all(item.channel_type != "whatsapp" for item in generic.channels)
+
+    for href in (
+        "https://wa.me/966501234567",
+        "https://wa.me/message/ABC123XYZ",
+        "https://wa.me/c/966501234567",
+        "https://api.whatsapp.com/send?phone=966501234567",
+        "https://web.whatsapp.com/send?phone=966501234567",
+        "https://www.whatsapp.com/channel/0029VaExample",
+    ):
+        page = parse_html(
+            "https://example.com/",
+            f'<a href="{href}">Contact us on WhatsApp</a>',
+        )
+        assert page.whatsapp_detected is True
+        assert any(item.channel_type == "whatsapp" for item in page.channels)
+
+
 def test_malformed_page_link_is_ignored_without_losing_other_page_signals() -> None:
     page = parse_html(
         "https://example.com/",
