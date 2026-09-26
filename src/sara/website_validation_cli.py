@@ -3,17 +3,23 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from .dossier import build_business_dossier
 from .storage import connect_readonly
 from .website_validation import (
+    REPORT_SCHEMA,
     OperationalValidationError,
     _parser,
     _validate_arguments,
     run_validation,
 )
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _legacy_schema_snapshot(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -101,7 +107,7 @@ def _representative_dossier_check(
         for business_id in business_ids:
             try:
                 dossier = build_business_dossier(conn, business_id=business_id)
-            except BaseException as exc:
+            except Exception as exc:
                 failure = {
                     "business_id": business_id,
                     "error": f"{type(exc).__name__}: {exc}",
@@ -163,6 +169,36 @@ def _write_report(report: dict[str, Any]) -> None:
     )
 
 
+def _write_fatal_report(args: Any, exc: Exception) -> None:
+    workspace = Path(args.workspace)
+    if workspace.exists() and any(workspace.iterdir()):
+        return
+    workspace.mkdir(parents=True, exist_ok=True)
+    report = {
+        "schema": REPORT_SCHEMA,
+        "generated_at": _utc_now(),
+        "source_db": str(Path(args.source_db)),
+        "working_db": str(workspace / "validation.sqlite"),
+        "merge_probe_db": str(workspace / "merge-probe.sqlite"),
+        "evidence_root": str(workspace / "evidence"),
+        "bootstrap": {},
+        "representative_samples": {
+            "single_location_business_ids": [int(v) for v in args.single_location_business_id],
+            "multi_branch_groups": [list(group) for group in args.multi_branch_group],
+            "merge_pair": None if args.merge_pair is None else list(args.merge_pair),
+            "passes_per_business": args.passes,
+        },
+        "acquisitions": [],
+        "checks": [],
+        "fatal_error": f"{type(exc).__name__}: {exc}",
+        "production_ready": False,
+    }
+    (workspace / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_validation_gate(**kwargs: Any) -> dict[str, Any]:
     report = run_validation(**kwargs)
     schema_check = _legacy_schema_check(report["source_db"], report["working_db"])
@@ -189,7 +225,11 @@ def main(argv: list[str] | None = None) -> int:
             merge_pair=args.merge_pair,
             passes=args.passes,
         )
+    except KeyboardInterrupt:
+        print("website operational validation interrupted", file=sys.stderr)
+        return 130
     except (OperationalValidationError, FileNotFoundError, sqlite3.Error, ValueError) as exc:
+        _write_fatal_report(args, exc)
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print(
