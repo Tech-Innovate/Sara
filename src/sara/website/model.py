@@ -7,6 +7,11 @@ from typing import Any
 
 from .parser import ParsedPage
 
+
+class WebsiteAcquisitionError(RuntimeError):
+    """Official website acquisition cannot proceed safely."""
+
+
 OFFICIAL_WEB_SOURCE_ID = "src_official_web"
 COLLECTOR_NAME = "sara.website"
 COLLECTOR_VERSION = "1"
