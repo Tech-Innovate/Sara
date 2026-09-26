@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -11,6 +12,8 @@ class MapsSourceShapeError(ValueError):
 def _text(value: Any) -> str | None:
     if value is None:
         return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
     value = str(value).strip()
     return value or None
 
