@@ -1,0 +1,169 @@
+name: Apply fallback identity compatibility patch
+
+on:
+  push:
+    branches:
+      - fix/maps-source-shape-merge-probe
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Preserve historical fallback identities
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/sara/storage.py')
+          text = path.read_text(encoding='utf-8')
+
+          old = '''def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
+    website = official_website(record)
+    place_id = _text(record.get("place_id"))
+    cid = _text(record.get("cid"))
+    data_id = _text(record.get("data_id"))
+    if place_id:
+        return place_id, cid, data_id, f"place:{place_id}"
+    if cid:
+        return place_id, cid, data_id, f"cid:{cid}"
+    if data_id:
+        return place_id, cid, data_id, f"data:{data_id}"
+
+    latitude, longitude = _coordinates(record)
+    values = (
+        _text(record.get("link")),
+        _text(record.get("title")),
+        _text(record.get("address")),
+        _text(record.get("phone")),
+        website,
+        None if latitude is None else str(latitude),
+        None if longitude is None else str(longitude),
+    )
+    normalized = [value.strip().lower() if value else "" for value in values]
+    if not any(normalized):
+        raise UnidentifiableRecord("record has no usable identity fields")
+    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
+    return place_id, cid, data_id, f"fallback:{digest}"
+'''
+          new = '''def _fallback_canonical_key(record: dict[str, Any], website: str | None) -> str:
+    latitude, longitude = _coordinates(record)
+    values = (
+        _text(record.get("link")),
+        _text(record.get("title")),
+        _text(record.get("address")),
+        _text(record.get("phone")),
+        website,
+        None if latitude is None else str(latitude),
+        None if longitude is None else str(longitude),
+    )
+    normalized = [value.strip().lower() if value else "" for value in values]
+    if not any(normalized):
+        raise UnidentifiableRecord("record has no usable identity fields")
+    digest = hashlib.sha256("|".join(normalized).encode("utf-8")).hexdigest()
+    return f"fallback:{digest}"
+
+
+def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
+    website = official_website(record)
+    place_id = _text(record.get("place_id"))
+    cid = _text(record.get("cid"))
+    data_id = _text(record.get("data_id"))
+    if place_id:
+        return place_id, cid, data_id, f"place:{place_id}"
+    if cid:
+        return place_id, cid, data_id, f"cid:{cid}"
+    if data_id:
+        return place_id, cid, data_id, f"data:{data_id}"
+    return place_id, cid, data_id, _fallback_canonical_key(record, website)
+
+
+def _fallback_compatibility_keys(record: dict[str, Any], canonical_key: str) -> tuple[str, ...]:
+    # Before source-shape normalization, a ``web_site``-only record contributed no
+    # website value to fallback identity while a literal ``website`` record did.
+    # Search both historical forms so upgrades do not duplicate strong-ID-less
+    # businesses. New rows still use the normalized canonical key.
+    keys = [
+        canonical_key,
+        _fallback_canonical_key(record, _text(record.get("website"))),
+        _fallback_canonical_key(record, None),
+    ]
+    return tuple(dict.fromkeys(keys))
+'''
+          if text.count(old) != 1:
+              raise SystemExit('storage.py: identity block did not match exactly once')
+          text = text.replace(old, new)
+
+          old = '''def _find_matches(
+    conn: sqlite3.Connection,
+    place_id: str | None,
+    cid: str | None,
+    data_id: str | None,
+    canonical_key: str,
+) -> list[sqlite3.Row]:
+    matches: dict[int, sqlite3.Row] = {}
+    for column, value in (("place_id", place_id), ("cid", cid), ("data_id", data_id), ("canonical_key", canonical_key)):
+        if value:
+            row = conn.execute(f"SELECT * FROM businesses WHERE {column} = ?", (value,)).fetchone()
+            if row:
+                matches[int(row["id"])] = row
+    return [matches[key] for key in sorted(matches)]
+'''
+          new = '''def _find_matches(
+    conn: sqlite3.Connection,
+    place_id: str | None,
+    cid: str | None,
+    data_id: str | None,
+    canonical_keys: Iterable[str],
+) -> list[sqlite3.Row]:
+    matches: dict[int, sqlite3.Row] = {}
+    for column, value in (("place_id", place_id), ("cid", cid), ("data_id", data_id)):
+        if value:
+            row = conn.execute(f"SELECT * FROM businesses WHERE {column} = ?", (value,)).fetchone()
+            if row:
+                matches[int(row["id"])] = row
+    for canonical_key in canonical_keys:
+        row = conn.execute(
+            "SELECT * FROM businesses WHERE canonical_key = ?", (canonical_key,)
+        ).fetchone()
+        if row:
+            matches[int(row["id"])] = row
+    return [matches[key] for key in sorted(matches)]
+'''
+          if text.count(old) != 1:
+              raise SystemExit('storage.py: find-matches block did not match exactly once')
+          text = text.replace(old, new)
+
+          old = '''    place_id, cid, data_id, canonical_key = _identity(record)
+    matches = _find_matches(conn, place_id, cid, data_id, canonical_key)
+'''
+          new = '''    place_id, cid, data_id, canonical_key = _identity(record)
+    canonical_keys = (
+        (canonical_key,)
+        if any((place_id, cid, data_id))
+        else _fallback_compatibility_keys(record, canonical_key)
+    )
+    matches = _find_matches(conn, place_id, cid, data_id, canonical_keys)
+'''
+          if text.count(old) != 1:
+              raise SystemExit('storage.py: upsert identity wiring did not match exactly once')
+          text = text.replace(old, new)
+
+          path.write_text(text, encoding='utf-8')
+          Path('.github/workflows/_fallback_identity_patch.yml').unlink()
+          PY
+      - name: Commit branch patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Preserve historical fallback identity keys'
+          git push origin HEAD:fix/maps-source-shape-merge-probe
