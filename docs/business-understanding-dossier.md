@@ -1,0 +1,57 @@
+# Business Understanding dossier inspection
+
+Phase 5 adds a read-only inspection surface for Business Understanding state. It does not acquire data, migrate schema, seed vocabulary, synchronize Maps businesses, create dossier assessments, or mutate existing records.
+
+## Usage
+
+```bash
+sara-dossier --db data/sara.db --business-id 123 --pretty
+```
+
+Exactly one selector is required:
+
+```text
+--business-id <current canonical Maps business id>
+--canonical-key <current canonical Maps business key>
+--entity-id <Business Understanding entity id>
+```
+
+Maps selectors require the business to have already been synchronized explicitly with `sara-maps-sync`. The dossier command never performs synchronization on the caller's behalf.
+
+`--evaluated-at <timezone-aware ISO-8601 timestamp>` controls only freshness evaluation. Omitting it uses the current UTC time. This is not a historical time-travel query: facts are the records that are current in the database when the command runs.
+
+## Output contract
+
+The JSON result identifies its scopes explicitly:
+
+- `fact_scope=current_only`: current facts for the canonical entity and its current locations;
+- `evidence_scope=current_fact_provenance`: retained evidence reached through those current facts' support links;
+- `unknown_scope=controlled_active_predicates_on_current_subjects`: unresolved controlled predicates plus explicit `unknown` and `not_observed` fact states.
+
+Locations carry `relationship_to_entity` so identity history remains inspectable:
+
+- `current` is a canonical active Location owned by the selected entity;
+- `historical_owned` is a Location historically owned by the selected entity but no longer current;
+- `merged_alias` is a historical Location that now redirects into one of the entity's current Locations. Its immutable provider identifiers remain visible on that alias rather than being silently moved.
+
+The surface preserves Sara's semantic distinctions:
+
+- `unknown` means the fact cannot currently be established;
+- `not_observed` is only reported when that explicit fact state exists; integrity checks require acquisition provenance and an absence-specific `supports_absence` support edge rather than treating generic research context as evidence of non-observation;
+- confirmed `false` remains a supported value and is not converted into an unknown;
+- `single_source` is checked against exactly one distinct usable supporting source; multiple observations from that same source still count as one source;
+- a controlled predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
+
+Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, and missing absence provenance rather than silently hiding them.
+
+## Dossier status
+
+If a sealed dossier assessment exists for the active dossier policy, the command returns the chronologically latest complete sealed snapshot. A sealed snapshot must contain every controlled dossier domain or the query fails closed.
+
+Persisted assessments are reported as immutable historical snapshots. Phase 5 does not claim that an old `analysis_ready` value remains current after later fact changes. Snapshot integrity issues such as impossible chronology, `fresh_fact_count > fact_count`, or `analysis_ready` with a mandatory domain below sufficiency are surfaced separately.
+
+The `read_only_preview` is intentionally conservative. It may expose states such as `not_started`, `insufficient`, `partial`, `stale`, `conflicted`, or `not_applicable`, but it never promotes a business to `sufficient`, `strong`, or `analysis_ready`. Exact sufficiency policy and persisted assessment computation remain separate work.
+
+## Read-only guarantee
+
+The CLI opens SQLite with Sara's `connect_readonly` path (`mode=ro` plus `query_only` where supported). It never calls schema migrations, vocabulary seeding, Maps synchronization, or an acquisition collector. An older or unsynchronized database is rejected instead of repaired implicitly.
