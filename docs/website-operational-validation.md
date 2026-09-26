@@ -60,7 +60,7 @@ Provide:
 
 Every selected acquisition target must already have a supported `business.website.official` fact. Domain discovery is outside this gate and outside the Phase-6 collector.
 
-The merge-probe business is not asserted to be a natural duplicate. Only in `merge-probe.sqlite`, the harness partitions that one real business's strong identifiers into two temporary complementary Maps rows before Understanding bootstrap. It then creates separate Understanding anchors/evidence for those rows, reconnects them with the real combined source record through Sara's normal `upsert_business` path, and runs the normal Maps synchronizer. The source database and `validation.sqlite` are never mutated by this synthetic setup.
+The merge-probe business is not asserted to be a natural duplicate. Only in `merge-probe.sqlite`, the harness partitions that one real business's strong identifiers into two temporary complementary Maps rows before Understanding bootstrap. It then creates separate Understanding anchors/evidence for those rows, reconnects them with the combined source record through Sara's normal `upsert_business` path under a later validation-generated Maps run, and runs the normal Maps synchronizer. The validation-generated run is explicitly marked synthetic, has no retained raw artifact reference, and is never represented as a real scraper execution. The source database and `validation.sqlite` are never mutated by this synthetic setup.
 
 A legacy `--merge-pair A,B` option remains available when a genuine pair with non-conflicting complementary strong identifiers actually exists. It is not required or recommended merely to satisfy the gate, and strong-identifier conflicts are never relaxed to manufacture such a pair.
 
@@ -109,7 +109,7 @@ The report schema is:
 sara-website-operational-validation-v1
 ```
 
-The controlled probe records `probe_kind=controlled_complementary_identifier_partition`, the real source business ID, and the temporary synthetic duplicate ID. Those fields describe the validation setup; they are not evidence that the duplicate Maps rows existed naturally in production.
+The controlled probe records `probe_kind=controlled_complementary_identifier_partition`, the real source business ID, the temporary synthetic duplicate ID, and the synthetic bridge run ID. Those fields describe the validation setup; they are not evidence that the duplicate Maps rows or bridge run existed naturally in production.
 
 `production_ready=true` is emitted only when all checks pass. A non-ready report or CLI exit code `2` is a stop condition for production enablement. Ctrl-C is propagated as cancellation semantics and exits with code `130`; it is not converted into an ordinary readiness result.
 
