@@ -238,7 +238,22 @@ def _booking_action_text(tokens: set[str]) -> bool:
     if "book" in tokens and bool(tokens & _BOOKING_ACTION_TERMS):
         return True
     if bool(tokens & {"booking", "reserve", "reservation", "reservations"}) and bool(
-        tokens & {"now", "online", "table", "tables", "slot", "slots", "today"}
+        tokens
+        & {
+            "now",
+            "online",
+            "table",
+            "tables",
+            "slot",
+            "slots",
+            "today",
+            "appointment",
+            "appointments",
+            "consultation",
+            "consultations",
+            "session",
+            "sessions",
+        }
     ):
         return True
     if bool(tokens & {"schedule", "scheduling"}) and bool(
