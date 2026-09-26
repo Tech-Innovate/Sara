@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import socket
+import ssl
 from email.message import Message
 
 import pytest
 
 from sara.website import http as website_http
 from sara.website.http import SafeHttpClient, WebsiteFetchError
+from sara.website.model import CrawlConfig
 
 
 def _client(**overrides) -> SafeHttpClient:
@@ -214,6 +216,15 @@ def test_retry_attempt_limit_stops_retryable_http_statuses(monkeypatch) -> None:
     assert sleeps == pytest.approx([1.0])
 
 
+def test_retry_attempt_limit_must_be_integral() -> None:
+    with pytest.raises(ValueError, match="integer"):
+        CrawlConfig(retry_attempt_limit=2.5).validate()
+    with pytest.raises(ValueError, match="integer"):
+        _client(retry_attempt_limit=2.5)
+    with pytest.raises(ValueError, match="integer"):
+        CrawlConfig(retry_attempt_limit=True).validate()
+
+
 def test_validated_ip_failover_consumes_attempt_budget(monkeypatch) -> None:
     attempts: list[str] = []
 
@@ -255,14 +266,14 @@ def test_validated_ip_failover_consumes_attempt_budget(monkeypatch) -> None:
     assert len(attempts) == 3
 
 
-def test_repeated_dns_failures_are_bounded(monkeypatch) -> None:
+def test_repeated_temporary_dns_failures_are_bounded() -> None:
     lookups = 0
     sleeps: list[float] = []
 
     def lookup(_host, _port, **_kwargs):
         nonlocal lookups
         lookups += 1
-        raise socket.gaierror("temporary resolver failure")
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary resolver failure")
 
     client = _client(
         retry_attempt_limit=3,
@@ -275,3 +286,56 @@ def test_repeated_dns_failures_are_bounded(monkeypatch) -> None:
 
     assert lookups == 3
     assert sleeps == pytest.approx([1.0, 2.0])
+
+
+def test_permanent_dns_failure_is_not_retried() -> None:
+    lookups = 0
+    sleeps: list[float] = []
+
+    def lookup(_host, _port, **_kwargs):
+        nonlocal lookups
+        lookups += 1
+        raise socket.gaierror(socket.EAI_NONAME, "name does not exist")
+
+    client = _client(dns_lookup=lookup, sleep=sleeps.append)
+
+    with pytest.raises(WebsiteFetchError, match="DNS resolution failed"):
+        client._request_with_retries("https://example.com/page", 65536)
+
+    assert lookups == 1
+    assert sleeps == []
+
+
+def test_tls_certificate_verification_failure_is_not_retried(monkeypatch) -> None:
+    attempts = 0
+    sleeps: list[float] = []
+
+    def lookup(_host, _port, **_kwargs):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ]
+
+    class Connection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def request(self, _method: str, _target: str, *, headers) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(website_http, "_PinnedHTTPSConnection", Connection)
+    client = _client(
+        dns_lookup=lookup,
+        monotonic=lambda: 100.0,
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(WebsiteFetchError, match="TLS certificate verification failed"):
+        client._request_with_retries("https://example.com/page", 65536)
+
+    assert attempts == 1
+    assert sleeps == []
