@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from ..maps_backfill import _fetch_one
@@ -16,6 +17,18 @@ def _parse_json(value: object) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return None
+
+
+def _instant(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise WebsiteAcquisitionError(f"{field} must be an ISO-8601 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise WebsiteAcquisitionError(f"{field} is not a valid ISO-8601 timestamp: {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise WebsiteAcquisitionError(f"{field} must be timezone-aware")
+    return parsed.astimezone(timezone.utc)
 
 
 def values_equivalent(predicate: str, left_json: object, right_json: object) -> bool:
@@ -78,6 +91,8 @@ def _insert_fact(
     valid_from: str,
     reconciled_at: str,
 ) -> None:
+    _instant(valid_from, field=f"fact {fact_id} valid_from")
+    _instant(reconciled_at, field=f"fact {fact_id} reconciled_at")
     conn.execute(
         "INSERT INTO facts("
         "id,subject_id,predicate,fact_slot,value_json,normalized_value_json,value_hash,status,"
@@ -102,6 +117,7 @@ def _insert_fact(
 
 
 def _close_fact(conn: sqlite3.Connection, fact_id: str, valid_to: str) -> None:
+    _instant(valid_to, field=f"fact {fact_id} valid_to")
     cursor = conn.execute(
         "UPDATE facts SET valid_to=? WHERE id=? AND valid_to IS NULL",
         (valid_to, fact_id),
@@ -145,6 +161,8 @@ def reconcile_observation_group(
     """
     if not observations:
         return 0, 0, 0
+    observed_instant = _instant(observed_at, field="website observation observed_at")
+    _instant(reconciled_at, field="website reconciliation reconciled_at")
     value_json = str(observations[0]["value_json"])
     value_hash = str(observations[0]["value_hash"])
     if any(
@@ -214,15 +232,21 @@ def reconcile_observation_group(
         )
         return 1, 0, links
 
+    current_valid_from = _instant(
+        current["valid_from"], field=f"current fact {current['id']} valid_from"
+    )
+    current_last_verified = _instant(
+        current["last_verified_at"] or current["valid_from"],
+        field=f"current fact {current['id']} last_verified_at",
+    )
     previous = _usable_supports(conn, str(current["id"]))
     previous_sources = {item["source_id"] for item in previous}
     exact_same = (
         current["value_json"] == value_json and current["value_hash"] == value_hash
     )
     semantically_same = values_equivalent(predicate, current["value_json"], value_json)
-    last_verified = str(current["last_verified_at"] or current["valid_from"])
 
-    if str(observed_at) < str(current["valid_from"]):
+    if observed_instant < current_valid_from:
         if exact_same and (
             current["status"] == "confirmed"
             or previous_sources == {OFFICIAL_WEB_SOURCE_ID}
@@ -239,7 +263,7 @@ def reconcile_observation_group(
             return 0, 0, links
         return 0, 0, 0
 
-    if exact_same and str(observed_at) <= last_verified:
+    if exact_same and observed_instant <= current_last_verified:
         if current["status"] == "confirmed" or previous_sources == {OFFICIAL_WEB_SOURCE_ID}:
             links = sum(
                 _link_observation(
@@ -313,6 +337,9 @@ def reconcile_not_observed(
     session_id: str,
     observed_at: str,
 ) -> tuple[int, int]:
+    observed_instant = _instant(
+        observed_at, field=f"{predicate} not_observed observed_at"
+    )
     current = _current_fact(
         conn, entity_id=entity_id, predicate=predicate, fact_slot="__single__"
     )
@@ -326,7 +353,10 @@ def reconcile_not_observed(
             )
         if current_value is not None:
             return 0, 0
-        if str(observed_at) < str(current["valid_from"]):
+        current_valid_from = _instant(
+            current["valid_from"], field=f"current fact {current['id']} valid_from"
+        )
+        if observed_instant < current_valid_from:
             return 0, 0
         _close_fact(conn, str(current["id"]), observed_at)
 
