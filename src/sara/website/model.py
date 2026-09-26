@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,18 +43,27 @@ class CrawlConfig:
             raise ValueError("depth_limit must be between 0 and 5")
         if self.max_response_bytes < 16_384 or self.max_response_bytes > 10_485_760:
             raise ValueError("max_response_bytes must be between 16384 and 10485760")
-        if self.timeout_seconds <= 0 or self.timeout_seconds > 120:
-            raise ValueError("timeout_seconds must be greater than zero and at most 120")
-        if self.request_interval_seconds <= 0 or self.request_interval_seconds > 60:
+        if (
+            not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+            or self.timeout_seconds > 120
+        ):
+            raise ValueError("timeout_seconds must be finite, greater than zero and at most 120")
+        if (
+            not math.isfinite(self.request_interval_seconds)
+            or self.request_interval_seconds <= 0
+            or self.request_interval_seconds > 60
+        ):
             raise ValueError(
-                "request_interval_seconds must be greater than zero and at most 60"
+                "request_interval_seconds must be finite, greater than zero and at most 60"
             )
         if (
-            self.max_policy_delay_seconds < self.request_interval_seconds
+            not math.isfinite(self.max_policy_delay_seconds)
+            or self.max_policy_delay_seconds < self.request_interval_seconds
             or self.max_policy_delay_seconds > 300
         ):
             raise ValueError(
-                "max_policy_delay_seconds must be at least request_interval_seconds and at most 300"
+                "max_policy_delay_seconds must be finite, at least request_interval_seconds and at most 300"
             )
         if not self.user_agent.strip():
             raise ValueError("user_agent must not be blank")
