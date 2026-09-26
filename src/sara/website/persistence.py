@@ -29,9 +29,6 @@ _BUSINESS_WIDE_HOME_CHANNEL_TYPES = {
     "x",
     "tiktok",
     "youtube",
-    "email",
-    "phone",
-    "whatsapp",
     "booking",
     "ordering",
     "support",
@@ -86,7 +83,8 @@ def _business_wide_scope_eligible(
         return True
     if canonical_home_url is None:
         return False
-    return page_role(canonical_home_url) == "home"
+    canonical = normalize_http_url(canonical_home_url)
+    return canonical is not None and canonical == origin_url(canonical)
 
 
 def _candidate_is_business_wide(
