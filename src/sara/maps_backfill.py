@@ -35,8 +35,8 @@ class MapsBackfillStats:
 
 GOOGLE_MAPS_SOURCE_ID = "src_google_maps"
 BACKFILL_COLLECTOR_NAME = "sara.maps_backfill"
-BACKFILL_VERSION = "1"
-RECONCILIATION_VERSION = "maps-backfill-v1"
+BACKFILL_VERSION = "2"
+RECONCILIATION_VERSION = "maps-backfill-v2"
 _ID_NAMESPACE = "sara.business-understanding.maps-backfill.v1"
 _IDENTIFIER_NAMESPACES = ("place_id", "cid", "data_id")
 

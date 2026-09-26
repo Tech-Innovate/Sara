@@ -42,8 +42,8 @@ class MapsSyncStats:
 
 
 SYNC_COLLECTOR_NAME = "sara.maps_sync"
-SYNC_VERSION = "1"
-SYNC_RECONCILIATION_VERSION = "maps-sync-v1"
+SYNC_VERSION = "2"
+SYNC_RECONCILIATION_VERSION = "maps-sync-v2"
 _IDENTIFIER_NAMESPACES = ("place_id", "cid", "data_id")
 _SYNC_METADATA_KEYS = {
     "import_kind",
