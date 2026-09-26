@@ -1,0 +1,338 @@
+name: Patch URL convergence
+
+on:
+  push:
+    branches:
+      - fix/website-url-convergence-validation-roles
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/website-url-convergence-validation-roles
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply guarded patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # Reconciliation: event-local, evidence-backed official-site aliasing.
+          path = Path('src/sara/website/reconcile.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              'from .parser import normalize_http_url\n',
+              'from .parser import normalize_http_url, same_site\n',
+              1,
+          )
+          anchor = '''    return normalize_http_url(left) == normalize_http_url(right)\n\n\ndef _current_fact'''
+          helper = '''    return normalize_http_url(left) == normalize_http_url(right)\n\n\ndef _verified_website_alias_from_new_evidence(\n    conn: sqlite3.Connection,\n    observations: list[dict[str, Any]],\n    left_json: object,\n    right_json: object,\n) -> bool:\n    \"\"\"Return true only for an alias proven by this acquisition's retained home evidence.\n\n    This is intentionally directional: the prior fact value must equal the acquisition\n    start URL, and the newly reconciled value must equal the verified home capture's\n    final URL. Merely sharing a host, differing by ``www`` or switching schemes is not\n    sufficient.\n    \"\"\"\n    left = _parse_json(left_json)\n    right = _parse_json(right_json)\n    if not isinstance(left, str) or not isinstance(right, str):\n        return False\n    left_url = normalize_http_url(left)\n    right_url = normalize_http_url(right)\n    if left_url is None or right_url is None:\n        return False\n\n    for item in observations:\n        evidence_id = item.get(\"evidence_id\")\n        if not isinstance(evidence_id, str) or not evidence_id:\n            continue\n        row = conn.execute(\n            \"SELECT source_id,status,metadata_json FROM evidence_items WHERE id=?\",\n            (evidence_id,),\n        ).fetchone()\n        if row is None or row[0] != OFFICIAL_WEB_SOURCE_ID or row[1] != \"usable\":\n            continue\n        metadata = _parse_json(row[2])\n        if not isinstance(metadata, dict):\n            continue\n        if metadata.get(\"acquisition_kind\") != \"bounded_official_website\":\n            continue\n        if metadata.get(\"home_page\") is not True:\n            continue\n        start_value = metadata.get(\"start_url\")\n        final_value = metadata.get(\"final_url\")\n        if not isinstance(start_value, str) or not isinstance(final_value, str):\n            continue\n        start_url = normalize_http_url(start_value)\n        final_url = normalize_http_url(final_value)\n        if start_url is None or final_url is None or not same_site(start_url, final_url):\n            continue\n        if start_url == left_url and final_url == right_url:\n            return True\n    return False\n\n\ndef _current_fact'''
+          if text.count(anchor) != 1:
+              raise SystemExit('reconcile helper anchor mismatch')
+          text = text.replace(anchor, helper, 1)
+          old = '    semantically_same = values_equivalent(predicate, current["value_json"], value_json)\n'
+          new = '''    semantically_same = values_equivalent(\n        predicate, current[\"value_json\"], value_json\n    ) or (\n        predicate == \"business.website.official\"\n        and _verified_website_alias_from_new_evidence(\n            conn, observations, current[\"value_json\"], value_json\n        )\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit('semantic-same anchor mismatch')
+          text = text.replace(old, new, 1)
+          old = '''            if not values_equivalent(predicate, item["value_json"], value_json):\n                links += _link_observation(\n'''
+          new = '''            equivalent = values_equivalent(\n                predicate, item[\"value_json\"], value_json\n            ) or (\n                predicate == \"business.website.official\"\n                and _verified_website_alias_from_new_evidence(\n                    conn, observations, item[\"value_json\"], value_json\n                )\n            )\n            if not equivalent:\n                links += _link_observation(\n'''
+          if text.count(old) != 1:
+              raise SystemExit('contradiction anchor mismatch')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Reconciliation provenance changes; collector behavior/identity does not.
+          path = Path('src/sara/website/model.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'RECONCILIATION_VERSION = "official-web-v1"'
+          if text.count(old) != 1:
+              raise SystemExit('website reconciliation version anchor mismatch')
+          text = text.replace(old, 'RECONCILIATION_VERSION = "official-web-v2"', 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Validation roles: only declared single-location samples are acquisition targets.
+          path = Path('src/sara/website_validation_cli.py')
+          text = path.read_text(encoding='utf-8')
+          anchor = '''def _run_acquisition_samples(\n'''
+          helper = '''def _website_acquisition_business_ids(\n    single_location_business_ids: Sequence[int],\n) -> list[int]:\n    return sorted({int(value) for value in single_location_business_ids})\n\n\ndef _run_acquisition_samples(\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit('acquisition helper anchor mismatch')
+          text = text.replace(anchor, helper, 1)
+          old = '''    selected = _selected_business_ids(\n        single_location_business_ids, multi_branch_groups\n    )\n'''
+          new = '''    representative_selected = _selected_business_ids(\n        single_location_business_ids, multi_branch_groups\n    )\n    acquisition_selected = _website_acquisition_business_ids(\n        single_location_business_ids\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit('selected IDs anchor mismatch')
+          text = text.replace(old, new, 1)
+          if text.count('            business_ids=selected,\n') != 1:
+              raise SystemExit('acquisition selected use mismatch')
+          text = text.replace(
+              '            business_ids=selected,\n',
+              '            business_ids=acquisition_selected,\n',
+              1,
+          )
+          old = '''    dossier_check, dossier_summaries = _representative_dossier_check(\n        working_db, selected\n    )\n'''
+          new = '''    dossier_check, dossier_summaries = _representative_dossier_check(\n        working_db, representative_selected\n    )\n'''
+          if text.count(old) != 1:
+              raise SystemExit('dossier selected use mismatch')
+          text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Operator contract.
+          path = Path('docs/website-operational-validation.md')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '5. Selected official websites can be acquired repeatedly with the bounded production collector, with at least one representative acquisition completing successfully; partial outcomes remain visible rather than being treated as success-by-omission.',
+              '5. Declared single-location acquisition samples can be acquired repeatedly with the bounded production collector, with at least one representative acquisition completing successfully; partial outcomes remain visible rather than being treated as success-by-omission. Multi-branch groups are identity-separation samples and are not implicitly crawled.',
+              1,
+          )
+          text = text.replace(
+              'Every selected acquisition target must already have a supported `business.website.official` fact. Domain discovery is outside this gate and outside the Phase-6 collector.',
+              'Each declared single-location acquisition target must already have a supported `business.website.official` fact. Multi-branch groups are used to prove canonical identity/location separation before and after acquisition and do not need crawlable websites. Domain discovery is outside this gate and outside the Phase-6 collector.',
+              1,
+          )
+          text = text.replace(
+              'By default, every representative website is acquired twice. The repeat run is deliberate: it exercises historical acquisition/session creation and reconciliation without requiring the collector to pretend that a new acquisition is a no-op.',
+              'By default, every declared single-location acquisition target is acquired twice. Multi-branch group members are not acquisition targets unless they are separately supplied as single-location samples. The repeat run is deliberate: it exercises historical acquisition/session creation and reconciliation without requiring the collector to pretend that a new acquisition is a no-op.',
+              1,
+          )
+          insertion = '''\n## Evidence-backed official-site URL convergence\n\nWebsite reconciliation does not globally collapse `http`/`https` or `www` variants. When a bounded official-site acquisition begins from the currently supported website fact and its retained usable home evidence records that exact `start_url` resolving to the verified home capture `final_url`, reconciliation may treat those two serialized URLs as representations of the same official site for that reconciliation event. The historical observation remains attached to its historical fact; it is not rewritten or attached as exact-value support to the new URL. Without that retained event-local evidence, differing URLs remain distinct and may contradict.\n\nThis reconciliation behavior is versioned as `official-web-v2`; the website collector version remains unchanged because request/extraction behavior did not change.\n'''
+          marker = '\n## What the gate proves\n'
+          if text.count(marker) != 1:
+              raise SystemExit('runbook insertion marker mismatch')
+          text = text.replace(marker, insertion + marker, 1)
+          path.write_text(text, encoding='utf-8')
+
+          # Regression coverage for the production-gate failure and sample-role split.
+          Path('tests/test_website_url_convergence.py').write_text(r'''from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from sara.migrations import apply_migrations
+from sara.storage import connect
+from sara.understanding_vocabulary import seed_business_understanding_vocabulary
+from sara.website.model import (
+    OFFICIAL_WEB_SOURCE_ID,
+    RECONCILIATION_VERSION,
+    canonical_json,
+    sha256_text,
+)
+from sara.website.reconcile import reconcile_observation_group, values_equivalent
+from sara.website_validation_cli import (
+    _selected_business_ids,
+    _website_acquisition_business_ids,
+)
+
+
+OLD_URL = "http://www.chennaidarbar.com/"
+NEW_URL = "https://chennaidarbar.com/"
+CREATED = "2026-09-26T10:00:00+00:00"
+OBSERVED = "2026-09-26T11:00:00+00:00"
+
+
+def _setup(path: Path):
+    conn = connect(path)
+    assert apply_migrations(conn) == (1,)
+    seed_business_understanding_vocabulary(conn)
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,created_at,updated_at) "
+        "VALUES ('be','business_entity',?,?)",
+        (CREATED, CREATED),
+    )
+    conn.execute(
+        "INSERT INTO business_entities(id,display_name,entity_type,lifecycle_status,created_at,updated_at) "
+        "VALUES ('be','Chennai Darbar','unknown','unknown',?,?)",
+        (CREATED, CREATED),
+    )
+    for source_id, source_type in (
+        ("src_google_maps", "google_maps"),
+        (OFFICIAL_WEB_SOURCE_ID, "official_web"),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id,source_type,name,created_at,active) VALUES (?,?,?,?,1)",
+            (source_id, source_type, source_id, CREATED),
+        )
+
+    old_json = canonical_json(OLD_URL)
+    old_hash = sha256_text(old_json)
+    config_hash = sha256_text("{}")
+    conn.execute(
+        "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,evidence_count,observation_count) "
+        "VALUES ('maps','be','src_google_maps','sara.maps_backfill','2','{}',?,'complete',?,?,1,1)",
+        (config_hash, CREATED, CREATED),
+    )
+    conn.execute(
+        "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,"
+        "metadata_json,created_at) VALUES ('ev_maps','maps','src_google_maps','platform','usable',?,'{}',?)",
+        (CREATED, CREATED),
+    )
+    conn.execute(
+        "INSERT INTO observations(id,subject_id,predicate,evidence_id,value_json,normalized_value_json,"
+        "value_hash,observation_kind,observed_at,extracted_at,extraction_method,extractor_name,"
+        "extractor_version,confidence,created_at) VALUES ("
+        "'obs_maps','be','business.website.official','ev_maps',?,?,?,'structured_value',?,?,"
+        "'deterministic_parser','sara.maps_backfill','2',1.0,?)",
+        (old_json, old_json, old_hash, CREATED, CREATED, CREATED),
+    )
+    conn.execute(
+        "INSERT INTO facts(id,subject_id,predicate,fact_slot,value_json,normalized_value_json,value_hash,"
+        "status,valid_from,last_verified_at,reconciled_at,reconciliation_version,created_at) VALUES ("
+        "'fact_maps','be','business.website.official','__single__',?,?,?,'single_source',?,?,?,?,?)",
+        (old_json, old_json, old_hash, CREATED, CREATED, CREATED, "maps-backfill-v2", CREATED),
+    )
+    conn.execute(
+        "INSERT INTO fact_observation_support(fact_id,observation_id,support_role) "
+        "VALUES ('fact_maps','obs_maps','supports')"
+    )
+    conn.commit()
+    return conn
+
+
+def _official_observation(conn, *, start_url: str, final_url: str, home_page: bool = True):
+    value_json = canonical_json(final_url)
+    value_hash = sha256_text(value_json)
+    config_hash = sha256_text("{}")
+    metadata = canonical_json(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "start_url": start_url,
+            "requested_url": start_url,
+            "final_url": final_url,
+            "home_page": home_page,
+        }
+    )
+    conn.execute(
+        "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,evidence_count,observation_count) "
+        "VALUES ('web','be',?,'sara.website','3','{}',?,'complete',?,?,1,1)",
+        (OFFICIAL_WEB_SOURCE_ID, config_hash, OBSERVED, OBSERVED),
+    )
+    conn.execute(
+        "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,"
+        "metadata_json,created_at) VALUES ('ev_web','web',?,'official','usable',?,?,?)",
+        (OFFICIAL_WEB_SOURCE_ID, OBSERVED, metadata, OBSERVED),
+    )
+    conn.execute(
+        "INSERT INTO observations(id,subject_id,predicate,evidence_id,value_json,normalized_value_json,"
+        "value_hash,observation_kind,observed_at,extracted_at,extraction_method,extractor_name,"
+        "extractor_version,confidence,created_at) VALUES ("
+        "'obs_web','be','business.website.official','ev_web',?,?,?,'structured_value',?,?,"
+        "'deterministic_parser','sara.website','3',1.0,?)",
+        (value_json, value_json, value_hash, OBSERVED, OBSERVED, OBSERVED),
+    )
+    conn.commit()
+    return {"id": "obs_web", "evidence_id": "ev_web", "value_json": value_json, "value_hash": value_hash}
+
+
+def _reconcile(conn, observation):
+    result = reconcile_observation_group(
+        conn,
+        entity_id="be",
+        predicate="business.website.official",
+        fact_slot="__single__",
+        observations=[observation],
+        observed_at=OBSERVED,
+        reconciled_at="2026-09-26T11:00:01+00:00",
+    )
+    conn.commit()
+    return result
+
+
+def _current_links(conn):
+    fact_id = conn.execute(
+        "SELECT id FROM facts WHERE subject_id='be' AND predicate='business.website.official' "
+        "AND valid_to IS NULL"
+    ).fetchone()[0]
+    return list(
+        conn.execute(
+            "SELECT fos.support_role,e.source_id FROM fact_observation_support fos "
+            "JOIN observations o ON o.id=fos.observation_id "
+            "JOIN evidence_items e ON e.id=o.evidence_id WHERE fos.fact_id=? ORDER BY fos.support_role,e.source_id",
+            (fact_id,),
+        )
+    )
+
+
+def test_verified_redirect_variant_is_not_a_contradiction(tmp_path: Path) -> None:
+    conn = _setup(tmp_path / "redirect.sqlite")
+    observation = _official_observation(conn, start_url=OLD_URL, final_url=NEW_URL)
+
+    assert values_equivalent(
+        "business.website.official", canonical_json(OLD_URL), canonical_json(NEW_URL)
+    ) is False
+    assert _reconcile(conn, observation) == (1, 1, 1)
+
+    current = conn.execute(
+        "SELECT value_json,status,reconciliation_version FROM facts "
+        "WHERE subject_id='be' AND predicate='business.website.official' AND valid_to IS NULL"
+    ).fetchone()
+    assert json.loads(current[0]) == NEW_URL
+    assert current[1] == "single_source"
+    assert current[2] == "official-web-v2" == RECONCILIATION_VERSION
+    assert [tuple(row) for row in _current_links(conn)] == [
+        ("supports", OFFICIAL_WEB_SOURCE_ID)
+    ]
+    conn.close()
+
+
+def test_url_variant_without_matching_home_evidence_still_contradicts(tmp_path: Path) -> None:
+    conn = _setup(tmp_path / "unverified.sqlite")
+    observation = _official_observation(
+        conn,
+        start_url="http://different-start.example/",
+        final_url=NEW_URL,
+    )
+
+    assert _reconcile(conn, observation) == (1, 1, 2)
+    assert [tuple(row) for row in _current_links(conn)] == [
+        ("contradicts", "src_google_maps"),
+        ("supports", OFFICIAL_WEB_SOURCE_ID),
+    ]
+    conn.close()
+
+
+def test_cross_site_final_url_never_qualifies_as_verified_alias(tmp_path: Path) -> None:
+    conn = _setup(tmp_path / "cross-site.sqlite")
+    observation = _official_observation(
+        conn,
+        start_url=OLD_URL,
+        final_url="https://other.example/",
+    )
+
+    assert _reconcile(conn, observation) == (1, 1, 2)
+    assert [tuple(row) for row in _current_links(conn)] == [
+        ("contradicts", "src_google_maps"),
+        ("supports", OFFICIAL_WEB_SOURCE_ID),
+    ]
+    conn.close()
+
+
+def test_validation_acquisition_targets_exclude_multi_branch_identity_samples() -> None:
+    assert _website_acquisition_business_ids([176, 8, 176]) == [8, 176]
+    assert _selected_business_ids([176, 8], [(40, 127)]) == [8, 40, 127, 176]
+''', encoding='utf-8')
+          PY
+      - name: Run focused tests
+        run: |
+          python -m pip install -e '.[dev]'
+          python -m compileall -q src
+          python -m pytest -q tests/test_website_url_convergence.py tests/test_website_reconciliation.py tests/test_website_operational_validation.py
+      - name: Commit patch and remove helper
+        shell: bash
+        run: |
+          rm .github/workflows/patch-url-convergence.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/sara/website/reconcile.py src/sara/website/model.py src/sara/website_validation_cli.py docs/website-operational-validation.md tests/test_website_url_convergence.py .github/workflows/patch-url-convergence.yml
+          git commit -m 'Fix official-site URL convergence and validation sample roles'
+          git push origin HEAD:fix/website-url-convergence-validation-roles
