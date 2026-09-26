@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,58 @@ def _bootstrap_probe(conn: sqlite3.Connection) -> None:
     sync_maps_business_understanding(conn)
 
 
+def _later_timestamp(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise OperationalValidationError("merge-probe source run has no valid timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise OperationalValidationError(
+            f"merge-probe source run has malformed timestamp {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (parsed.astimezone(timezone.utc) + timedelta(seconds=1)).isoformat()
+
+
+def _create_bridge_run(
+    conn: sqlite3.Connection,
+    *,
+    source_run_id: str,
+    business_id: int,
+) -> tuple[str, str]:
+    source = conn.execute("SELECT * FROM runs WHERE id=?", (source_run_id,)).fetchone()
+    if source is None:
+        raise OperationalValidationError(f"merge-probe run {source_run_id!r} does not exist")
+    bridge_run_id = f"validation-merge-probe-{business_id}"
+    if conn.execute("SELECT 1 FROM runs WHERE id=?", (bridge_run_id,)).fetchone() is not None:
+        raise OperationalValidationError(
+            f"controlled merge-probe run id already exists: {bridge_run_id!r}"
+        )
+    bridge_started_at = _later_timestamp(source["finished_at"] or source["started_at"])
+    conn.execute(
+        "INSERT INTO runs("
+        "id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,config_json,raw_path,"
+        "status,started_at,finished_at,exit_code,error,raw_records,accepted_records,"
+        "out_of_bounds_records,unlocated_records,unidentified_records,unique_seen,new_businesses"
+        ") VALUES (?,?,?,?,?,?,?,?,?,'complete',?,?,0,NULL,1,1,0,0,0,1,0)",
+        (
+            bridge_run_id,
+            source["area_name"],
+            source["bbox_json"],
+            source["cell_km"],
+            source["depth"],
+            source["queries_json"],
+            source["scraper_image"],
+            source["config_json"],
+            source["raw_path"],
+            bridge_started_at,
+            bridge_started_at,
+        ),
+    )
+    return bridge_run_id, bridge_started_at
+
+
 def run_controlled_merge_survival_probe(
     source_db: Path,
     probe_db: Path,
@@ -130,6 +183,7 @@ def run_controlled_merge_survival_probe(
     backup_existing_database(source_db, probe_db)
     conn = connect_existing(probe_db)
     duplicate_id: int | None = None
+    bridge_run_id: str | None = None
     try:
         row = conn.execute("SELECT * FROM businesses WHERE id=?", (business_id,)).fetchone()
         if row is None:
@@ -141,15 +195,19 @@ def run_controlled_merge_survival_probe(
         keep_record = _partition_record(raw, [keep])
         moved_record = _partition_record(raw, moved)
 
-        run_id = str(row["last_run_id"] or "")
-        if not run_id:
+        source_run_id = str(row["last_run_id"] or "")
+        if not source_run_id:
             raise OperationalValidationError(
                 f"merge-probe business {business_id} has no last_run_id provenance"
             )
-        run = conn.execute("SELECT started_at FROM runs WHERE id=?", (run_id,)).fetchone()
-        if run is None:
-            raise OperationalValidationError(f"merge-probe run {run_id!r} does not exist")
-        run_started_at = str(run["started_at"])
+        source_run = conn.execute(
+            "SELECT started_at FROM runs WHERE id=?", (source_run_id,)
+        ).fetchone()
+        if source_run is None:
+            raise OperationalValidationError(
+                f"merge-probe run {source_run_id!r} does not exist"
+            )
+        source_started_at = str(source_run["started_at"])
 
         keep_values = {field: None for field in IDENTITY_FIELDS}
         keep_values[keep[0]] = keep[1]
@@ -166,9 +224,9 @@ def run_controlled_merge_survival_probe(
         )
         duplicate_id, created = upsert_business(
             conn,
-            run_id,
+            source_run_id,
             moved_record,
-            run_started_at=run_started_at,
+            run_started_at=source_started_at,
         )
         if not created or duplicate_id == business_id:
             raise OperationalValidationError(
@@ -177,7 +235,7 @@ def run_controlled_merge_survival_probe(
         conn.execute(
             "INSERT OR IGNORE INTO run_businesses(run_id,business_id,first_observed_at) "
             "VALUES (?,?,?)",
-            (run_id, duplicate_id, run_started_at),
+            (source_run_id, duplicate_id, source_started_at),
         )
         conn.commit()
 
@@ -204,16 +262,25 @@ def run_controlled_merge_survival_probe(
             bridge[field] = value
 
         conn.execute("BEGIN IMMEDIATE")
+        bridge_run_id, bridge_started_at = _create_bridge_run(
+            conn,
+            source_run_id=source_run_id,
+            business_id=business_id,
+        )
         survivor_id, created = upsert_business(
             conn,
-            run_id,
+            bridge_run_id,
             bridge,
-            run_started_at=run_started_at,
+            run_started_at=bridge_started_at,
         )
         if created:
             raise OperationalValidationError(
                 "controlled bridge unexpectedly created a third Maps business"
             )
+        conn.execute(
+            "INSERT INTO run_businesses(run_id,business_id,first_observed_at) VALUES (?,?,?)",
+            (bridge_run_id, survivor_id, bridge_started_at),
+        )
         conn.commit()
         sync_maps_business_understanding(conn)
 
@@ -268,6 +335,7 @@ def run_controlled_merge_survival_probe(
                 "probe_kind": "controlled_complementary_identifier_partition",
                 "source_business_id": business_id,
                 "synthetic_duplicate_business_id": duplicate_id,
+                "synthetic_bridge_run_id": bridge_run_id,
                 "kept_identifier": {"namespace": keep[0], "value": keep[1]},
                 "moved_identifiers": [
                     {"namespace": field, "value": value} for field, value in moved
@@ -294,6 +362,7 @@ def run_controlled_merge_survival_probe(
                 "probe_kind": "controlled_complementary_identifier_partition",
                 "source_business_id": business_id,
                 "synthetic_duplicate_business_id": duplicate_id,
+                "synthetic_bridge_run_id": bridge_run_id,
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )
