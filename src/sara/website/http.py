@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import math
 import socket
 import ssl
 import time
@@ -88,18 +89,24 @@ class SafeHttpClient:
         normalized = normalize_http_url(site_url)
         if normalized is None:
             raise ValueError("site_url must be an absolute http/https URL")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be greater than zero")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and greater than zero")
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be greater than zero")
-        if request_interval_seconds <= 0:
-            raise ValueError("request_interval_seconds must be greater than zero")
         if (
-            max_policy_delay_seconds < request_interval_seconds
+            not math.isfinite(request_interval_seconds)
+            or request_interval_seconds <= 0
+        ):
+            raise ValueError(
+                "request_interval_seconds must be finite and greater than zero"
+            )
+        if (
+            not math.isfinite(max_policy_delay_seconds)
+            or max_policy_delay_seconds < request_interval_seconds
             or max_policy_delay_seconds > 300
         ):
             raise ValueError(
-                "max_policy_delay_seconds must be at least request_interval_seconds and at most 300"
+                "max_policy_delay_seconds must be finite, at least request_interval_seconds and at most 300"
             )
         self.site_url = normalized
         self.user_agent = user_agent
