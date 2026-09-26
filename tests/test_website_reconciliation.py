@@ -27,10 +27,11 @@ def setup_fact_db(path: Path, *, current_value: bool, valid_from: str):
         )
     value_json = canonical_json(current_value)
     value_hash = sha256_text(value_json)
+    config_hash = sha256_text("{}")
     conn.execute(
         "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,status,started_at,finished_at) "
-        "VALUES ('acq_prior','be','src_prior','test','1','{}','hash','complete',?,?)",
-        (valid_from, valid_from),
+        "VALUES ('acq_prior','be','src_prior','test','1','{}',?,'complete',?,?)",
+        (config_hash, valid_from, valid_from),
     )
     conn.execute(
         "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,metadata_json,created_at) "
@@ -59,10 +60,11 @@ def insert_official_observation(conn, *, value: bool, observed_at: str, observat
     value_hash = sha256_text(value_json)
     acquisition_id = f"acq_{observation_id}"
     evidence_id = f"ev_{observation_id}"
+    config_hash = sha256_text("{}")
     conn.execute(
         "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,status,started_at,finished_at) "
         "VALUES (?,?,?,'sara.website','1','{}',?,'complete',?,?)",
-        (acquisition_id, "be", OFFICIAL_WEB_SOURCE_ID, acquisition_id, observed_at, observed_at),
+        (acquisition_id, "be", OFFICIAL_WEB_SOURCE_ID, config_hash, observed_at, observed_at),
     )
     conn.execute(
         "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,metadata_json,created_at) "
