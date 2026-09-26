@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -23,6 +24,7 @@ from sara.website_validation import (
 from sara.website_validation_cli import (
     _run_acquisition_samples,
     _single_location_check,
+    _website_session_integrity_check,
     main as validation_main,
 )
 
@@ -253,11 +255,74 @@ def test_acquisition_sample_runner_does_not_swallow_keyboard_interrupt(tmp_path:
     conn.close()
 
 
-def test_single_location_check_requires_one_current_maps_business_and_location() -> None:
-    good = [{"business_id": 1, "maps_business_count": 1, "location_count": 1}]
+def test_website_session_integrity_verifies_artifact_bytes(tmp_path: Path) -> None:
+    conn = _migrated(tmp_path)
+    _insert_business(conn, 1)
+    _insert_anchor(conn, 1, "be1", "loc1")
+    created = "2026-01-01T00:00:00+00:00"
+    conn.execute(
+        "INSERT OR IGNORE INTO sources(id,source_type,name,created_at) "
+        "VALUES ('src_official_web','official_website','Official website',?)",
+        (created,),
+    )
+    config_json = "{}"
+    config_hash = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
+    evidence_root = tmp_path / "evidence"
+    artifact = evidence_root / "be1" / "sess" / "page.html"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"hello")
+    content_hash = hashlib.sha256(b"hello").hexdigest()
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,evidence_count,observation_count"
+        ") VALUES ('sess','be1','src_official_web','sara.website','3',?,?,"
+        "'complete',?,?,1,0)",
+        (config_json, config_hash, created, created),
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_role,status,retrieved_at,media_type,"
+        "content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES ('ev','sess','src_official_web','official','usable',?,'text/html',?,?, '{}',?)",
+        (created, content_hash, str(artifact), created),
+    )
+    conn.commit()
+
+    result = _website_session_integrity_check(
+        conn, session_ids=["sess"], evidence_root=evidence_root
+    )
+    assert result.passed is True
+    assert result.details["artifacts_verified"] == 1
+
+    artifact.write_bytes(b"tampered")
+    result = _website_session_integrity_check(
+        conn, session_ids=["sess"], evidence_root=evidence_root
+    )
+    assert result.passed is False
+    assert "hash mismatch" in result.details["failures"][0]["errors"][0]
+    conn.close()
+
+
+def test_single_location_check_uses_current_locations_not_historical_alias_count() -> None:
+    good = [
+        {
+            "business_id": 1,
+            "maps_business_count": 1,
+            "location_count": 3,
+            "current_location_count": 1,
+        }
+    ]
     assert _single_location_check(good, [1])["passed"] is True
 
-    bad = [{"business_id": 1, "maps_business_count": 2, "location_count": 2}]
+    bad = [
+        {
+            "business_id": 1,
+            "maps_business_count": 2,
+            "location_count": 2,
+            "current_location_count": 2,
+        }
+    ]
     result = _single_location_check(bad, [1])
     assert result["passed"] is False
     assert result["details"]["failures"][0]["business_id"] == 1
