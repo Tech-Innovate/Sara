@@ -35,8 +35,10 @@ _HIGH_VALUE_TERMS = {
 }
 _BOOKING_TERMS = {
     "booking",
+    "book",
     "reserve",
     "reservation",
+    "reservations",
     "appointment",
     "appointments",
     "schedule",
@@ -59,6 +61,7 @@ _BOOKING_ACTION_TERMS = {
     "today",
 }
 _ORDERING_TERMS = {"order", "ordering", "delivery", "deliver", "pickup", "takeaway", "takeout"}
+_ORDERING_ACTION_TERMS = {"now", "online", "food", "meal", "menu", "delivery", "pickup", "takeaway", "takeout"}
 _SUPPORT_TERMS = {"support", "help", "helpdesk"}
 _SOCIAL_HOSTS = {
     "instagram.com": "instagram",
@@ -160,9 +163,7 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         (key, item)
         for key, item in parse_qsl(parsed.query, keep_blank_values=True)
         if key.lower() not in _TRACKING_QUERY_KEYS
-        and not any(
-            key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES
-        )
+        and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
     ]
     query = urlencode(pairs, doseq=True)
     return urlunsplit((scheme, netloc, path, query, ""))
@@ -181,9 +182,7 @@ def _priority(url: str, text: str) -> int:
     score = 0
     for token in tokens:
         score = max(score, _HIGH_VALUE_TERMS.get(token, 0))
-    depth_penalty = max(
-        0, len([part for part in parsed.path.split("/") if part]) - 1
-    ) * 3
+    depth_penalty = max(0, len([part for part in parsed.path.split("/") if part]) - 1) * 3
     return score - depth_penalty
 
 
@@ -219,65 +218,64 @@ def _is_social_profile(url: str, channel_type: str) -> bool:
         return False
     first = parts[0]
     if channel_type == "instagram":
-        return first not in {
-            "accounts",
-            "explore",
-            "p",
-            "reel",
-            "reels",
-            "stories",
-            "share",
-        }
+        return first not in {"accounts", "explore", "p", "reel", "reels", "stories", "share"}
     if channel_type == "facebook":
-        return first not in {
-            "dialog",
-            "plugins",
-            "share",
-            "sharer",
-            "watch",
-            "reel",
-            "story.php",
-        }
+        return first not in {"dialog", "plugins", "share", "sharer", "watch", "reel", "story.php"}
     if channel_type == "linkedin":
         return first in {"company", "school", "showcase"} and len(parts) >= 2
     if channel_type == "x":
-        return first not in {
-            "home",
-            "i",
-            "intent",
-            "search",
-            "settings",
-            "share",
-        }
+        return first not in {"home", "i", "intent", "search", "settings", "share"}
     if channel_type == "tiktok":
         return first.startswith("@") and len(first) > 1
     if channel_type == "youtube":
-        return first.startswith("@") or (
-            first in {"channel", "c", "user"} and len(parts) >= 2
-        )
+        return first.startswith("@") or (first in {"channel", "c", "user"} and len(parts) >= 2)
     return False
 
 
-def classify_channel(
-    href: str, text: str, page_url: str
-) -> ChannelCandidate | None:
+def _booking_action_text(tokens: set[str]) -> bool:
+    if len(tokens) == 1 and bool(tokens & _BOOKING_TERMS):
+        return True
+    if "book" in tokens and bool(tokens & _BOOKING_ACTION_TERMS):
+        return True
+    if bool(tokens & {"booking", "reserve", "reservation", "reservations"}) and bool(
+        tokens & {"now", "online", "table", "tables", "slot", "slots", "today"}
+    ):
+        return True
+    if bool(tokens & {"schedule", "scheduling"}) and bool(
+        tokens & {"appointment", "appointments", "consultation", "consultations", "visit", "session", "sessions", "online", "now"}
+    ):
+        return True
+    if bool(tokens & {"appointment", "appointments"}) and bool(
+        tokens & {"book", "schedule", "online", "now"}
+    ):
+        return True
+    return False
+
+
+def _ordering_action_text(tokens: set[str]) -> bool:
+    if tokens in ({"order"}, {"ordering"}):
+        return True
+    if "order" in tokens and bool(tokens & _ORDERING_ACTION_TERMS):
+        return True
+    if "ordering" in tokens and bool(tokens & {"online", "menu", "food", "meal"}):
+        return True
+    return False
+
+
+def classify_channel(href: str, text: str, page_url: str) -> ChannelCandidate | None:
     raw = html.unescape(href).strip()
     lower = raw.lower()
     if lower.startswith("mailto:"):
         address = raw[7:].split("?", 1)[0].strip().lower()
         if not address or "@" not in address:
             return None
-        return ChannelCandidate(
-            "email", address, address, f"mailto:{address}", "direct_link"
-        )
+        return ChannelCandidate("email", address, address, f"mailto:{address}", "direct_link")
     if lower.startswith("tel:"):
         original = raw[4:].split("?", 1)[0].strip()
         normalized = _normalize_phone(original)
         if normalized is None:
             return None
-        return ChannelCandidate(
-            "phone", normalized, normalized, f"tel:{normalized}", "direct_link"
-        )
+        return ChannelCandidate("phone", normalized, normalized, f"tel:{normalized}", "direct_link")
 
     url = normalize_http_url(raw, page_url)
     if url is None:
@@ -292,23 +290,18 @@ def classify_channel(
     combined = path_tokens | text_tokens
 
     if host == "wa.me" or host.endswith(".whatsapp.com") or host == "whatsapp.com":
-        return ChannelCandidate(
-            "whatsapp", url, url, url, "direct_link"
-        )
+        return ChannelCandidate("whatsapp", url, url, url, "direct_link")
 
     social = _social_type(host)
     if social and _is_social_profile(url, social):
         return ChannelCandidate(social, url, url, url, "direct_link")
 
-    explicit_booking_text = bool(text_tokens & _BOOKING_TERMS) or (
-        "book" in text_tokens and bool(text_tokens & _BOOKING_ACTION_TERMS)
-    )
     if _domain_matches(host, _BOOKING_DOMAINS) or (
-        bool(combined & (_BOOKING_TERMS | {"book"})) and explicit_booking_text
+        bool(combined & _BOOKING_TERMS) and _booking_action_text(text_tokens)
     ):
         return ChannelCandidate("booking", url, url, url, "action_link")
     if _domain_matches(host, _ORDERING_DOMAINS) or (
-        bool(combined & _ORDERING_TERMS) and bool(text_tokens & _ORDERING_TERMS)
+        bool(combined & _ORDERING_TERMS) and _ordering_action_text(text_tokens)
     ):
         return ChannelCandidate("ordering", url, url, url, "action_link")
     if bool(combined & _SUPPORT_TERMS) and bool(text_tokens & _SUPPORT_TERMS):
@@ -328,9 +321,7 @@ class _PageParser(HTMLParser):
         self._links: list[tuple[str, str, tuple[str, ...]]] = []
         self.canonical_url: str | None = None
 
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {key.lower(): (value or "") for key, value in attrs}
         name = tag.lower()
         if name == "title":
@@ -343,9 +334,7 @@ class _PageParser(HTMLParser):
                     self.canonical_url = candidate
         elif name == "a":
             self._anchor_href = values.get("href") or None
-            self._anchor_rel = tuple(
-                sorted(token.lower() for token in values.get("rel", "").split())
-            )
+            self._anchor_rel = tuple(sorted(token.lower() for token in values.get("rel", "").split()))
             self._anchor_text = []
 
     def handle_endtag(self, tag: str) -> None:
@@ -381,22 +370,13 @@ class _PageParser(HTMLParser):
             url = normalize_http_url(href, self.page_url)
             if url is None or "nofollow" in rel:
                 continue
-            candidate = LinkCandidate(
-                url=url, text=text, rel=rel, priority=_priority(url, text)
-            )
+            candidate = LinkCandidate(url=url, text=text, rel=rel, priority=_priority(url, text))
             previous = link_map.get(url)
             if previous is None or candidate.priority > previous.priority:
                 link_map[url] = candidate
 
-        links = tuple(
-            sorted(link_map.values(), key=lambda item: (-item.priority, item.url))
-        )
-        channels = tuple(
-            sorted(
-                channel_map.values(),
-                key=lambda item: (item.channel_type, item.normalized_identifier),
-            )
-        )
+        links = tuple(sorted(link_map.values(), key=lambda item: (-item.priority, item.url)))
+        channels = tuple(sorted(channel_map.values(), key=lambda item: (item.channel_type, item.normalized_identifier)))
         return ParsedPage(
             title=title,
             canonical_url=self.canonical_url,
