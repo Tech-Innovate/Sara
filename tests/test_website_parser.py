@@ -59,18 +59,42 @@ def test_parser_extracts_high_value_links_and_channels() -> None:
     assert any(channel_type == "whatsapp" for channel_type, _identifier in channels)
 
 
-def test_booking_heuristic_requires_action_context_for_same_site_links() -> None:
-    neutral = parse_html(
-        "https://example.com/",
-        '<a href="/book-history">Our book history</a>',
-    )
-    assert neutral.booking_detected is False
+def test_booking_heuristic_requires_transactional_action_context() -> None:
+    for label, href in (
+        ("Our book history", "/book-history"),
+        ("Booking policy", "/booking-policy"),
+        ("Appointment information", "/appointments/info"),
+    ):
+        page = parse_html("https://example.com/", f'<a href="{href}">{label}</a>')
+        assert page.booking_detected is False
 
-    action = parse_html(
-        "https://example.com/",
-        '<a href="/appointments">Book appointment</a>',
-    )
-    assert action.booking_detected is True
+    for label, href in (
+        ("Book appointment", "/appointments"),
+        ("Book now", "/book"),
+        ("Reservations", "/reservations"),
+        ("Schedule consultation", "/consultation"),
+    ):
+        page = parse_html("https://example.com/", f'<a href="{href}">{label}</a>')
+        assert page.booking_detected is True
+
+
+def test_ordering_heuristic_requires_transactional_action_context() -> None:
+    for label, href in (
+        ("Order history", "/order-history"),
+        ("Delivery policy", "/delivery-policy"),
+        ("Pickup information", "/pickup-info"),
+    ):
+        page = parse_html("https://example.com/", f'<a href="{href}">{label}</a>')
+        assert page.ordering_detected is False
+
+    for label, href in (
+        ("Order", "/order"),
+        ("Order online", "/order"),
+        ("Order delivery", "/delivery"),
+        ("Online ordering", "/ordering"),
+    ):
+        page = parse_html("https://example.com/", f'<a href="{href}">{label}</a>')
+        assert page.ordering_detected is True
 
 
 def test_malformed_page_link_is_ignored_without_losing_other_page_signals() -> None:
