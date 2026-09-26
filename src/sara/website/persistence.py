@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..maps_backfill import _fetch_one
-from .crawl import origin_url, page_role
+from .crawl import page_role
 from .model import (
     CAPABILITY_PREDICATES,
     COLLECTOR_NAME,
@@ -42,7 +42,7 @@ def _website_channel(home_url: str) -> ChannelCandidate:
     return ChannelCandidate(
         channel_type="website",
         identifier=home_url,
-        normalized_identifier=home_url.lower(),
+        normalized_identifier=home_url,
         url=home_url,
         extraction="verified_official_fact",
     )
@@ -66,11 +66,13 @@ def _latest_timestamp(values: list[str], *, field: str) -> str:
     return max(values, key=lambda value: _timestamp_key(value, field=field))
 
 
-def _is_home_capture(capture: PageCapture, *, start_url: str) -> bool:
-    root = origin_url(start_url)
-    return (
-        normalize_http_url(capture.requested_url) == root
-        or normalize_http_url(capture.final_url) == root
+def _is_home_capture(
+    capture: PageCapture, *, canonical_home_url: str | None
+) -> bool:
+    if canonical_home_url is None:
+        return False
+    return normalize_http_url(capture.final_url) == normalize_http_url(
+        canonical_home_url
     )
 
 
@@ -339,7 +341,9 @@ def ingest_crawl_result(
         observed_times: dict[tuple[str, str], list[str]] = {}
         for capture in result.captures:
             evidence_id = _evidence_id(session_id, capture)
-            home_page = _is_home_capture(capture, start_url=start_url)
+            home_page = _is_home_capture(
+                capture, canonical_home_url=result.canonical_home_url
+            )
             channel_metadata, created, refreshed = _page_channels(
                 conn,
                 entity_id=entity_id,
