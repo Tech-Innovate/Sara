@@ -420,7 +420,11 @@ class SafeHttpClient:
                 raise WebsiteFetchError(
                     f"TLS certificate verification failed for {url}: {exc}"
                 ) from exc
-            except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            except ssl.SSLError as exc:
+                raise WebsiteFetchError(
+                    f"TLS protocol failure for {url}: {exc}"
+                ) from exc
+            except (OSError, http.client.HTTPException) as exc:
                 last_error = exc
             finally:
                 connection.close()
