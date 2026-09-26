@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -15,10 +16,14 @@ from sara.website_validation import (
     backup_database,
     compare_legacy_snapshots,
     legacy_snapshot,
-    run_acquisition_samples,
     validate_fact_provenance,
     validate_multi_branch_groups,
     validate_one_to_one_maps_anchors,
+)
+from sara.website_validation_cli import (
+    _run_acquisition_samples,
+    _single_location_check,
+    main as validation_main,
 )
 
 
@@ -214,7 +219,7 @@ def test_acquisition_sample_runner_repeats_without_network(tmp_path: Path) -> No
         calls.append(business_id)
         return {"status": "complete", "pages_fetched": 1}
 
-    check, results = run_acquisition_samples(
+    check, results = _run_acquisition_samples(
         conn,
         evidence_root=tmp_path / "evidence",
         business_ids=[1],
@@ -226,6 +231,61 @@ def test_acquisition_sample_runner_repeats_without_network(tmp_path: Path) -> No
     assert calls == [1, 1]
     assert [item["pass"] for item in results] == [1, 2]
     conn.close()
+
+
+def test_acquisition_sample_runner_does_not_swallow_keyboard_interrupt(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "db.sqlite")
+    _insert_business(conn, 1)
+    conn.commit()
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_acquisition_samples(
+            conn,
+            evidence_root=tmp_path / "evidence",
+            business_ids=[1],
+            passes=2,
+            config=CrawlConfig(),
+            collector=interrupted,
+        )
+    conn.close()
+
+
+def test_single_location_check_requires_one_current_maps_business_and_location() -> None:
+    good = [{"business_id": 1, "maps_business_count": 1, "location_count": 1}]
+    assert _single_location_check(good, [1])["passed"] is True
+
+    bad = [{"business_id": 1, "maps_business_count": 2, "location_count": 2}]
+    result = _single_location_check(bad, [1])
+    assert result["passed"] is False
+    assert result["details"]["failures"][0]["business_id"] == 1
+
+
+def test_cli_writes_machine_readable_fatal_report_after_argument_validation(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    rc = validation_main(
+        [
+            "--source-db",
+            str(tmp_path / "missing.sqlite"),
+            "--workspace",
+            str(workspace),
+            "--single-location-business-id",
+            "1",
+            "--single-location-business-id",
+            "2",
+            "--multi-branch-group",
+            "3,4",
+            "--merge-pair",
+            "5,6",
+        ]
+    )
+    assert rc == 2
+    report = json.loads((workspace / "report.json").read_text(encoding="utf-8"))
+    assert report["schema"] == "sara-website-operational-validation-v1"
+    assert report["production_ready"] is False
+    assert "fatal_error" in report
 
 
 def test_sample_argument_parsers_fail_closed() -> None:
