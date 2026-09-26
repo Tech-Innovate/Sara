@@ -1,0 +1,28 @@
+name: Apply SR-01 synthetic partition provenance fix
+
+on:
+  push:
+    branches:
+      - fix/maps-source-shape-merge-probe
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply patch
+        run: python .github/apply_sr01_patch.py
+      - name: Commit branch patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Fix synthetic partition provenance in merge probe'
+          git push origin HEAD:fix/maps-source-shape-merge-probe
