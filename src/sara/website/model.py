@@ -14,7 +14,7 @@ class WebsiteAcquisitionError(RuntimeError):
 
 OFFICIAL_WEB_SOURCE_ID = "src_official_web"
 COLLECTOR_NAME = "sara.website"
-COLLECTOR_VERSION = "1"
+COLLECTOR_VERSION = "2"
 RECONCILIATION_VERSION = "official-web-v1"
 ID_NAMESPACE = "sara.business-understanding.official-web.v1"
 CAPABILITY_PREDICATES = (
