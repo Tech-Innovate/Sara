@@ -10,7 +10,6 @@ from sara.storage import connect
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 from sara.website.model import CrawlConfig
 from sara.website_validation import (
-    OperationalValidationError,
     _parse_group,
     _parse_pair,
     backup_database,
@@ -113,7 +112,7 @@ def test_legacy_snapshot_comparison_detects_mutation(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_anchor_and_multi_branch_checks_require_distinct_entities(tmp_path: Path) -> None:
+def test_anchor_and_multi_branch_checks_require_complete_distinct_mapping(tmp_path: Path) -> None:
     conn = _migrated(tmp_path)
     for business_id in (1, 2, 3):
         _insert_business(conn, business_id)
@@ -124,10 +123,6 @@ def test_anchor_and_multi_branch_checks_require_distinct_entities(tmp_path: Path
     assert validate_multi_branch_groups(conn, [(2, 3)]).passed is True
 
     conn.execute("DELETE FROM maps_business_location_links WHERE business_id=3")
-    conn.execute(
-        "INSERT INTO maps_business_location_links(business_id,location_id,linked_at) "
-        "VALUES (3,'loc2','2026-01-01T00:00:00+00:00')"
-    )
     conn.commit()
     assert validate_one_to_one_maps_anchors(conn).passed is False
     assert validate_multi_branch_groups(conn, [(2, 3)]).passed is False
@@ -196,7 +191,7 @@ def test_fact_provenance_accepts_value_chain_and_complete_absence_support(tmp_pa
         "INSERT INTO facts("
         "id,subject_id,predicate,fact_slot,value_json,normalized_value_json,value_hash,status,"
         "valid_from,last_verified_at,reconciled_at,reconciliation_version,created_at"
-        ") VALUES ('fact3','be1','business.name.trading','other','\"Bad\"','\"Bad\"',?,"
+        ") VALUES ('fact3','be1','business.category.primary','__single__','\"Bad\"','\"Bad\"',?,"
         "'single_source',?,?,?,?,?)",
         ("3" * 64, created, created, created, "test-v1", created),
     )
