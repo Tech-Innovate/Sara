@@ -75,40 +75,58 @@ def _write_artifact(path: Path, body: bytes) -> None:
         raise
 
 
-def _is_home_capture(capture: PageCapture, *, start_url: str) -> bool:
-    root = origin_url(start_url)
-    requested = normalize_http_url(capture.requested_url)
-    final = normalize_http_url(capture.final_url)
-    return requested == root or final == root
-
-
-def _canonical_home(capture: PageCapture, *, start_url: str) -> str:
-    final = normalize_http_url(capture.final_url)
-    if final is None:
-        return capture.final_url
-    candidate = capture.parsed.canonical_url
-    if candidate is None or not same_site(candidate, start_url):
-        return final
-    normalized_candidate = normalize_http_url(candidate)
-    if normalized_candidate is None:
-        return final
-    candidate_parts = urlsplit(normalized_candidate)
-    final_parts = urlsplit(final)
-    if final_parts.scheme == "https" and candidate_parts.scheme != "https":
-        return final
-    if (candidate_parts.path, candidate_parts.query) != (
-        final_parts.path,
-        final_parts.query,
-    ):
-        return final
-    return normalized_candidate
-
-
 def _decode_page(response: HttpResponse) -> str:
     try:
         return response.body.decode(response.charset, errors="replace")
     except LookupError:
         return response.body.decode("utf-8", errors="replace")
+
+
+def _safe_canonical(capture: PageCapture, *, start_url: str) -> str | None:
+    candidate = capture.parsed.canonical_url
+    if candidate is None or not same_site(candidate, start_url):
+        return None
+    normalized = normalize_http_url(candidate)
+    final = normalize_http_url(capture.final_url)
+    if normalized is None or final is None:
+        return None
+    candidate_parts = urlsplit(normalized)
+    final_parts = urlsplit(final)
+    if final_parts.scheme == "https" and candidate_parts.scheme != "https":
+        return None
+    return normalized
+
+
+def _canonical_home_from_verified_start(
+    captures: list[PageCapture], *, start_url: str
+) -> str | None:
+    start = normalize_http_url(start_url)
+    if start is None:
+        return None
+    start_capture = next(
+        (
+            capture
+            for capture in captures
+            if normalize_http_url(capture.requested_url) == start
+        ),
+        None,
+    )
+    if start_capture is None:
+        return None
+
+    final = normalize_http_url(start_capture.final_url)
+    if final is None:
+        return None
+    declared = _safe_canonical(start_capture, start_url=start)
+    desired = declared or final
+
+    # A declared canonical that points elsewhere on the site is only promoted if
+    # that exact page was also fetched and retained. This prevents a path-hosted
+    # business URL from being rewritten to an unrelated generic origin root.
+    if desired != final:
+        if not any(normalize_http_url(capture.final_url) == desired for capture in captures):
+            return None
+    return desired
 
 
 def crawl_official_site(
@@ -130,7 +148,7 @@ def crawl_official_site(
     queue: list[tuple[int, int, str]] = []
     heapq.heappush(queue, (-10_000, 0, start_url))
     root = origin_url(start_url)
-    if root != start_url:
+    if root != normalize_http_url(start_url):
         heapq.heappush(queue, (-9_000, 0, root))
 
     seen: set[str] = set()
@@ -198,19 +216,7 @@ def crawl_official_site(
             if same_site(link.url, start_url) and link.url not in seen:
                 heapq.heappush(queue, (-link.priority, depth + 1, link.url))
 
-    home_capture = next(
-        (
-            capture
-            for capture in captures
-            if _is_home_capture(capture, start_url=start_url)
-        ),
-        None,
-    )
-    canonical_home = (
-        None
-        if home_capture is None
-        else _canonical_home(home_capture, start_url=start_url)
-    )
+    canonical_home = _canonical_home_from_verified_start(captures, start_url=start_url)
     return CrawlResult(
         captures=tuple(captures),
         errors=tuple(errors),
