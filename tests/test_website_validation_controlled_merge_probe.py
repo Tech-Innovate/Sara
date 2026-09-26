@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import sqlite3
 from pathlib import Path
 
 from sara.maps_backfill import backfill_maps_business_understanding
@@ -82,6 +84,34 @@ def test_controlled_merge_probe_partitions_one_real_business_and_preserves_histo
     assert result.details["post_merge_anchor_check"]["passed"] is True
     assert result.details["post_merge_foreign_key_violations"] == []
     assert result.details["survivor_dossier_integrity_issues"] == []
+
+    check = sqlite3.connect(probe)
+    check.row_factory = sqlite3.Row
+    bridge = check.execute(
+        "SELECT area_name,queries_json,scraper_image,config_json,raw_path "
+        "FROM runs WHERE id='validation-merge-probe-1'"
+    ).fetchone()
+    assert bridge is not None
+    assert bridge["area_name"] == "controlled-validation-merge-probe"
+    assert bridge["queries_json"] == "[]"
+    assert bridge["scraper_image"] == "sara-controlled-merge-probe"
+    assert bridge["raw_path"] is None
+    assert json.loads(bridge["config_json"]) == {
+        "validation_kind": "controlled_maps_identity_merge_probe",
+        "source_business_id": 1,
+        "source_run_id": "r1",
+        "synthetic_record": True,
+    }
+    bridge_artifact_refs = {
+        row[0]
+        for row in check.execute(
+            "SELECT e.artifact_ref FROM evidence_items e "
+            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "WHERE a.legacy_run_id='validation-merge-probe-1'"
+        )
+    }
+    assert bridge_artifact_refs == {None}
+    check.close()
 
 
 def test_controlled_merge_probe_requires_two_real_strong_identifiers(tmp_path: Path) -> None:
