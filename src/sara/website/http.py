@@ -230,11 +230,12 @@ class SafeHttpClient:
             if crawl_delay is not None:
                 delay = max(delay, float(crawl_delay))
             request_rate = parser.request_rate(self.user_agent)
-            if (
-                request_rate is not None
-                and request_rate.requests > 0
-                and request_rate.seconds > 0
-            ):
+            if request_rate is not None:
+                if request_rate.requests <= 0 or request_rate.seconds <= 0:
+                    raise WebsiteBlockedError(
+                        "robots request-rate policy is non-positive for "
+                        f"{self._origin(url)}"
+                    )
                 # Evenly spacing requests at seconds/requests is conservative:
                 # it never exceeds the advertised average request rate.
                 delay = max(
