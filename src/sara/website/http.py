@@ -94,9 +94,12 @@ class SafeHttpClient:
             raise ValueError("max_response_bytes must be greater than zero")
         if request_interval_seconds <= 0:
             raise ValueError("request_interval_seconds must be greater than zero")
-        if max_policy_delay_seconds < request_interval_seconds:
+        if (
+            max_policy_delay_seconds < request_interval_seconds
+            or max_policy_delay_seconds > 300
+        ):
             raise ValueError(
-                "max_policy_delay_seconds must be at least request_interval_seconds"
+                "max_policy_delay_seconds must be at least request_interval_seconds and at most 300"
             )
         self.site_url = normalized
         self.user_agent = user_agent
@@ -281,7 +284,6 @@ class SafeHttpClient:
         target = self._request_target(parsed)
         host_header = self._host_header(parsed)
         last_error: BaseException | None = None
-        self._pace(url)
 
         for address in addresses:
             if parsed.scheme == "https":
@@ -300,6 +302,7 @@ class SafeHttpClient:
                     self.timeout_seconds,
                 )
             try:
+                self._pace(url)
                 connection.request(
                     "GET",
                     target,
