@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import BoundingBox
+from .maps_source import official_website
 
 
 def utc_now() -> str:
@@ -190,6 +191,7 @@ def _coordinates(record: dict[str, Any]) -> tuple[float | None, float | None]:
 
 
 def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | None, str]:
+    website = official_website(record)
     place_id = _text(record.get("place_id"))
     cid = _text(record.get("cid"))
     data_id = _text(record.get("data_id"))
@@ -206,7 +208,7 @@ def _identity(record: dict[str, Any]) -> tuple[str | None, str | None, str | Non
         _text(record.get("title")),
         _text(record.get("address")),
         _text(record.get("phone")),
-        _text(record.get("website")),
+        website,
         None if latitude is None else str(latitude),
         None if longitude is None else str(longitude),
     )
@@ -311,7 +313,7 @@ def _payload(record: dict[str, Any]) -> dict[str, Any]:
         "latitude": latitude,
         "longitude": longitude,
         "phone": _text(record.get("phone")),
-        "website": _text(record.get("website")),
+        "website": official_website(record),
         "review_rating": _float(record.get("review_rating")),
         "review_count": _int(record.get("review_count")),
         "status": _text(record.get("status")),

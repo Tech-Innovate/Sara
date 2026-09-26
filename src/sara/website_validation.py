@@ -623,9 +623,20 @@ def _parser() -> argparse.ArgumentParser:
         help="comma-separated Maps business IDs belonging to one known multi-branch brand",
     )
     parser.add_argument(
+        "--merge-probe-business-id",
+        type=int,
+        help=(
+            "real Maps business with at least two strong identifiers; the disposable "
+            "probe copy partitions those identifiers and exercises actual convergence"
+        ),
+    )
+    parser.add_argument(
         "--merge-pair",
         type=_parse_pair,
-        help="comma-separated complementary-identifier Maps business IDs for the merge-survival probe",
+        help=(
+            "legacy optional natural complementary-identifier pair; prefer "
+            "--merge-probe-business-id for representative gosom data"
+        ),
     )
     parser.add_argument(
         "--passes",
@@ -647,8 +658,18 @@ def _validate_arguments(args: argparse.Namespace) -> None:
         )
     if not args.multi_branch_group:
         raise OperationalValidationError("provide at least one --multi-branch-group")
-    if args.merge_pair is None:
-        raise OperationalValidationError("provide --merge-pair for the evidence-survival probe")
+    merge_probe_business_id = getattr(args, "merge_probe_business_id", None)
+    if merge_probe_business_id is not None and merge_probe_business_id <= 0:
+        raise OperationalValidationError("--merge-probe-business-id must be a positive integer")
+    if merge_probe_business_id is None and args.merge_pair is None:
+        raise OperationalValidationError(
+            "provide --merge-probe-business-id for the controlled evidence-survival probe "
+            "or the legacy --merge-pair form"
+        )
+    if merge_probe_business_id is not None and args.merge_pair is not None:
+        raise OperationalValidationError(
+            "provide exactly one of --merge-probe-business-id or --merge-pair"
+        )
     workspace = Path(args.workspace)
     if workspace.exists() and any(workspace.iterdir()):
         raise OperationalValidationError(

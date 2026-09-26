@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from .maps_source import official_website
 from .understanding_vocabulary import (
     PREDICATE_SEEDS,
     VocabularySeedError,
@@ -153,7 +154,7 @@ def _source_values(raw: dict[str, Any]) -> dict[str, Any]:
         "latitude": _float(raw.get("latitude")),
         "longitude": _float(longitude),
         "phone": _text(raw.get("phone")),
-        "website": _text(raw.get("website")),
+        "website": official_website(raw),
         "review_rating": _float(raw.get("review_rating")),
         "review_count": _int(raw.get("review_count")),
         "status": _text(raw.get("status")),
