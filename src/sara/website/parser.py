@@ -33,7 +33,31 @@ _HIGH_VALUE_TERMS = {
     "support": 85,
     "help": 75,
 }
-_BOOKING_TERMS = {"booking", "reserve", "reservation", "appointment", "appointments"}
+_BOOKING_TERMS = {
+    "booking",
+    "reserve",
+    "reservation",
+    "appointment",
+    "appointments",
+    "schedule",
+    "scheduling",
+}
+_BOOKING_ACTION_TERMS = {
+    "now",
+    "online",
+    "appointment",
+    "appointments",
+    "table",
+    "tables",
+    "visit",
+    "session",
+    "sessions",
+    "consultation",
+    "consultations",
+    "slot",
+    "slots",
+    "today",
+}
 _ORDERING_TERMS = {"order", "ordering", "delivery", "deliver", "pickup", "takeaway", "takeout"}
 _SUPPORT_TERMS = {"support", "help", "helpdesk"}
 _SOCIAL_HOSTS = {
@@ -209,8 +233,11 @@ def classify_channel(
         return ChannelCandidate(social, url, url.lower(), url, "direct_link")
 
     host_lower = host.lower()
+    explicit_booking_text = bool(text_tokens & _BOOKING_TERMS) or (
+        "book" in text_tokens and bool(text_tokens & _BOOKING_ACTION_TERMS)
+    )
     if any(hint in host_lower for hint in _BOOKING_HOST_HINTS) or (
-        bool(combined & _BOOKING_TERMS) and bool(text_tokens & _BOOKING_TERMS)
+        bool(combined & (_BOOKING_TERMS | {"book"})) and explicit_booking_text
     ):
         return ChannelCandidate("booking", url, url.lower(), url, "action_link")
     if any(hint in host_lower for hint in _ORDERING_HOST_HINTS) or (
