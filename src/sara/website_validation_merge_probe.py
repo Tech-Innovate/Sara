@@ -144,22 +144,31 @@ def _create_bridge_run(
             f"controlled merge-probe run id already exists: {bridge_run_id!r}"
         )
     bridge_started_at = _later_timestamp(source["finished_at"] or source["started_at"])
+    bridge_config_json = json.dumps(
+        {
+            "validation_kind": "controlled_maps_identity_merge_probe",
+            "source_business_id": business_id,
+            "source_run_id": source_run_id,
+            "synthetic_record": True,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     conn.execute(
         "INSERT INTO runs("
         "id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,config_json,raw_path,"
         "status,started_at,finished_at,exit_code,error,raw_records,accepted_records,"
         "out_of_bounds_records,unlocated_records,unidentified_records,unique_seen,new_businesses"
-        ") VALUES (?,?,?,?,?,?,?,?,?,'complete',?,?,0,NULL,1,1,0,0,0,1,0)",
+        ") VALUES (?,?,?,?,?,?,?,?,NULL,'complete',?,?,0,NULL,1,1,0,0,0,1,0)",
         (
             bridge_run_id,
-            source["area_name"],
+            "controlled-validation-merge-probe",
             source["bbox_json"],
             source["cell_km"],
             source["depth"],
-            source["queries_json"],
-            source["scraper_image"],
-            source["config_json"],
-            source["raw_path"],
+            "[]",
+            "sara-controlled-merge-probe",
+            bridge_config_json,
             bridge_started_at,
             bridge_started_at,
         ),
