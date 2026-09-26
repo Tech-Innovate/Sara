@@ -34,6 +34,7 @@ class _RequestBudget:
     retry_delay_budget_seconds: float
     attempts_started: int = 0
     retry_delay_used: float = 0.0
+    retry_events: int = 0
 
     def start_attempt(self, url: str) -> None:
         if self.attempts_started >= self.attempt_limit:
@@ -41,6 +42,10 @@ class _RequestBudget:
                 f"request attempt limit exhausted ({self.attempt_limit}) for {url}"
             )
         self.attempts_started += 1
+
+    def next_retry_number(self) -> int:
+        self.retry_events += 1
+        return self.retry_events
 
     def reserve_retry_delay(self, delay: float, url: str) -> None:
         projected = self.retry_delay_used + delay
@@ -377,7 +382,7 @@ class SafeHttpClient:
         host_header = self._host_header(parsed)
         last_error: BaseException | None = None
 
-        for address in addresses:
+        for index, address in enumerate(addresses):
             if parsed.scheme == "https":
                 connection: http.client.HTTPConnection = _PinnedHTTPSConnection(
                     parsed.hostname or "",
@@ -426,6 +431,19 @@ class SafeHttpClient:
                 ) from exc
             except (OSError, http.client.HTTPException) as exc:
                 last_error = exc
+                if budget is not None and index < len(addresses) - 1:
+                    if budget.attempts_started >= budget.attempt_limit:
+                        raise WebsiteFetchError(
+                            "request attempt limit exhausted after transport failures "
+                            f"({budget.attempt_limit}) for {url}"
+                        ) from exc
+                    retry_number = budget.next_retry_number()
+                    delay = self._retry_delay_seconds(
+                        retry_number=retry_number,
+                        headers=None,
+                        url=url,
+                    )
+                    self._sleep_for_retry(budget=budget, delay=delay, url=url)
             finally:
                 connection.close()
 
@@ -511,14 +529,14 @@ class SafeHttpClient:
             attempt_limit=self.retry_attempt_limit,
             retry_delay_budget_seconds=self.retry_delay_budget_seconds,
         )
-        retry_number = 0
+        failure_cycles = 0
         while True:
             try:
                 status, headers, body = self._request_once(
                     url, max_bytes, budget=budget
                 )
             except _WebsiteTransientError as exc:
-                failure_cycles = retry_number + 1
+                failure_cycles += 1
                 if (
                     budget.attempts_started >= budget.attempt_limit
                     or failure_cycles >= budget.attempt_limit
@@ -527,7 +545,7 @@ class SafeHttpClient:
                         "request attempt limit exhausted after transport failures "
                         f"({budget.attempt_limit}) for {url}"
                     ) from exc
-                retry_number += 1
+                retry_number = budget.next_retry_number()
                 delay = self._retry_delay_seconds(
                     retry_number=retry_number,
                     headers=None,
@@ -543,7 +561,7 @@ class SafeHttpClient:
                     f"request attempt limit exhausted after HTTP {status} "
                     f"({budget.attempt_limit}) for {url}"
                 )
-            retry_number += 1
+            retry_number = budget.next_retry_number()
             delay = self._retry_delay_seconds(
                 retry_number=retry_number,
                 headers=headers,
