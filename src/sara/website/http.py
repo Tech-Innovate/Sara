@@ -398,6 +398,7 @@ class SafeHttpClient:
                     address,
                     self.timeout_seconds,
                 )
+            transient_error: BaseException | None = None
             try:
                 if budget is not None:
                     budget.start_attempt(url)
@@ -431,21 +432,23 @@ class SafeHttpClient:
                 ) from exc
             except (OSError, http.client.HTTPException) as exc:
                 last_error = exc
-                if budget is not None and index < len(addresses) - 1:
-                    if budget.attempts_started >= budget.attempt_limit:
-                        raise WebsiteFetchError(
-                            "request attempt limit exhausted after transport failures "
-                            f"({budget.attempt_limit}) for {url}"
-                        ) from exc
-                    retry_number = budget.next_retry_number()
-                    delay = self._retry_delay_seconds(
-                        retry_number=retry_number,
-                        headers=None,
-                        url=url,
-                    )
-                    self._sleep_for_retry(budget=budget, delay=delay, url=url)
+                transient_error = exc
             finally:
                 connection.close()
+
+            if transient_error is not None and budget is not None and index < len(addresses) - 1:
+                if budget.attempts_started >= budget.attempt_limit:
+                    raise WebsiteFetchError(
+                        "request attempt limit exhausted after transport failures "
+                        f"({budget.attempt_limit}) for {url}"
+                    ) from transient_error
+                retry_number = budget.next_retry_number()
+                delay = self._retry_delay_seconds(
+                    retry_number=retry_number,
+                    headers=None,
+                    url=url,
+                )
+                self._sleep_for_retry(budget=budget, delay=delay, url=url)
 
         raise _WebsiteTransientError(
             f"request failed for {url}: {last_error or 'all validated addresses failed'}"
