@@ -497,7 +497,11 @@ class SafeHttpClient:
                     url, max_bytes, budget=budget
                 )
             except _WebsiteTransientError as exc:
-                if budget.attempts_started >= budget.attempt_limit:
+                failure_cycles = retry_number + 1
+                if (
+                    budget.attempts_started >= budget.attempt_limit
+                    or failure_cycles >= budget.attempt_limit
+                ):
                     raise WebsiteFetchError(
                         "request attempt limit exhausted after transport failures "
                         f"({budget.attempt_limit}) for {url}"
