@@ -71,22 +71,22 @@ _SOCIAL_HOSTS = {
     "youtube.com": "youtube",
     "youtu.be": "youtube",
 }
-_BOOKING_HOST_HINTS = (
-    "booksy.",
-    "calendly.",
-    "opentable.",
-    "resy.",
-    "fresha.",
-    "mindbodyonline.",
-)
-_ORDERING_HOST_HINTS = (
-    "doordash.",
-    "ubereats.",
-    "talabat.",
-    "hungerstation.",
-    "jahez.",
-    "deliveroo.",
-)
+_BOOKING_DOMAINS = {
+    "booksy.com",
+    "calendly.com",
+    "opentable.com",
+    "resy.com",
+    "fresha.com",
+    "mindbodyonline.com",
+}
+_ORDERING_DOMAINS = {
+    "doordash.com",
+    "ubereats.com",
+    "talabat.com",
+    "hungerstation.com",
+    "jahez.net",
+    "deliveroo.com",
+}
 
 
 @dataclass(frozen=True)
@@ -118,35 +118,41 @@ class ParsedPage:
 
 
 def _host(value: str) -> str:
-    host = (urlsplit(value).hostname or "").lower().rstrip(".")
+    try:
+        host = (urlsplit(value).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
     return host[4:] if host.startswith("www.") else host
 
 
 def same_site(url: str, site_url: str) -> bool:
     candidate = _host(url)
     site = _host(site_url)
-    if not candidate or not site:
-        return False
-    return candidate == site or candidate == f"www.{site}" or f"www.{candidate}" == site
+    return bool(candidate and site and candidate == site)
 
 
 def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
     value = html.unescape(value).strip()
     if not value:
         return None
-    absolute = urljoin(base_url, value) if base_url else value
-    parsed = urlsplit(absolute)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    try:
+        absolute = urljoin(base_url, value) if base_url else value
+        parsed = urlsplit(absolute)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
         return None
-    host = parsed.hostname.lower().rstrip(".")
-    port = parsed.port
+    if scheme not in {"http", "https"} or not host:
+        return None
+    display_host = f"[{host}]" if ":" in host else host
     if port and not (
-        (parsed.scheme.lower() == "http" and port == 80)
-        or (parsed.scheme.lower() == "https" and port == 443)
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
     ):
-        netloc = f"{host}:{port}"
+        netloc = f"{display_host}:{port}"
     else:
-        netloc = host
+        netloc = display_host
     path = parsed.path or "/"
     pairs = [
         (key, item)
@@ -157,7 +163,7 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         )
     ]
     query = urlencode(pairs, doseq=True)
-    return urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 
 def _tokens(value: str) -> set[str]:
@@ -165,7 +171,10 @@ def _tokens(value: str) -> set[str]:
 
 
 def _priority(url: str, text: str) -> int:
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return 0
     tokens = _tokens(parsed.path + " " + text)
     score = 0
     for token in tokens:
@@ -185,12 +194,66 @@ def _normalize_phone(value: str) -> str | None:
     return cleaned
 
 
+def _domain_matches(host: str, domains: set[str]) -> bool:
+    normalized = host.lower().rstrip(".")
+    return any(normalized == domain or normalized.endswith("." + domain) for domain in domains)
+
+
 def _social_type(host: str) -> str | None:
-    host = host.lower().rstrip(".")
+    normalized = host.lower().rstrip(".")
     for suffix, channel_type in _SOCIAL_HOSTS.items():
-        if host == suffix or host.endswith("." + suffix):
+        if normalized == suffix or normalized.endswith("." + suffix):
             return channel_type
     return None
+
+
+def _is_social_profile(url: str, channel_type: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    parts = [part.lower() for part in parsed.path.split("/") if part]
+    if not parts:
+        return False
+    first = parts[0]
+    if channel_type == "instagram":
+        return first not in {
+            "accounts",
+            "explore",
+            "p",
+            "reel",
+            "reels",
+            "stories",
+            "share",
+        }
+    if channel_type == "facebook":
+        return first not in {
+            "dialog",
+            "plugins",
+            "share",
+            "sharer",
+            "watch",
+            "reel",
+            "story.php",
+        }
+    if channel_type == "linkedin":
+        return first in {"company", "school", "showcase"} and len(parts) >= 2
+    if channel_type == "x":
+        return first not in {
+            "home",
+            "i",
+            "intent",
+            "search",
+            "settings",
+            "share",
+        }
+    if channel_type == "tiktok":
+        return first.startswith("@") and len(first) > 1
+    if channel_type == "youtube":
+        return first.startswith("@") or (
+            first in {"channel", "c", "user"} and len(parts) >= 2
+        )
+    return False
 
 
 def classify_channel(
@@ -217,7 +280,10 @@ def classify_channel(
     url = normalize_http_url(raw, page_url)
     if url is None:
         return None
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None
     host = (parsed.hostname or "").lower()
     path_tokens = _tokens(parsed.path)
     text_tokens = _tokens(text)
@@ -229,18 +295,17 @@ def classify_channel(
         )
 
     social = _social_type(host)
-    if social:
+    if social and _is_social_profile(url, social):
         return ChannelCandidate(social, url, url.lower(), url, "direct_link")
 
-    host_lower = host.lower()
     explicit_booking_text = bool(text_tokens & _BOOKING_TERMS) or (
         "book" in text_tokens and bool(text_tokens & _BOOKING_ACTION_TERMS)
     )
-    if any(hint in host_lower for hint in _BOOKING_HOST_HINTS) or (
+    if _domain_matches(host, _BOOKING_DOMAINS) or (
         bool(combined & (_BOOKING_TERMS | {"book"})) and explicit_booking_text
     ):
         return ChannelCandidate("booking", url, url.lower(), url, "action_link")
-    if any(hint in host_lower for hint in _ORDERING_HOST_HINTS) or (
+    if _domain_matches(host, _ORDERING_DOMAINS) or (
         bool(combined & _ORDERING_TERMS) and bool(text_tokens & _ORDERING_TERMS)
     ):
         return ChannelCandidate("ordering", url, url.lower(), url, "action_link")
