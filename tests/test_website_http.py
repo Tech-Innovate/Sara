@@ -143,6 +143,23 @@ def test_robots_pacing_uses_stricter_crawl_delay_and_request_rate() -> None:
     )
 
 
+@pytest.mark.parametrize("request_rate", ["0/10", "3/0"])
+def test_non_positive_robots_request_rate_blocks(request_rate: str) -> None:
+    client = SafeHttpClient(
+        site_url="https://example.com/",
+        user_agent="SaraBusinessUnderstanding/1.0",
+        timeout_seconds=2,
+        max_response_bytes=65536,
+    )
+    client._robots["https://example.com/"] = _robots(
+        "User-agent: *",
+        f"Request-rate: {request_rate}",
+        "Allow: /",
+    )
+    with pytest.raises(WebsiteBlockedError, match="request-rate"):
+        client._policy_delay_seconds("https://example.com/page")
+
+
 def test_excessive_robots_pacing_policy_blocks_instead_of_sleeping() -> None:
     client = SafeHttpClient(
         site_url="https://example.com/",
