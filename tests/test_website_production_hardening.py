@@ -5,6 +5,8 @@ import socket
 from email.message import Message
 from pathlib import Path
 
+import pytest
+
 from sara.migrations import apply_migrations
 from sara.storage import connect
 from sara.website import http as website_http
@@ -110,3 +112,31 @@ def test_each_validated_address_request_attempt_is_paced(monkeypatch) -> None:
     assert status == 200
     assert body == b"<html></html>"
     assert paced == ["https://example.com/", "https://example.com/"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"timeout_seconds": float("nan")}, "timeout_seconds"),
+        ({"request_interval_seconds": float("nan")}, "request_interval_seconds"),
+        ({"max_policy_delay_seconds": float("nan")}, "max_policy_delay_seconds"),
+        ({"request_interval_seconds": float("inf")}, "request_interval_seconds"),
+        ({"max_policy_delay_seconds": float("inf")}, "max_policy_delay_seconds"),
+    ],
+)
+def test_crawl_config_rejects_non_finite_timing_values(kwargs, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        CrawlConfig(**kwargs).validate()
+
+
+def test_http_client_rejects_non_finite_pacing_values() -> None:
+    common = {
+        "site_url": "https://example.com/",
+        "user_agent": "SaraBusinessUnderstanding/1.0",
+        "timeout_seconds": 2,
+        "max_response_bytes": 65536,
+    }
+    with pytest.raises(ValueError, match="request_interval_seconds"):
+        SafeHttpClient(**common, request_interval_seconds=float("nan"))
+    with pytest.raises(ValueError, match="max_policy_delay_seconds"):
+        SafeHttpClient(**common, max_policy_delay_seconds=float("nan"))
