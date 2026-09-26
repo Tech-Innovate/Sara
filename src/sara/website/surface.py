@@ -79,6 +79,8 @@ def collect_official_website(
             user_agent=config.user_agent,
             timeout_seconds=config.timeout_seconds,
             max_response_bytes=config.max_response_bytes,
+            request_interval_seconds=config.request_interval_seconds,
+            max_policy_delay_seconds=config.max_policy_delay_seconds,
             obey_robots=config.obey_robots,
         )
         result = crawl_official_site(
@@ -193,6 +195,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth-limit", type=int, default=2)
     parser.add_argument("--max-response-bytes", type=_positive_int, default=1_048_576)
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--request-interval",
+        type=float,
+        default=1.0,
+        help="minimum seconds between requests to the same origin",
+    )
+    parser.add_argument(
+        "--max-policy-delay",
+        type=float,
+        default=30.0,
+        help="maximum robots pacing delay accepted before the source is blocked",
+    )
     parser.add_argument("--user-agent", default="SaraBusinessUnderstanding/1.0")
     parser.add_argument("--pretty", action="store_true")
     return parser
@@ -216,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
                 depth_limit=args.depth_limit,
                 max_response_bytes=args.max_response_bytes,
                 timeout_seconds=args.timeout,
+                request_interval_seconds=args.request_interval,
+                max_policy_delay_seconds=args.max_policy_delay,
                 user_agent=args.user_agent,
             ),
         )
