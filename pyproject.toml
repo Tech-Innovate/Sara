@@ -18,6 +18,7 @@ dev = ["pytest>=8"]
 sara = "sara.cli:main"
 sara-maps-sync = "sara.maps_sync:main"
 sara-dossier = "sara.dossier:main"
+sara-website = "sara.website:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
