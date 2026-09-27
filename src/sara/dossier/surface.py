@@ -65,10 +65,8 @@ def build_business_dossier(
     )
     facts = current_facts(conn, canonical_entity_id, current_location_ids, evaluation)
     evidence, integrity_issues = attach_provenance(conn, facts)
-    source_location_ids = sorted({str(item["id"]) for item in location_rows})
     customer_voice, customer_voice_issues = customer_review_observations(
         conn,
-        source_location_ids,
         current_location_ids,
     )
     integrity_issues = sort_integrity_issues(
