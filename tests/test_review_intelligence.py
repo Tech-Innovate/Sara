@@ -7,6 +7,7 @@ import pytest
 
 from sara.maps_backfill import (
     backfill_maps_business_understanding,
+    business_entity_id_for_maps_business,
     location_id_for_maps_business,
 )
 from sara.migrations import apply_migrations
@@ -134,7 +135,7 @@ def test_parser_collapses_exact_duplicates_but_preserves_distinct_review_variant
     assert duplicate.source_paths == ("user_reviews[0]", "user_reviews_extended[0]")
 
 
-def test_retained_reviews_become_location_scoped_evidence_and_observations_not_facts(
+def test_retained_reviews_become_source_location_observations_not_facts(
     tmp_path: Path,
 ) -> None:
     conn = prepared_conn(tmp_path / "reviews.sqlite")
@@ -154,10 +155,15 @@ def test_retained_reviews_become_location_scoped_evidence_and_observations_not_f
         now=lambda: "2026-09-27T08:00:00+00:00",
     )
 
+    expected_location = location_id_for_maps_business(business_id)
+    expected_entity = business_entity_id_for_maps_business(business_id)
     assert stats.business_id == business_id
-    assert stats.location_id == location_id_for_maps_business(business_id)
+    assert stats.business_entity_id == expected_entity
+    assert stats.source_business_entity_id == expected_entity
+    assert stats.source_location_id == expected_location
+    assert stats.canonical_location_id == expected_location
     assert stats.source_review_records == 3
-    assert stats.unique_review_evidence == 2
+    assert stats.review_evidence_records == 2
     assert stats.duplicate_source_records_collapsed == 1
     assert stats.evidence_items_created == 2
     assert stats.observations_created == 2
@@ -170,7 +176,7 @@ def test_retained_reviews_become_location_scoped_evidence_and_observations_not_f
         (stats.session_id,),
     ).fetchone()
     assert tuple(session) == (
-        stats.location_id,
+        stats.source_location_id,
         "src_google_maps",
         COLLECTOR_NAME,
         "1",
@@ -202,7 +208,7 @@ def test_retained_reviews_become_location_scoped_evidence_and_observations_not_f
         )
     )
     assert len(observations) == 2
-    assert {row["subject_id"] for row in observations} == {stats.location_id}
+    assert {row["subject_id"] for row in observations} == {stats.source_location_id}
     assert {row["predicate"] for row in observations} == {REVIEW_PREDICATE}
     assert {row["observation_kind"] for row in observations} == {"source_assertion"}
     assert {row["extraction_method"] for row in observations} == {"direct_structured"}
@@ -225,6 +231,8 @@ def test_retained_reviews_become_location_scoped_evidence_and_observations_not_f
     retained_raw = json.loads(identified_metadata["raw_review_json"])
     assert retained_raw["Name"] == "Public Reviewer"
     assert identified_metadata["parent_evidence_id"] == stats.source_evidence_id
+    assert identified_metadata["source_business_entity_id"] == stats.source_business_entity_id
+    assert identified_metadata["source_location_id"] == stats.source_location_id
     assert identified_metadata["source_paths"] == [
         "user_reviews[0]",
         "user_reviews_extended[0]",
@@ -286,7 +294,7 @@ def test_empty_review_arrays_record_attempt_without_claiming_absence(tmp_path: P
     )
 
     assert stats.source_review_records == 0
-    assert stats.unique_review_evidence == 0
+    assert stats.review_evidence_records == 0
     assert stats.evidence_items_created == 0
     assert stats.observations_created == 0
     session = conn.execute(
