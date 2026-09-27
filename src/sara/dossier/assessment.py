@@ -125,6 +125,7 @@ def _chronology_inputs(
         inputs.append({"field": field, "value": value})
 
     entity = dossier["business_entity"]
+    add(entity.get("created_at"), "business entity created_at")
     add(entity.get("updated_at"), "business entity updated_at")
     for owner in location_owner_resolution:
         for node in owner["resolution_chain"]:
@@ -138,6 +139,7 @@ def _chronology_inputs(
                 f"location {owner['location_id']} owner Entity {owner_id} merged_at",
             )
     for location in dossier["locations"]:
+        add(location.get("created_at"), f"location {location['id']} created_at")
         add(location.get("updated_at"), f"location {location['id']} updated_at")
         add(location.get("merged_at"), f"location {location['id']} merged_at")
         for identifier in location["external_identifiers"]:
@@ -155,7 +157,9 @@ def _chronology_inputs(
                 f"external identifier {identifier_id} last_observed_at",
             )
     for business in dossier["maps_businesses"]:
-        add(business.get("last_seen_at"), f"Maps business {business['id']} last_seen_at")
+        business_id = business["id"]
+        add(business.get("last_seen_at"), f"Maps business {business_id} last_seen_at")
+        add(business.get("linked_at"), f"Maps business {business_id} linked_at")
     for fact in dossier["facts"]:
         add(fact.get("created_at"), f"fact {fact['id']} created_at")
         add(fact.get("valid_from"), f"fact {fact['id']} valid_from")
