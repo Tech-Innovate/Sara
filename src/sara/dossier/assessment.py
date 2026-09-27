@@ -65,6 +65,17 @@ def _fresh_value(fact: dict[str, Any]) -> bool:
     )
 
 
+def _absence_inspection_current(fact: dict[str, Any]) -> bool:
+    return (
+        fact["status"] == "not_observed"
+        and not bool(fact["freshness"]["is_stale"])
+        and any(
+            support["support_role"] == "supports_absence"
+            for support in fact["acquisition_support"]
+        )
+    )
+
+
 def _usable_support_sources(fact: dict[str, Any]) -> set[str]:
     return {
         str(item["source_id"])
@@ -89,7 +100,7 @@ def _domain_context(
     return facts, unknowns, fresh
 
 
-def _base_reason(
+def _reason(
     *,
     code: str,
     facts: list[dict[str, Any]],
@@ -107,42 +118,6 @@ def _base_reason(
     return result
 
 
-def _generic_domain(
-    dossier: dict[str, Any], domain: str
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, domain)
-    if any(fact["status"] == "conflicted" for fact in facts):
-        return "conflicted", _base_reason(
-            code="current_fact_conflict", facts=facts, unknowns=unknowns
-        ), fresh
-    if facts and not fresh and any(
-        fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
-    ):
-        return "stale", _base_reason(
-            code="no_fresh_value_fact", facts=facts, unknowns=unknowns
-        ), fresh
-    if facts and all(fact["status"] == "not_applicable" for fact in facts) and not unknowns:
-        return "not_applicable", _base_reason(
-            code="all_current_domain_facts_not_applicable", facts=facts, unknowns=unknowns
-        ), fresh
-    if fresh and not unknowns:
-        state = "strong" if _all_corroborated(fresh) else "sufficient"
-        return state, _base_reason(
-            code="fresh_supported_domain_evidence", facts=facts, unknowns=unknowns
-        ), fresh
-    if fresh:
-        return "partial", _base_reason(
-            code="fresh_evidence_with_unresolved_items", facts=facts, unknowns=unknowns
-        ), fresh
-    if facts or unknowns:
-        return "insufficient", _base_reason(
-            code="domain_has_no_fresh_supported_value", facts=facts, unknowns=unknowns
-        ), fresh
-    return "not_started", _base_reason(
-        code="no_domain_evidence", facts=facts, unknowns=unknowns
-    ), fresh
-
-
 def _predicate_facts(
     dossier: dict[str, Any], predicate: str, *, subject_id: str | None = None
 ) -> list[dict[str, Any]]:
@@ -154,74 +129,155 @@ def _predicate_facts(
     ]
 
 
-def _single_predicate_domain(
-    dossier: dict[str, Any], domain: str, predicate: str
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+def _generic_domain(
+    dossier: dict[str, Any], domain: str
+) -> tuple[str, dict[str, Any]]:
     facts, unknowns, fresh = _domain_context(dossier, domain)
     if any(fact["status"] == "conflicted" for fact in facts):
-        return "conflicted", _base_reason(
+        return "conflicted", _reason(
+            code="current_fact_conflict", facts=facts, unknowns=unknowns
+        )
+    if facts and not fresh and any(
+        fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
+    ):
+        return "stale", _reason(
+            code="no_fresh_value_fact", facts=facts, unknowns=unknowns
+        )
+    if facts and all(fact["status"] == "not_applicable" for fact in facts) and not unknowns:
+        return "not_applicable", _reason(
+            code="all_current_domain_facts_not_applicable", facts=facts, unknowns=unknowns
+        )
+    if fresh and not unknowns:
+        return (
+            "strong" if _all_corroborated(fresh) else "sufficient",
+            _reason(code="fresh_supported_domain_evidence", facts=facts, unknowns=unknowns),
+        )
+    if fresh:
+        return "partial", _reason(
+            code="fresh_evidence_with_unresolved_items", facts=facts, unknowns=unknowns
+        )
+    if facts or unknowns:
+        return "insufficient", _reason(
+            code="domain_has_no_fresh_supported_value", facts=facts, unknowns=unknowns
+        )
+    return "not_started", _reason(code="no_domain_evidence", facts=facts, unknowns=unknowns)
+
+
+def _single_predicate_domain(
+    dossier: dict[str, Any], domain: str, predicate: str
+) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, domain)
+    if any(fact["status"] == "conflicted" for fact in facts):
+        return "conflicted", _reason(
             code="required_predicate_conflicted",
             facts=facts,
             unknowns=unknowns,
             extra={"required_predicate": predicate},
-        ), fresh
-    required = [fact for fact in _predicate_facts(dossier, predicate) if _fresh_value(fact)]
-    if required:
-        state = "strong" if _all_corroborated(required) else "sufficient"
-        return state, _base_reason(
-            code="required_predicate_supported",
-            facts=facts,
-            unknowns=unknowns,
-            extra={"required_predicate": predicate},
-        ), required
-    if facts and any(
-        fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
+        )
+    matches = _predicate_facts(dossier, predicate)
+    supported = [fact for fact in matches if _fresh_value(fact)]
+    if supported:
+        return (
+            "strong" if _all_corroborated(supported) else "sufficient",
+            _reason(
+                code="required_predicate_supported",
+                facts=facts,
+                unknowns=unknowns,
+                extra={"required_predicate": predicate},
+            ),
+        )
+    if matches and any(
+        fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in matches
     ):
-        return "stale", _base_reason(
+        return "stale", _reason(
             code="required_predicate_stale",
             facts=facts,
             unknowns=unknowns,
             extra={"required_predicate": predicate},
-        ), fresh
+        )
     if facts:
-        return "insufficient", _base_reason(
+        return "insufficient", _reason(
             code="required_predicate_not_supported",
             facts=facts,
             unknowns=unknowns,
             extra={"required_predicate": predicate},
-        ), fresh
-    return "not_started", _base_reason(
+        )
+    return "not_started", _reason(
         code="required_predicate_not_observed",
         facts=facts,
         unknowns=unknowns,
         extra={"required_predicate": predicate},
-    ), fresh
+    )
 
 
-def _locations_domain(
-    dossier: dict[str, Any]
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "locations")
+def _identity_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "identity")
+    names = [
+        fact
+        for fact in _predicate_facts(dossier, "business.name.trading")
+        if _fresh_value(fact)
+    ]
+    if any(fact["status"] == "conflicted" for fact in facts):
+        return "conflicted", _reason(
+            code="identity_fact_conflict", facts=facts, unknowns=unknowns
+        )
+    strong_identifiers = sorted(
+        {
+            f"{identifier['source_id']}:{identifier['namespace']}:{identifier['value']}"
+            for location in dossier["locations"]
+            if location["current_for_entity"]
+            for identifier in location["external_identifiers"]
+            if identifier["status"] == "active"
+            and identifier["namespace"] in {"place_id", "cid", "data_id"}
+        }
+    )
+    if names and strong_identifiers:
+        return (
+            "strong" if _all_corroborated(names) else "sufficient",
+            _reason(
+                code="fresh_name_and_strong_location_identity_anchor",
+                facts=facts,
+                unknowns=unknowns,
+                extra={"strong_external_identifiers": strong_identifiers},
+            ),
+        )
+    if names:
+        return "partial", _reason(
+            code="fresh_name_without_strong_location_identity_anchor",
+            facts=facts,
+            unknowns=unknowns,
+        )
+    if facts and any(
+        fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
+    ):
+        return "stale", _reason(code="identity_evidence_stale", facts=facts, unknowns=unknowns)
+    return (
+        "insufficient" if facts or unknowns else "not_started",
+        _reason(code="identity_not_resolved", facts=facts, unknowns=unknowns),
+    )
+
+
+def _locations_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "locations")
     current_locations = [
         str(item["id"]) for item in dossier["locations"] if item["current_for_entity"]
     ]
-    required_predicates = ("location.address", "location.latitude", "location.longitude")
+    required = ("location.address", "location.latitude", "location.longitude")
     if any(fact["status"] == "conflicted" for fact in facts):
-        return "conflicted", _base_reason(
+        return "conflicted", _reason(
             code="location_fact_conflict", facts=facts, unknowns=unknowns
-        ), fresh
+        )
     if not current_locations:
-        return "insufficient", _base_reason(
+        return "insufficient", _reason(
             code="no_current_location_subject",
             facts=facts,
             unknowns=unknowns,
-            extra={"required_predicates": list(required_predicates)},
-        ), fresh
-
+            extra={"required_predicates": list(required)},
+        )
     missing: list[dict[str, str]] = []
     basis: list[dict[str, Any]] = []
     for location_id in current_locations:
-        for predicate in required_predicates:
+        for predicate in required:
             matches = [
                 fact
                 for fact in _predicate_facts(dossier, predicate, subject_id=location_id)
@@ -232,48 +288,45 @@ def _locations_domain(
             else:
                 missing.append({"location_id": location_id, "predicate": predicate})
     if not missing:
-        state = "strong" if _all_corroborated(basis) else "sufficient"
-        return state, _base_reason(
-            code="all_current_locations_have_core_geography",
-            facts=facts,
-            unknowns=unknowns,
-            extra={
-                "current_location_ids": current_locations,
-                "required_predicates": list(required_predicates),
-            },
-        ), basis
+        return (
+            "strong" if _all_corroborated(basis) else "sufficient",
+            _reason(
+                code="all_current_locations_have_core_geography",
+                facts=facts,
+                unknowns=unknowns,
+                extra={"current_location_ids": current_locations, "required_predicates": list(required)},
+            ),
+        )
     if basis:
-        return "partial", _base_reason(
+        return "partial", _reason(
             code="current_location_geography_incomplete",
             facts=facts,
             unknowns=unknowns,
             extra={"missing": missing},
-        ), basis
+        )
     if facts and any(
         fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
     ):
-        return "stale", _base_reason(
+        return "stale", _reason(
             code="current_location_geography_stale",
             facts=facts,
             unknowns=unknowns,
             extra={"missing": missing},
-        ), basis
-    return "insufficient", _base_reason(
+        )
+    return "insufficient", _reason(
         code="current_location_geography_unresolved",
         facts=facts,
         unknowns=unknowns,
         extra={"missing": missing},
-    ), basis
+    )
 
 
-def _communication_domain(
-    dossier: dict[str, Any]
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "communication")
+def _communication_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "communication")
     if any(fact["status"] == "conflicted" for fact in facts):
-        return "conflicted", _base_reason(
+        return "conflicted", _reason(
             code="communication_fact_conflict", facts=facts, unknowns=unknowns
-        ), fresh
+        )
     current_locations = [
         str(item["id"]) for item in dossier["locations"] if item["current_for_entity"]
     ]
@@ -290,47 +343,43 @@ def _communication_domain(
         else:
             missing.append(location_id)
     if current_locations and not missing:
-        state = "strong" if _all_corroborated(basis) else "sufficient"
-        return state, _base_reason(
-            code="all_current_locations_have_public_phone",
-            facts=facts,
-            unknowns=unknowns,
-            extra={"current_location_ids": current_locations},
-        ), basis
+        return (
+            "strong" if _all_corroborated(basis) else "sufficient",
+            _reason(
+                code="all_current_locations_have_public_phone",
+                facts=facts,
+                unknowns=unknowns,
+                extra={"current_location_ids": current_locations},
+            ),
+        )
     if basis:
-        return "partial", _base_reason(
+        return "partial", _reason(
             code="public_contact_incomplete_across_locations",
             facts=facts,
             unknowns=unknowns,
             extra={"missing_location_ids": missing},
-        ), basis
+        )
     if facts and any(
         fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
     ):
-        return "stale", _base_reason(
-            code="public_contact_stale", facts=facts, unknowns=unknowns
-        ), basis
+        return "stale", _reason(code="public_contact_stale", facts=facts, unknowns=unknowns)
     return (
-        "not_started" if not facts else "insufficient",
-        _base_reason(
+        "insufficient" if facts or unknowns else "not_started",
+        _reason(
             code="no_fresh_public_contact",
             facts=facts,
             unknowns=unknowns,
             extra={"missing_location_ids": missing},
         ),
-        basis,
     )
 
 
-def _digital_capabilities_domain(
-    dossier: dict[str, Any]
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "digital_capabilities")
+def _digital_capabilities_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "digital_capabilities")
     if any(fact["status"] == "conflicted" for fact in facts):
-        return "conflicted", _base_reason(
+        return "conflicted", _reason(
             code="digital_capability_conflict", facts=facts, unknowns=unknowns
-        ), fresh
-
+        )
     inspected: list[str] = []
     missing: list[str] = []
     basis: list[dict[str, Any]] = []
@@ -338,11 +387,7 @@ def _digital_capabilities_domain(
     for predicate in _CAPABILITY_PREDICATES:
         matches = _predicate_facts(dossier, predicate)
         supported = [fact for fact in matches if _fresh_value(fact)]
-        searched = [
-            fact
-            for fact in matches
-            if fact["status"] == "not_observed" and bool(fact["acquisition_support"])
-        ]
+        searched = [fact for fact in matches if _absence_inspection_current(fact)]
         if supported:
             inspected.append(predicate)
             basis.extend(supported)
@@ -351,12 +396,11 @@ def _digital_capabilities_domain(
             bounded_not_observed.append(predicate)
         else:
             missing.append(predicate)
-
     if not missing:
         state = "sufficient"
         if not bounded_not_observed and _all_corroborated(basis):
             state = "strong"
-        return state, _base_reason(
+        return state, _reason(
             code="core_digital_capabilities_inspected",
             facts=facts,
             unknowns=unknowns,
@@ -365,41 +409,39 @@ def _digital_capabilities_domain(
                 "bounded_not_observed_predicates": bounded_not_observed,
                 "semantic_note": "not_observed records bounded inspection, not confirmed absence",
             },
-        ), basis
+        )
     if inspected:
-        return "partial", _base_reason(
+        return "partial", _reason(
             code="digital_capability_inspection_incomplete",
             facts=facts,
             unknowns=unknowns,
             extra={"inspected_predicates": inspected, "missing_predicates": missing},
-        ), basis
+        )
     if facts and any(
         fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
     ):
-        return "stale", _base_reason(
+        return "stale", _reason(
             code="digital_capability_evidence_stale", facts=facts, unknowns=unknowns
-        ), basis
+        )
     return (
-        "not_started" if not facts else "insufficient",
-        _base_reason(
+        "insufficient" if facts or unknowns else "not_started",
+        _reason(
             code="digital_capabilities_not_inspected",
             facts=facts,
             unknowns=unknowns,
             extra={"missing_predicates": missing},
         ),
-        basis,
     )
 
 
 def _reputation_domain(
     dossier: dict[str, Any], evaluated_at: datetime
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "reputation")
+) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "reputation")
     if any(fact["status"] == "conflicted" for fact in facts):
-        return "conflicted", _base_reason(
+        return "conflicted", _reason(
             code="reputation_metric_conflict", facts=facts, unknowns=unknowns
-        ), fresh
-
+        )
     rating = [
         fact for fact in _predicate_facts(dossier, "reputation.rating") if _fresh_value(fact)
     ]
@@ -421,13 +463,8 @@ def _reputation_domain(
         age_days = (evaluated_at - retrieved_at).total_seconds() / 86400
         if 0 <= age_days <= 30:
             current_voice.append(review)
-
-    basis = [*rating, *review_count]
     if rating and review_count and current_voice:
-        state = "sufficient"
-        if len(current_voice) >= 3 and _all_corroborated(basis):
-            state = "strong"
-        return state, _base_reason(
+        return "sufficient", _reason(
             code="current_platform_metrics_and_customer_voice_present",
             facts=facts,
             unknowns=unknowns,
@@ -436,9 +473,9 @@ def _reputation_domain(
                 "total_review_observation_count": len(voice),
                 "review_retrieval_freshness_days": 30,
             },
-        ), basis
+        )
     if voice or rating or review_count:
-        return "partial", _base_reason(
+        return "partial", _reason(
             code="reputation_evidence_incomplete",
             facts=facts,
             unknowns=unknowns,
@@ -448,24 +485,18 @@ def _reputation_domain(
                 "current_review_observation_count": len(current_voice),
                 "total_review_observation_count": len(voice),
             },
-        ), basis
+        )
     if facts and any(
         fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
     ):
-        return "stale", _base_reason(
-            code="reputation_evidence_stale", facts=facts, unknowns=unknowns
-        ), basis
-    return "not_started", _base_reason(
-        code="no_reputation_or_customer_voice_evidence",
-        facts=facts,
-        unknowns=unknowns,
-    ), basis
+        return "stale", _reason(code="reputation_evidence_stale", facts=facts, unknowns=unknowns)
+    return "not_started", _reason(
+        code="no_reputation_or_customer_voice_evidence", facts=facts, unknowns=unknowns
+    )
 
 
-def _customer_journey_domain(
-    dossier: dict[str, Any]
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "customer_journey")
+def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "customer_journey")
     supporting_predicates = {
         "business.model.transaction_type",
         "location.phone",
@@ -476,46 +507,33 @@ def _customer_journey_domain(
         fact
         for fact in dossier["facts"]
         if fact["predicate"] in supporting_predicates
-        and (_fresh_value(fact) or fact["status"] == "not_observed")
+        and (_fresh_value(fact) or _absence_inspection_current(fact))
     ]
-    if facts:
-        state, reason, basis = _generic_domain(dossier, "customer_journey")
-        if state in _READY_STATES:
-            # The v1 policy has no direct customer-journey observation contract.
-            # Current facts in this domain can inform the dossier, but cannot by
-            # themselves establish that major interaction stages were reconstructed.
-            state = "partial"
-            reason = _base_reason(
-                code="direct_customer_journey_facts_exist_but_v1_has_no_stage_reconstruction_contract",
-                facts=facts,
-                unknowns=unknowns,
-            )
-        return state, reason, basis
-    if supporting:
-        return "partial", _base_reason(
-            code="adjacent_customer_interaction_evidence_exists_without_stage_reconstruction",
+    if any(fact["status"] == "conflicted" for fact in facts):
+        return "conflicted", _reason(
+            code="customer_journey_fact_conflict", facts=facts, unknowns=unknowns
+        )
+    if facts or supporting:
+        return "partial", _reason(
+            code="customer_interaction_evidence_exists_without_stage_reconstruction_contract",
             facts=facts,
             unknowns=unknowns,
             extra={"supporting_fact_ids": sorted(str(fact["id"]) for fact in supporting)},
-        ), []
-    return "not_started", _base_reason(
-        code="no_customer_journey_reconstruction_evidence",
-        facts=facts,
-        unknowns=unknowns,
-    ), []
+        )
+    return "not_started", _reason(
+        code="no_customer_journey_reconstruction_evidence", facts=facts, unknowns=unknowns
+    )
 
 
-def _provenance_domain(
-    dossier: dict[str, Any]
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "provenance")
+def _provenance_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "provenance")
     traceable_items = len(dossier["facts"]) + int(dossier["customer_voice"]["review_count"])
     if traceable_items == 0:
-        return "not_started", _base_reason(
+        return "not_started", _reason(
             code="nothing_material_to_trace", facts=facts, unknowns=unknowns
-        ), fresh
+        )
     if dossier["integrity_issues"]:
-        return "insufficient", _base_reason(
+        return "insufficient", _reason(
             code="provenance_integrity_issues_present",
             facts=facts,
             unknowns=unknowns,
@@ -524,79 +542,66 @@ def _provenance_domain(
                     {str(item["code"]) for item in dossier["integrity_issues"]}
                 )
             },
-        ), fresh
-    return "sufficient", _base_reason(
+        )
+    return "sufficient", _reason(
         code="material_current_state_traces_to_retained_evidence",
         facts=facts,
         unknowns=unknowns,
         extra={"traceable_item_count": traceable_items},
-    ), fresh
+    )
 
 
-def _unknowns_domain(
-    dossier: dict[str, Any]
-) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-    facts, unknowns, fresh = _domain_context(dossier, "unknowns")
-    return "sufficient", _base_reason(
+def _unknowns_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    facts, unknowns, _fresh = _domain_context(dossier, "unknowns")
+    return "sufficient", _reason(
         code="controlled_fact_unknowns_enumerated_without_invented_values",
         facts=facts,
         unknowns=unknowns,
         extra={"controlled_unresolved_count": len(dossier["unknowns"])},
-    ), fresh
+    )
 
 
 def derive_domain_assessments(dossier: dict[str, Any]) -> list[dict[str, Any]]:
     evaluated_at = parse_timestamp(dossier["evaluated_at"], field="dossier evaluated_at")
-    derived: dict[str, tuple[str, dict[str, Any], list[dict[str, Any]]]] = {}
-
-    derived["identity"] = _single_predicate_domain(
-        dossier, "identity", "business.name.trading"
-    )
-    derived["classification"] = _single_predicate_domain(
-        dossier, "classification", "business.category.primary"
-    )
-    derived["locations"] = _locations_domain(dossier)
-    derived["offerings"] = _single_predicate_domain(
-        dossier, "offerings", "business.offering.service"
-    )
-    derived["customer_market"] = _single_predicate_domain(
-        dossier, "customer_market", "business.customer_segment.stated"
-    )
-    derived["business_model"] = _single_predicate_domain(
-        dossier, "business_model", "business.model.transaction_type"
-    )
-    derived["communication"] = _communication_domain(dossier)
-    derived["digital_presence"] = _single_predicate_domain(
-        dossier, "digital_presence", "business.website.official"
-    )
-    derived["digital_capabilities"] = _digital_capabilities_domain(dossier)
-    derived["customer_journey"] = _customer_journey_domain(dossier)
-    derived["reputation"] = _reputation_domain(dossier, evaluated_at)
-    derived["competitive_context"] = (
-        "not_started",
-        _base_reason(
-            code="peer_context_not_yet_established_by_supported_dossier_inputs",
-            facts=[],
-            unknowns=[],
+    derived: dict[str, tuple[str, dict[str, Any]]] = {
+        "identity": _identity_domain(dossier),
+        "classification": _single_predicate_domain(
+            dossier, "classification", "business.category.primary"
         ),
-        [],
-    )
-    derived["provenance"] = _provenance_domain(dossier)
-    derived["unknowns"] = _unknowns_domain(dossier)
-
-    for domain in (
-        "scale",
-        "marketing",
-        "technology",
-        "people",
-        "operations",
-        "change",
-    ):
+        "locations": _locations_domain(dossier),
+        "offerings": _single_predicate_domain(
+            dossier, "offerings", "business.offering.service"
+        ),
+        "customer_market": _single_predicate_domain(
+            dossier, "customer_market", "business.customer_segment.stated"
+        ),
+        "business_model": _single_predicate_domain(
+            dossier, "business_model", "business.model.transaction_type"
+        ),
+        "communication": _communication_domain(dossier),
+        "digital_presence": _single_predicate_domain(
+            dossier, "digital_presence", "business.website.official"
+        ),
+        "digital_capabilities": _digital_capabilities_domain(dossier),
+        "customer_journey": _customer_journey_domain(dossier),
+        "reputation": _reputation_domain(dossier, evaluated_at),
+        "competitive_context": (
+            "not_started",
+            _reason(
+                code="peer_context_not_yet_established_by_supported_dossier_inputs",
+                facts=[],
+                unknowns=[],
+            ),
+        ),
+        "provenance": _provenance_domain(dossier),
+        "unknowns": _unknowns_domain(dossier),
+    }
+    for domain in ("scale", "marketing", "technology", "people", "operations", "change"):
         derived[domain] = _generic_domain(dossier, domain)
 
     result: list[dict[str, Any]] = []
     for seed in DOSSIER_DOMAIN_SEED_V1:
-        state, reason, _basis = derived[seed.name]
+        state, reason = derived[seed.name]
         domain_facts, domain_unknowns, domain_fresh = _domain_context(dossier, seed.name)
         result.append(
             {
@@ -638,11 +643,15 @@ def _input_watermark(dossier: dict[str, Any]) -> str:
             f"review evidence {review['evidence']['id']} retrieved_at",
         )
     if not candidates:
-        raise DossierAssessmentError("dossier has no timestamped state from which to derive facts_as_of")
+        raise DossierAssessmentError(
+            "dossier has no timestamped state from which to derive facts_as_of"
+        )
     return max(candidates).astimezone(timezone.utc).isoformat()
 
 
-def _input_signature(dossier: dict[str, Any], domains: list[dict[str, Any]]) -> dict[str, Any]:
+def _input_signature(
+    dossier: dict[str, Any], domains: list[dict[str, Any]]
+) -> dict[str, Any]:
     return {
         "facts": [
             {
@@ -692,13 +701,13 @@ def _input_signature(dossier: dict[str, Any], domains: list[dict[str, Any]]) -> 
     }
 
 
-def _existing_assessment(
+def _verify_existing_assessment(
     conn: sqlite3.Connection,
     *,
     assessment_id: str,
     expected_parent: tuple[object, ...],
     expected_domains: list[dict[str, Any]],
-) -> tuple[str, bool] | None:
+) -> str | None:
     row = conn.execute(
         "SELECT business_entity_id,policy_version,facts_as_of,analysis_ready,computed_at,summary_json "
         "FROM dossier_assessments WHERE id=?",
@@ -706,7 +715,7 @@ def _existing_assessment(
     ).fetchone()
     if row is None:
         return None
-    actual_parent = tuple(row[index] for index in (0, 1, 2, 3, 5))
+    actual_parent = (row[0], row[1], row[2], row[3], row[5])
     if actual_parent != expected_parent:
         raise DossierAssessmentError(
             f"existing deterministic dossier assessment {assessment_id} has incompatible parent state"
@@ -724,7 +733,7 @@ def _existing_assessment(
         "FROM dossier_domain_assessments WHERE assessment_id=? ORDER BY domain",
         (assessment_id,),
     ).fetchall()
-    actual = [tuple(row) for row in rows]
+    actual = [tuple(item) for item in rows]
     expected = sorted(
         (
             item["domain"],
@@ -739,9 +748,7 @@ def _existing_assessment(
         raise DossierAssessmentError(
             f"existing deterministic dossier assessment {assessment_id} domain state has drifted"
         )
-    return str(row[4] if False else conn.execute(
-        "SELECT computed_at FROM dossier_assessments WHERE id=?", (assessment_id,)
-    ).fetchone()[0]), True
+    return str(row[4])
 
 
 def persist_dossier_assessment(
@@ -754,9 +761,12 @@ def persist_dossier_assessment(
 ) -> DossierAssessmentResult:
     """Compute and seal one immutable dossier sufficiency snapshot.
 
-    The assessment is derived from the current database state under one writer
-    transaction. No acquisition, migration, vocabulary seeding, synchronization,
-    or external I/O is performed. Customer reviews remain evidence-only inputs.
+    Current database state is frozen under one writer transaction. The operation
+    performs no acquisition, migration, vocabulary seeding, synchronization, or
+    external I/O. Customer reviews remain evidence-only inputs. A repeated run
+    with the same logical input and freshness state reuses the same deterministic
+    snapshot; a later freshness transition creates a new immutable snapshot even
+    when the underlying factual watermark is unchanged.
     """
     if conn.in_transaction:
         raise DossierAssessmentError(
@@ -813,11 +823,8 @@ def persist_dossier_assessment(
             "schema": "sara-dossier-assessment-summary-v1",
             "derivation_version": DERIVATION_VERSION,
             "policy_version": DOSSIER_POLICY_VERSION,
-            "freshness_evaluated_at": computed_at,
             "fact_count": len(dossier["facts"]),
-            "customer_review_observation_count": int(
-                dossier["customer_voice"]["review_count"]
-            ),
+            "customer_review_observation_count": int(dossier["customer_voice"]["review_count"]),
             "controlled_unresolved_count": len(dossier["unknowns"]),
             "integrity_issue_count": len(dossier["integrity_issues"]),
             "integrity_issue_codes": sorted(
@@ -841,32 +848,20 @@ def persist_dossier_assessment(
             summary_json,
         )
 
-        existing_same_watermark = conn.execute(
-            "SELECT id FROM dossier_assessments "
-            "WHERE business_entity_id=? AND policy_version=? AND facts_as_of=? AND id<>?",
-            (entity, DOSSIER_POLICY_VERSION, facts_as_of, assessment_id),
-        ).fetchall()
-        if existing_same_watermark:
-            raise DossierAssessmentError(
-                "another assessment already exists for the same entity, policy, and facts watermark "
-                "with a different derived identity"
-            )
-
-        existing = _existing_assessment(
+        existing_computed_at = _verify_existing_assessment(
             conn,
             assessment_id=assessment_id,
             expected_parent=expected_parent,
             expected_domains=domains,
         )
-        if existing is not None:
-            stored_computed_at, _ = existing
+        if existing_computed_at is not None:
             conn.commit()
             return DossierAssessmentResult(
                 assessment_id=assessment_id,
                 business_entity_id=entity,
                 policy_version=DOSSIER_POLICY_VERSION,
                 facts_as_of=facts_as_of,
-                computed_at=stored_computed_at,
+                computed_at=existing_computed_at,
                 analysis_ready=analysis_ready,
                 blocking_mandatory_domains=blocking,
                 domains=tuple(domains),
@@ -905,7 +900,6 @@ def persist_dossier_assessment(
             "INSERT INTO dossier_assessment_seals(assessment_id,sealed_at) VALUES (?,?)",
             (assessment_id, computed_at),
         )
-
         violations = list(conn.execute("PRAGMA foreign_key_check"))
         if violations:
             raise DossierAssessmentError(
