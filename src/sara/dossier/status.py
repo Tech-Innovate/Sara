@@ -74,7 +74,7 @@ def persisted_assessment(conn: sqlite3.Connection, entity_id: str) -> dict[str, 
 
     result["domains"] = domains
     result["integrity_issues"] = integrity_issues
-    result["snapshot_semantics"] = "immutable_historical_assessment_not_recomputed_by_phase5"
+    result["snapshot_semantics"] = "immutable_historical_assessment_not_recomputed_by_dossier_reader"
     return result
 
 
@@ -82,7 +82,10 @@ def preview_domains(
     facts: list[dict[str, Any]],
     unknowns: list[dict[str, Any]],
     integrity_issues: list[dict[str, Any]],
+    *,
+    customer_voice: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    customer_voice = customer_voice or []
     result: list[dict[str, Any]] = []
     for seed in DOSSIER_DOMAIN_SEED_V1:
         domain_facts = [fact for fact in facts if fact["domain"] == seed.name]
@@ -95,13 +98,13 @@ def preview_domains(
         ]
 
         if seed.name == "provenance":
-            if not facts:
-                state, reasons = "not_started", ["no_current_facts_to_trace"]
+            if not facts and not customer_voice:
+                state, reasons = "not_started", ["no_current_facts_or_customer_voice_to_trace"]
             elif integrity_issues:
-                state, reasons = "insufficient", ["current_fact_provenance_has_integrity_issues"]
+                state, reasons = "insufficient", ["current_provenance_has_integrity_issues"]
             else:
                 state, reasons = "partial", [
-                    "current_fact_provenance_is_traceable_but_preview_never_claims_sufficiency"
+                    "current_provenance_is_traceable_but_preview_never_claims_sufficiency"
                 ]
         elif seed.name == "unknowns":
             state = "partial"
@@ -109,6 +112,10 @@ def preview_domains(
                 "controlled_unresolved_items_are_enumerated"
                 if unknowns
                 else "no_controlled_unresolved_items_detected_but_preview_never_claims_sufficiency"
+            ]
+        elif seed.name == "reputation" and customer_voice and not domain_facts:
+            state, reasons = "partial", [
+                "customer_review_evidence_exists_but_preview_never_claims_sufficiency"
             ]
         elif not domain_facts:
             state, reasons = "not_started", ["no_current_facts_in_domain"]
@@ -124,7 +131,7 @@ def preview_domains(
             state, reasons = "insufficient", ["domain_has_only_null_semantic_fact_states"]
         else:
             state, reasons = "partial", [
-                "some_current_evidence_exists_but_phase5_preview_does_not_promote_sufficiency"
+                "some_current_evidence_exists_but_read_only_preview_does_not_promote_sufficiency"
             ]
 
         result.append(
