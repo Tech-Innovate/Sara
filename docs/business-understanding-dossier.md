@@ -38,11 +38,11 @@ Controlled predicates whose reconciliation policy is `evidence_only` are intenti
 
 ### Customer voice
 
-`customer_voice.reviews` projects the normalized review observation and bounded provenance needed to inspect the customer statement. It does **not** expose the review evidence item's raw `metadata_json`, because retained raw review metadata may contain reviewer display/profile identifiers that are not required for the dossier read model.
+`customer_voice.reviews` projects only the normalized review observation and bounded provenance needed to inspect the customer statement. It does **not** expose the observation's asserted `value_json` or the review evidence item's raw `metadata_json`: either retained representation may contain reviewer display/profile identifiers that are not required for the dossier read model. The normalized projection is hash-validated before it crosses this boundary.
 
 Review observations remain attached to their immutable source-time Location. The read model scopes review lookup to the selected entity's already-resolved Location lineage before decoding review state, then requires each source Location to resolve to a selected current Location. Unrelated businesses' review records therefore cannot contaminate a single-entity dossier.
 
-Before a review is promoted into `customer_voice`, the projection also requires usable evidence, a usable acquisition lifecycle, source/session consistency, the expected customer-generated evidence role, object-shaped review values, and a `value_hash` that matches the canonical normalized review payload. Structurally reachable but invalid review state is surfaced as an integrity issue instead of being counted as customer voice.
+Before a review is promoted into `customer_voice`, the projection also requires usable evidence, a usable acquisition lifecycle, source/session consistency, the expected customer-generated evidence role, an object-shaped normalized review value, and a `value_hash` that matches the canonical normalized review payload. Structurally reachable but invalid review state is surfaced as an integrity issue instead of being counted as customer voice.
 
 Customer statements remain customer evidence. The dossier does not turn review text, rating, or owner response into an operational Fact about the business.
 
@@ -62,7 +62,7 @@ The surface preserves Sara's semantic distinctions:
 - `single_source` is checked against exactly one distinct usable supporting source; multiple observations from that same source still count as one source;
 - a controlled Fact-eligible predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
 
-Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, missing absence provenance, and customer-review provenance/value-integrity problems rather than silently hiding them.
+Evidence observations include their asserted and normalized values so disagreements in current Fact provenance can be inspected rather than inferred from support-edge IDs alone. Customer voice is a narrower privacy-bounded projection and exposes only its normalized review value. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, missing absence provenance, and customer-review provenance/value-integrity problems rather than silently hiding them.
 
 ## Persisted dossier assessment
 
@@ -79,7 +79,7 @@ The active policy is `business-understanding-v1`, with derivation implementation
 - immutable parent state in `dossier_assessments`;
 - exactly one row for every controlled dossier domain in `dossier_domain_assessments`;
 - domain state, deterministic reason JSON, fact count, and fresh-fact count;
-- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot;
+- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot, including Location redirect `merged_at` timestamps that affect canonical identity;
 - `computed_at`, the actual policy-evaluation time;
 - `analysis_ready` and the mandatory domains that block it;
 - a deterministic input-signature hash and bounded claim ceiling in `summary_json`;
@@ -91,7 +91,7 @@ The writer holds one `BEGIN IMMEDIATE` transaction across identity resolution, d
 
 The deterministic assessment identity excludes wall-clock time itself. Re-evaluating the same logical input while it remains in the same freshness state reuses the existing sealed snapshot rather than manufacturing duplicate history.
 
-Fact-support provenance is part of that logical input. Appending a new observation-support or acquisition-support edge therefore creates a new assessment identity even when the domain state remains in the same semantic bucket. This prevents a materially changed provenance graph from being silently represented by an older snapshot.
+Fact-support provenance is part of that logical input. Appending a new observation-support or acquisition-support edge therefore creates a new assessment identity even when the domain state remains in the same semantic bucket. Location structural state is also part of the signature: redirects, canonical targets, resolution chains, relationship-to-entity state, and retained external identifiers cannot change underneath an older assessment without changing the logical input identity. This prevents materially changed provenance or identity structure from being silently represented by an older snapshot.
 
 Time still matters semantically. If the same factual input later crosses a freshness threshold, the derived state changes and Sara creates a new immutable assessment even though `facts_as_of` may be unchanged. Older assessments remain sealed historical judgments.
 
@@ -122,7 +122,7 @@ The v1 assessment policy is intentionally conservative:
 - `communication` requires a fresh public phone for every current Location;
 - `digital_presence` requires a fresh official-website fact;
 - `digital_capabilities` requires bounded inspection of online booking, online ordering, and WhatsApp. A current `not_observed` fact counts as inspection only when it has `supports_absence` acquisition provenance; it never becomes confirmed absence;
-- `reputation` requires current platform rating/review-count facts plus retained customer-review evidence retrieved within the policy's 30-day review-collection freshness window before it can become `sufficient`;
+- `reputation` requires current platform rating/review-count facts plus retained customer-review evidence retrieved within the policy's 30-day review-collection freshness window before it can become `sufficient`. If at least one required reputation component remains current while others are missing/expired, the domain is `partial`; when retained platform/customer-voice evidence is wholly expired, the domain becomes `stale` rather than remaining permanently `partial`;
 - `provenance` requires material current facts/customer voice to trace cleanly to retained evidence;
 - `unknowns` evaluates whether controlled Fact-eligible unresolved state is explicitly enumerated rather than invented away.
 
