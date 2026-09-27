@@ -46,10 +46,12 @@ def customer_review_observations(
     remain on their immutable source-time Location and are exposed only when that
     Location still resolves to one of the selected current Locations.
 
-    A structurally reachable review whose evidence/session provenance or value
-    integrity is invalid is reported as an integrity issue but is not promoted
-    into ``customer_voice``. The projection never exposes raw evidence metadata
-    that may contain reviewer profile or display identifiers.
+    A structurally reachable review whose evidence/session provenance or
+    normalized-value integrity is invalid is reported as an integrity issue but
+    is not promoted into ``customer_voice``. The projection exposes only the
+    normalized customer statement and bounded provenance: raw/asserted review
+    payloads and raw evidence metadata may contain reviewer profile or display
+    identifiers and never cross this read-model boundary.
     """
     source_ids = _location_lineage(conn, current_location_ids)
     if not source_ids:
@@ -58,7 +60,7 @@ def customer_review_observations(
     current = set(current_location_ids)
     placeholders = ",".join("?" for _ in source_ids)
     cursor = conn.execute(
-        "SELECT o.id,o.subject_id,o.value_json,o.normalized_value_json,o.value_hash,"
+        "SELECT o.id,o.subject_id,o.normalized_value_json,o.value_hash,"
         "o.observation_kind,o.observed_at,o.extracted_at,o.extraction_method,"
         "o.extractor_name,o.extractor_version,o.confidence,"
         "e.id AS evidence_id,e.source_id,e.source_locator,e.source_role,"
@@ -176,14 +178,11 @@ def customer_review_observations(
         if not provenance_valid:
             continue
 
-        value = json_value(
-            item["value_json"], field=f"review observation {observation_id} value_json"
-        )
         normalized = json_value(
             item["normalized_value_json"],
             field=f"review observation {observation_id} normalized_value_json",
         )
-        if not isinstance(value, dict) or not isinstance(normalized, dict):
+        if not isinstance(normalized, dict):
             issues.append(
                 {
                     "code": "customer_review_value_not_object",
@@ -209,7 +208,6 @@ def customer_review_observations(
                 "source_location_id": source_subject_id,
                 "canonical_location_id": canonical_location_id,
                 "location_resolution_chain": list(resolved["chain"]),
-                "value": value,
                 "normalized_value": normalized,
                 "value_hash": item["value_hash"],
                 "observation_kind": item["observation_kind"],
