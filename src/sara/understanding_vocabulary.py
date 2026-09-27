@@ -310,23 +310,31 @@ def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
         )
 
 
+def _read_predicate(conn: sqlite3.Connection, seed: PredicateSeed) -> tuple[object, ...] | None:
+    row = conn.execute(
+        "SELECT domain, subject_kind, value_type, cardinality, "
+        "reconciliation_policy, freshness_days, description, active "
+        "FROM predicate_definitions WHERE name = ?",
+        (seed.name,),
+    ).fetchone()
+    return None if row is None else tuple(row)
+
+
 def _verify_predicates(
     conn: sqlite3.Connection,
     seeds: tuple[PredicateSeed, ...],
+    *,
+    required: bool,
 ) -> None:
     _require_exact_phase_one_history(conn)
     for seed in seeds:
-        row = conn.execute(
-            "SELECT domain, subject_kind, value_type, cardinality, "
-            "reconciliation_policy, freshness_days, description, active "
-            "FROM predicate_definitions WHERE name = ?",
-            (seed.name,),
-        ).fetchone()
-        if row is None:
-            raise VocabularySeedError(
-                f"controlled predicate {seed.name!r} is not installed; run vocabulary seeding first"
-            )
-        actual = tuple(row)
+        actual = _read_predicate(conn, seed)
+        if actual is None:
+            if required:
+                raise VocabularySeedError(
+                    f"controlled predicate {seed.name!r} is not installed; run vocabulary seeding first"
+                )
+            continue
         expected = _predicate_values(seed)
         if actual != expected:
             raise VocabularySeedError(
@@ -336,18 +344,20 @@ def _verify_predicates(
 
 
 def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
-    """Verify the foundational vocabulary required by existing readers/writers.
+    """Verify the shipped foundation and any installed additive vocabulary.
 
     Additive feature predicates do not become a deployment-order prerequisite
-    for already-shipped read-only surfaces such as ``sara-dossier``. They have
-    feature-specific verification gates instead.
+    for already-shipped readers such as ``sara-dossier``. If an additive
+    predicate is present, however, its semantics must still match this build;
+    optional does not mean unverified.
     """
-    _verify_predicates(conn, FOUNDATION_PREDICATE_SEEDS)
+    _verify_predicates(conn, FOUNDATION_PREDICATE_SEEDS, required=True)
+    _verify_predicates(conn, PREDICATE_SEED_REVIEW_INTELLIGENCE, required=False)
 
 
 def verify_review_intelligence_vocabulary(conn: sqlite3.Connection) -> None:
-    """Verify the foundation plus the Review Intelligence evidence predicate."""
-    _verify_predicates(conn, PREDICATE_SEEDS)
+    """Verify the foundation plus the required Review Intelligence predicate."""
+    _verify_predicates(conn, PREDICATE_SEEDS, required=True)
 
 
 def seed_business_understanding_vocabulary(
@@ -379,14 +389,9 @@ def seed_business_understanding_vocabulary(
     try:
         conn.execute("BEGIN IMMEDIATE")
         for seed in PREDICATE_SEEDS:
-            row = conn.execute(
-                "SELECT domain, subject_kind, value_type, cardinality, "
-                "reconciliation_policy, freshness_days, description, active "
-                "FROM predicate_definitions WHERE name = ?",
-                (seed.name,),
-            ).fetchone()
+            actual = _read_predicate(conn, seed)
             expected = _predicate_values(seed)
-            if row is None:
+            if actual is None:
                 conn.execute(
                     "INSERT INTO predicate_definitions("
                     "name, domain, subject_kind, value_type, cardinality, "
@@ -396,7 +401,6 @@ def seed_business_understanding_vocabulary(
                 )
                 inserted.append(seed.name)
                 continue
-            actual = tuple(row)
             if actual != expected:
                 raise VocabularySeedError(
                     f"predicate seed drift for {seed.name!r}: "
