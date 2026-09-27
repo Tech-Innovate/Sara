@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -163,6 +164,76 @@ def test_corrupted_review_value_hash_is_not_promoted_to_customer_voice(tmp_path:
         and issue["observation_id"] == observation_id
         for issue in dossier["integrity_issues"]
     )
+    conn.close()
+
+
+def test_asserted_review_payload_never_crosses_customer_voice_privacy_boundary(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "review-privacy.sqlite", with_review=True)
+    extracted = extract_retained_reviews(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-27T12:00:00+00:00",
+    )
+    assert extracted.observations_created == 1
+    observation_id = conn.execute(
+        "SELECT id FROM observations WHERE predicate='reputation.customer_review'"
+    ).fetchone()[0]
+
+    # The schema permits asserted and normalized observation payloads to differ.
+    # Simulate a producer retaining reviewer-facing fields in the asserted value
+    # while keeping the normalized projection sanitized and hash-valid.
+    asserted = json.dumps(
+        {
+            "review_id": "review-integrity-1",
+            "text_original": "Good service",
+            "Name": "Sensitive Reviewer Display Name",
+            "ProfilePicture": "https://profiles.example/sensitive.jpg",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    conn.execute("DROP TRIGGER observations_immutable")
+    conn.execute(
+        "UPDATE observations SET value_json=? WHERE id=?",
+        (asserted, observation_id),
+    )
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn,
+        business_id=1,
+        evaluated_at="2026-09-28T10:00:00+00:00",
+    )
+    assert dossier["customer_voice"]["review_count"] == 1
+    review = dossier["customer_voice"]["reviews"][0]
+    assert "value" not in review
+    assert review["normalized_value"]["review_id"] == "review-integrity-1"
+    serialized = json.dumps(dossier["customer_voice"], sort_keys=True)
+    assert "Sensitive Reviewer Display Name" not in serialized
+    assert "profiles.example" not in serialized
+    conn.close()
+
+
+def test_wholly_expired_reputation_evidence_is_stale(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "reputation-stale.sqlite", with_review=True)
+    extracted = extract_retained_reviews(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-27T12:00:00+00:00",
+    )
+    assert extracted.observations_created == 1
+
+    assessment = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-11-30T10:00:00+00:00",
+    )
+    reputation = next(item for item in assessment.domains if item["domain"] == "reputation")
+    assert reputation["state"] == "stale"
+    assert reputation["reason"]["code"] == "reputation_evidence_stale"
+    assert reputation["reason"]["expired_review_observation_count"] == 1
     conn.close()
 
 
