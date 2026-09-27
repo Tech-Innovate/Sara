@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from ..reviews.model import REVIEW_PREDICATE
+from ..reviews.model import REVIEW_PREDICATE, canonical_json, sha256_text
 from .core import DossierQueryError, json_value, resolve_subject, row_dict
 
 
@@ -46,10 +46,10 @@ def customer_review_observations(
     remain on their immutable source-time Location and are exposed only when that
     Location still resolves to one of the selected current Locations.
 
-    A structurally reachable review whose evidence/session provenance is invalid
-    is reported as an integrity issue but is not promoted into ``customer_voice``.
-    The projection never exposes raw evidence metadata that may contain reviewer
-    profile or display identifiers.
+    A structurally reachable review whose evidence/session provenance or value
+    integrity is invalid is reported as an integrity issue but is not promoted
+    into ``customer_voice``. The projection never exposes raw evidence metadata
+    that may contain reviewer profile or display identifiers.
     """
     source_ids = _location_lineage(conn, current_location_ids)
     if not source_ids:
@@ -187,6 +187,16 @@ def customer_review_observations(
             issues.append(
                 {
                     "code": "customer_review_value_not_object",
+                    "observation_id": observation_id,
+                    "evidence_id": evidence_id,
+                }
+            )
+            continue
+        expected_value_hash = sha256_text(canonical_json(normalized))
+        if item["value_hash"] != expected_value_hash:
+            issues.append(
+                {
+                    "code": "customer_review_value_hash_mismatch",
                     "observation_id": observation_id,
                     "evidence_id": evidence_id,
                 }
