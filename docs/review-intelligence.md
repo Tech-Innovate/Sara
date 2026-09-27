@@ -34,6 +34,10 @@ reputation.customer_review
 
 It is a `location` / `json` / `multi` predicate with reconciliation policy `evidence_only`.
 
+The predicate is an additive vocabulary extension. Existing Business Understanding readers continue to require the already-deployed foundational vocabulary, so a database does not become unreadable merely because the Review Intelligence predicate has not yet been seeded. If the review predicate is present, existing readers still validate its definition and fail closed on semantic drift. Review extraction itself requires the extension and the `sara-reviews` CLI explicitly seeds/verifies it before writing review state.
+
+Because `evidence_only` predicates are not supposed to produce current Facts, the Phase-5 dossier's controlled-unknown enumeration excludes them. `reputation.customer_review` is therefore not reported as a permanently unresolved factual attribute simply because no Fact row exists. The Phase-5 dossier also does not yet project review observations into its customer-voice output; a review-specific inspection/read model remains a separate slice.
+
 For each retained review evidence record Sara preserves:
 
 - source review identity when supplied by Google Maps;
@@ -100,6 +104,7 @@ This foundation does **not** implement:
 - service recommendations;
 - review-driven operational Facts;
 - broad Business Entity aggregation across locations;
-- dossier sufficiency promotion.
+- dossier sufficiency promotion;
+- a user-facing customer-voice projection of review observations.
 
 A future bounded review-acquisition slice can request additional review evidence only after its own acquisition, completion, throttling, provenance, and operational-validation contract is reviewed. This foundation establishes the evidence semantics that such a collector must write into.
