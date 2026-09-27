@@ -161,6 +161,39 @@ def test_fact_created_at_changes_deterministic_signature_below_stable_watermark(
     conn.close()
 
 
+def test_reconciled_at_changes_chronology_signature_below_stable_watermark(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "reconciled-at-signature.sqlite")
+    stable_later_watermark = "2026-09-29T00:00:00+00:00"
+    _pin_later_identifier_watermark(conn, stable_later_watermark)
+
+    first = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-30T10:00:00+00:00",
+    )
+    assert first.facts_as_of == stable_later_watermark
+
+    fact_id = _name_fact_id(conn)
+    conn.execute("DROP TRIGGER facts_version_immutable")
+    conn.execute(
+        "UPDATE facts SET reconciled_at='2026-09-28T14:00:00+00:00' WHERE id=?",
+        (fact_id,),
+    )
+    conn.commit()
+
+    second = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-30T10:00:00+00:00",
+    )
+    assert second.facts_as_of == first.facts_as_of
+    assert second.assessment_id != first.assessment_id
+    assert second.already_assessed is False
+    conn.close()
+
+
 def test_review_observed_after_extraction_is_reported_and_excluded(tmp_path: Path) -> None:
     conn = _prepared(tmp_path / "review-observed-after-extraction.sqlite", with_review=True)
     observation_id, evidence_id = _review_ids(conn)
