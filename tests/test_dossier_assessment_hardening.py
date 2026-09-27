@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from sara.dossier import build_business_dossier, persist_dossier_assessment
 from sara.maps_backfill import (
@@ -38,6 +39,11 @@ def _prepared(path: Path):
     )
     conn.commit()
     return conn
+
+
+def _backfill(conn):
+    with patch("sara.maps_backfill._utc_now", return_value="2026-09-26T10:00:00+00:00"):
+        return backfill_maps_business_understanding(conn)
 
 
 def _record(identity: str, *, latitude: float, with_review: bool) -> dict:
@@ -82,7 +88,7 @@ def test_customer_voice_survives_cross_owner_location_convergence(tmp_path: Path
         ],
         finalize_run=("complete", 0, None),
     )
-    backfill_maps_business_understanding(conn)
+    _backfill(conn)
     business_a, business_b = [
         int(row[0]) for row in conn.execute("SELECT id FROM businesses ORDER BY id")
     ]
@@ -138,7 +144,7 @@ def test_unattempted_capability_domain_is_not_started_not_insufficient(tmp_path:
         [_record("a", latitude=21.55, with_review=False)],
         finalize_run=("complete", 0, None),
     )
-    backfill_maps_business_understanding(conn)
+    _backfill(conn)
 
     result = persist_dossier_assessment(
         conn,
