@@ -102,6 +102,18 @@ def _fact_evidence_session(conn) -> str:
     return str(row[0])
 
 
+def _fact_evidence_id(conn) -> str:
+    row = conn.execute(
+        "SELECT DISTINCT e.id FROM facts f "
+        "JOIN fact_observation_support fos ON fos.fact_id=f.id "
+        "JOIN observations o ON o.id=fos.observation_id "
+        "JOIN evidence_items e ON e.id=o.evidence_id "
+        "WHERE f.predicate='business.name.trading' AND f.valid_to IS NULL"
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
 def test_malformed_review_acquisition_timestamp_is_localized_and_excluded(
     tmp_path: Path,
 ) -> None:
@@ -415,6 +427,131 @@ def test_maps_linked_at_changes_signature_below_stable_watermark(tmp_path: Path)
     conn.execute(
         "UPDATE maps_business_location_links "
         "SET linked_at='2026-09-28T12:00:00+00:00' WHERE business_id=1"
+    )
+    conn.commit()
+
+    second = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-30T10:00:00+00:00",
+    )
+    assert second.facts_as_of == first.facts_as_of
+    assert second.assessment_id != first.assessment_id
+    assert second.already_assessed is False
+    conn.close()
+
+
+def test_understanding_entity_subject_created_at_participates_in_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "subject-entity-created-future.sqlite")
+    entity_id = str(conn.execute("SELECT id FROM business_entities").fetchone()[0])
+    conn.execute(
+        "UPDATE knowledge_subjects SET created_at='2026-09-30T13:00:00+00:00' WHERE id=?",
+        (entity_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_understanding_location_subject_updated_at_participates_in_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "subject-location-updated-future.sqlite")
+    location_id = location_id_for_maps_business(1)
+    conn.execute(
+        "UPDATE knowledge_subjects SET updated_at='2026-09-30T13:00:00+00:00' WHERE id=?",
+        (location_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_fact_evidence_published_at_participates_in_chronology(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "evidence-published-future.sqlite")
+    evidence_id = _fact_evidence_id(conn)
+    conn.execute("DROP TRIGGER evidence_items_immutable")
+    conn.execute(
+        "UPDATE evidence_items SET published_at='2026-09-30T13:00:00+00:00' WHERE id=?",
+        (evidence_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_review_evidence_published_at_participates_in_chronology(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "review-published-future.sqlite", with_review=True)
+    _observation_id, evidence_id, _session_id = _review_ids(conn)
+    conn.execute("DROP TRIGGER evidence_items_immutable")
+    conn.execute(
+        "UPDATE evidence_items SET published_at='2026-09-30T13:00:00+00:00' WHERE id=?",
+        (evidence_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_evidence_published_at_changes_signature_below_stable_watermark(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "evidence-published-signature.sqlite")
+    location_id = location_id_for_maps_business(1)
+    evidence_id = _fact_evidence_id(conn)
+    stable_later_watermark = "2026-09-29T00:00:00+00:00"
+    conn.execute(
+        "UPDATE external_identifiers SET last_observed_at=? "
+        "WHERE subject_id=? AND namespace='place_id' AND status='active'",
+        (stable_later_watermark, location_id),
+    )
+    conn.commit()
+
+    first = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-30T10:00:00+00:00",
+    )
+    assert first.facts_as_of == stable_later_watermark
+
+    conn.execute("DROP TRIGGER evidence_items_immutable")
+    conn.execute(
+        "UPDATE evidence_items SET published_at='2026-09-28T12:00:00+00:00' WHERE id=?",
+        (evidence_id,),
     )
     conn.commit()
 
