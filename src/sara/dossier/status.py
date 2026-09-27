@@ -136,7 +136,11 @@ def preview_domains(
         elif seed.name == "reputation":
             if not domain_facts and not customer_voice:
                 state, reasons = "not_started", ["no_current_reputation_or_customer_voice_evidence"]
-            elif all(fact["status"] == "not_applicable" for fact in domain_facts) and not domain_unknowns:
+            elif (
+                domain_facts
+                and all(fact["status"] == "not_applicable" for fact in domain_facts)
+                and not domain_unknowns
+            ):
                 state, reasons = "not_applicable", ["all_current_domain_facts_are_not_applicable"]
             elif any(fact["status"] == "conflicted" for fact in domain_facts):
                 state, reasons = "conflicted", ["one_or_more_current_facts_are_conflicted"]
