@@ -222,8 +222,9 @@ def entity_record(conn: sqlite3.Connection, entity_id: str) -> dict[str, Any]:
 
 def identifier_rows(conn: sqlite3.Connection, location_id: str) -> list[dict[str, Any]]:
     cursor = conn.execute(
-        "SELECT ei.id,ei.source_id,ei.namespace,ei.value,ei.status,ei.first_observed_at,"
-        "ei.last_observed_at,ei.created_at,s.source_type,s.name AS source_name "
+        "SELECT ei.id,ei.source_id,ei.namespace,ei.value,ei.status,ei.status_changed_at,"
+        "ei.first_observed_at,ei.last_observed_at,ei.created_at,"
+        "s.source_type,s.name AS source_name "
         "FROM external_identifiers ei JOIN sources s ON s.id=ei.source_id "
         "WHERE ei.subject_id=? ORDER BY ei.source_id,ei.namespace,ei.value,ei.id",
         (location_id,),
