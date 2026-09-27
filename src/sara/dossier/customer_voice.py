@@ -68,7 +68,9 @@ def customer_review_observations(
         "e.media_type,e.content_sha256,e.artifact_ref,e.acquisition_session_id,"
         "a.target_subject_id AS acquisition_target_subject_id,"
         "a.source_id AS acquisition_source_id,a.collector_name,a.collector_version,"
-        "a.status AS acquisition_status,s.source_type,s.name AS source_name,s.base_url "
+        "a.status AS acquisition_status,a.started_at AS acquisition_started_at,"
+        "a.finished_at AS acquisition_finished_at,"
+        "s.source_type,s.name AS source_name,s.base_url "
         "FROM observations o "
         "LEFT JOIN evidence_items e ON e.id=o.evidence_id "
         "LEFT JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
@@ -276,6 +278,8 @@ def customer_review_observations(
                     "collector_name": item["collector_name"],
                     "collector_version": item["collector_version"],
                     "acquisition_status": item["acquisition_status"],
+                    "acquisition_started_at": item["acquisition_started_at"],
+                    "acquisition_finished_at": item["acquisition_finished_at"],
                 },
             }
         )
