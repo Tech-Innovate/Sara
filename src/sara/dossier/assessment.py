@@ -107,17 +107,22 @@ def _location_owner_resolution_state(
     return sorted(result, key=lambda item: str(item["location_id"]))
 
 
-def _input_watermark(
+def _chronology_inputs(
     dossier: dict[str, Any],
     location_owner_resolution: list[dict[str, Any]],
-) -> str:
-    """Return the latest timestamped input represented by the dossier snapshot."""
-    candidates: list[datetime] = []
+) -> list[dict[str, object]]:
+    """Return every timestamped logical input used to derive ``facts_as_of``.
+
+    The returned representation is also sealed into deterministic assessment
+    identity so a timestamp can never change beneath a later stable maximum and
+    silently reuse an older assessment.
+    """
+    inputs: list[dict[str, object]] = []
 
     def add(value: object, field: str) -> None:
         if value in (None, ""):
             return
-        candidates.append(parse_timestamp(value, field=field))
+        inputs.append({"field": field, "value": value})
 
     entity = dossier["business_entity"]
     add(entity.get("updated_at"), "business entity updated_at")
@@ -205,10 +210,25 @@ def _input_watermark(
             evidence.get("acquisition_finished_at"),
             f"review evidence {evidence_id} acquisition {session_id} finished_at",
         )
-    if not candidates:
+    return sorted(
+        inputs,
+        key=lambda item: (str(item["field"]), str(item["value"])),
+    )
+
+
+def _input_watermark(
+    dossier: dict[str, Any],
+    location_owner_resolution: list[dict[str, Any]],
+) -> str:
+    """Return the latest timestamped input represented by the dossier snapshot."""
+    chronology = _chronology_inputs(dossier, location_owner_resolution)
+    if not chronology:
         raise DossierAssessmentError(
             "dossier has no timestamped state from which to derive facts_as_of"
         )
+    candidates = [
+        parse_timestamp(item["value"], field=str(item["field"])) for item in chronology
+    ]
     return max(candidates).astimezone(timezone.utc).isoformat()
 
 
@@ -301,6 +321,7 @@ def _input_signature(
 ) -> dict[str, Any]:
     """Capture all state that can change or materially support the v1 assessment."""
     return {
+        "chronology_inputs": _chronology_inputs(dossier, location_owner_resolution),
         "location_owner_resolution": location_owner_resolution,
         "locations": [_location_signature(location) for location in dossier["locations"]],
         "facts": [
