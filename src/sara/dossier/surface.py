@@ -118,7 +118,7 @@ def build_business_dossier(
                     facts,
                     unknowns,
                     integrity_issues,
-                    customer_voice=customer_voice,
+                    customer_voice,
                 ),
             },
         },
