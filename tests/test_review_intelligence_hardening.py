@@ -5,9 +5,14 @@ from pathlib import Path
 import pytest
 
 import sara.reviews.core as review_core
-from sara.maps_backfill import backfill_maps_business_understanding, location_id_for_maps_business
+from sara.maps_backfill import (
+    backfill_maps_business_understanding,
+    business_entity_id_for_maps_business,
+    location_id_for_maps_business,
+)
 from sara.migrations import apply_migrations
 from sara.reviews import ReviewIntelligenceError, extract_retained_reviews
+from sara.reviews.model import REVIEW_PREDICATE
 from sara.storage import connect as storage_connect, ingest_records
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 
@@ -105,6 +110,80 @@ def test_parent_maps_evidence_must_resolve_to_selected_current_location(tmp_path
         "SELECT COUNT(*) FROM acquisition_sessions WHERE collector_name=?",
         (review_core.COLLECTOR_NAME,),
     ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_review_session_and_observation_stay_on_source_subject_after_location_convergence(
+    tmp_path: Path,
+) -> None:
+    conn = prepared_conn(tmp_path / "merge-stability.sqlite")
+    business_a, business_b = ingest_businesses(
+        conn,
+        [record("a", latitude=21.55), record("b", latitude=21.56)],
+    )
+    source_location = location_id_for_maps_business(business_a)
+    source_entity = business_entity_id_for_maps_business(business_a)
+    target_location = location_id_for_maps_business(business_b)
+    target_entity = business_entity_id_for_maps_business(business_b)
+
+    first = extract_retained_reviews(
+        conn,
+        business_id=business_a,
+        now=lambda: "2026-09-27T08:00:00+00:00",
+    )
+    assert first.source_location_id == source_location
+    assert first.canonical_location_id == source_location
+    assert first.source_business_entity_id == source_entity
+    assert first.business_entity_id == source_entity
+
+    # Model the post-acquisition Understanding state after the second Maps row
+    # has converged away: its Maps row/link disappears, the surviving Maps row
+    # now points to the chosen target Location, and the original Location is a
+    # durable historical alias. Location ownership itself remains immutable.
+    conn.execute("DELETE FROM businesses WHERE id=?", (business_b,))
+    conn.execute(
+        "UPDATE maps_business_location_links SET location_id=? WHERE business_id=?",
+        (target_location, business_a),
+    )
+    merged_at = "2026-09-27T08:30:00+00:00"
+    conn.execute(
+        "UPDATE knowledge_subjects SET record_state='merged',merged_into_subject_id=?,"
+        "merged_at=?,updated_at=? WHERE id=?",
+        (target_location, merged_at, merged_at, source_location),
+    )
+    conn.commit()
+
+    counts_before = tuple(
+        int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in ("acquisition_sessions", "evidence_items", "observations")
+    )
+    second = extract_retained_reviews(
+        conn,
+        business_id=business_a,
+        now=lambda: "2026-09-27T09:00:00+00:00",
+    )
+
+    assert second.session_id == first.session_id
+    assert second.already_extracted is True
+    assert second.source_location_id == source_location
+    assert second.canonical_location_id == target_location
+    assert second.source_business_entity_id == source_entity
+    assert second.business_entity_id == target_entity
+    assert tuple(
+        int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in ("acquisition_sessions", "evidence_items", "observations")
+    ) == counts_before
+    assert conn.execute(
+        "SELECT target_subject_id FROM acquisition_sessions WHERE id=?",
+        (first.session_id,),
+    ).fetchone()[0] == source_location
+    assert {
+        row[0]
+        for row in conn.execute(
+            "SELECT subject_id FROM observations WHERE predicate=?",
+            (REVIEW_PREDICATE,),
+        )
+    } == {source_location}
     conn.close()
 
 
