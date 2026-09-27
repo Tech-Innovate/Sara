@@ -238,7 +238,7 @@ def customer_review_observations(
                 )
         if item["observed_at"] is not None:
             try:
-                parse_timestamp(
+                parsed_timestamps["observed_at"] = parse_timestamp(
                     item["observed_at"],
                     field=f"review observation {observation_id} observed_at",
                 )
@@ -266,6 +266,20 @@ def customer_review_observations(
                     "acquisition_session_id": item["acquisition_session_id"],
                     "acquisition_started_at": item["acquisition_started_at"],
                     "acquisition_finished_at": item["acquisition_finished_at"],
+                }
+            )
+            continue
+        if (
+            "observed_at" in parsed_timestamps
+            and parsed_timestamps["observed_at"] > parsed_timestamps["extracted_at"]
+        ):
+            issues.append(
+                {
+                    "code": "customer_review_observation_chronology_invalid",
+                    "observation_id": observation_id,
+                    "evidence_id": evidence_id,
+                    "observed_at": item["observed_at"],
+                    "extracted_at": item["extracted_at"],
                 }
             )
             continue
