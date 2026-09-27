@@ -56,12 +56,13 @@ def _location_owner_resolution_state(
     conn: sqlite3.Connection,
     dossier: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Seal the Entity redirect state that admits each dossier Location.
+    """Seal Entity redirects that admit Locations through immutable ownership.
 
     ``business_locations.business_entity_id`` is immutable source-time ownership.
-    A Location can enter the selected dossier only because that owner currently
-    resolves to the selected canonical Entity. Those redirect nodes are therefore
-    structural assessment inputs, not incidental lookup state.
+    Some dossier rows are inbound Location aliases whose original owner does not
+    resolve to the selected Entity; those rows are admitted by the Location
+    redirect path instead, whose lifecycle is sealed separately. Only owner
+    chains that actually resolve to the selected Entity participate here.
     """
     canonical_entity_id = str(dossier["business_entity"]["id"])
     result: list[dict[str, Any]] = []
@@ -70,8 +71,16 @@ def _location_owner_resolution_state(
         owner_entity_id = str(location["business_entity_id"])
         try:
             resolved = resolve_subject(conn, owner_entity_id, "business_entity")
-            canonical_owner_id = str(resolved["canonical"]["id"])
-            chain = []
+        except DossierQueryError as exc:
+            raise DossierAssessmentError(
+                f"cannot resolve owner Entity for dossier location {location_id}: {exc}"
+            ) from exc
+        canonical_owner_id = str(resolved["canonical"]["id"])
+        if canonical_owner_id != canonical_entity_id:
+            continue
+
+        chain: list[dict[str, Any]] = []
+        try:
             for owner_subject_id in resolved["chain"]:
                 row = subject(conn, str(owner_subject_id), "business_entity")
                 chain.append(
@@ -85,13 +94,8 @@ def _location_owner_resolution_state(
                 )
         except DossierQueryError as exc:
             raise DossierAssessmentError(
-                f"cannot resolve owner Entity for dossier location {location_id}: {exc}"
+                f"cannot read owner Entity redirect state for dossier location {location_id}: {exc}"
             ) from exc
-        if canonical_owner_id != canonical_entity_id:
-            raise DossierAssessmentError(
-                f"dossier location {location_id} owner resolves to {canonical_owner_id!r}, "
-                f"expected selected Entity {canonical_entity_id!r}"
-            )
         result.append(
             {
                 "location_id": location_id,
