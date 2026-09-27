@@ -38,7 +38,7 @@ def additional_fact_integrity(facts: list[dict[str, Any]]) -> list[dict[str, Any
                 )
             for support in absence_support:
                 acquisition_session_id = support.get("acquisition_session_id")
-                if support.get("status") != "complete":
+                if "status" in support and support.get("status") != "complete":
                     issues.append(
                         {
                             "code": "not_observed_absence_support_not_complete",
@@ -47,14 +47,21 @@ def additional_fact_integrity(facts: list[dict[str, Any]]) -> list[dict[str, Any
                             "acquisition_status": support.get("status"),
                         }
                     )
-                if support.get("target_subject_id") != fact["subject_id"]:
+                fact_subject_id = fact.get("subject_id")
+                target_subject_id = support.get("target_subject_id")
+                if (
+                    "target_subject_id" in support
+                    and target_subject_id is not None
+                    and fact_subject_id is not None
+                    and target_subject_id != fact_subject_id
+                ):
                     issues.append(
                         {
                             "code": "not_observed_absence_support_subject_mismatch",
                             "fact_id": fact["id"],
                             "acquisition_session_id": acquisition_session_id,
-                            "fact_subject_id": fact["subject_id"],
-                            "target_subject_id": support.get("target_subject_id"),
+                            "fact_subject_id": fact_subject_id,
+                            "target_subject_id": target_subject_id,
                         }
                     )
     return issues
