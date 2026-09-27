@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from ..understanding_vocabulary import DOSSIER_DOMAIN_SEED_V1, DOSSIER_POLICY_VERSION
 from .assessment_policy import DERIVATION_VERSION, derive_domain_assessments
-from .core import DossierQueryError, parse_timestamp
+from .core import DossierQueryError, parse_timestamp, resolve_subject, subject
 from .surface import build_business_dossier
 
 
@@ -52,7 +52,61 @@ def _validated_timestamp(value: object, *, field: str) -> str:
         raise DossierAssessmentError(str(exc)) from exc
 
 
-def _input_watermark(dossier: dict[str, Any]) -> str:
+def _location_owner_resolution_state(
+    conn: sqlite3.Connection,
+    dossier: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Seal the Entity redirect state that admits each dossier Location.
+
+    ``business_locations.business_entity_id`` is immutable source-time ownership.
+    A Location can enter the selected dossier only because that owner currently
+    resolves to the selected canonical Entity. Those redirect nodes are therefore
+    structural assessment inputs, not incidental lookup state.
+    """
+    canonical_entity_id = str(dossier["business_entity"]["id"])
+    result: list[dict[str, Any]] = []
+    for location in dossier["locations"]:
+        location_id = str(location["id"])
+        owner_entity_id = str(location["business_entity_id"])
+        try:
+            resolved = resolve_subject(conn, owner_entity_id, "business_entity")
+            canonical_owner_id = str(resolved["canonical"]["id"])
+            chain = []
+            for owner_subject_id in resolved["chain"]:
+                row = subject(conn, str(owner_subject_id), "business_entity")
+                chain.append(
+                    {
+                        "id": str(row["id"]),
+                        "record_state": row["record_state"],
+                        "merged_into_subject_id": row["merged_into_subject_id"],
+                        "updated_at": row["updated_at"],
+                        "merged_at": row["merged_at"],
+                    }
+                )
+        except DossierQueryError as exc:
+            raise DossierAssessmentError(
+                f"cannot resolve owner Entity for dossier location {location_id}: {exc}"
+            ) from exc
+        if canonical_owner_id != canonical_entity_id:
+            raise DossierAssessmentError(
+                f"dossier location {location_id} owner resolves to {canonical_owner_id!r}, "
+                f"expected selected Entity {canonical_entity_id!r}"
+            )
+        result.append(
+            {
+                "location_id": location_id,
+                "owner_business_entity_id": owner_entity_id,
+                "canonical_business_entity_id": canonical_owner_id,
+                "resolution_chain": chain,
+            }
+        )
+    return sorted(result, key=lambda item: str(item["location_id"]))
+
+
+def _input_watermark(
+    dossier: dict[str, Any],
+    location_owner_resolution: list[dict[str, Any]],
+) -> str:
     """Return the latest timestamped input represented by the dossier snapshot."""
     candidates: list[datetime] = []
 
@@ -63,6 +117,17 @@ def _input_watermark(dossier: dict[str, Any]) -> str:
 
     entity = dossier["business_entity"]
     add(entity.get("updated_at"), "business entity updated_at")
+    for owner in location_owner_resolution:
+        for node in owner["resolution_chain"]:
+            owner_id = node["id"]
+            add(
+                node.get("updated_at"),
+                f"location {owner['location_id']} owner Entity {owner_id} updated_at",
+            )
+            add(
+                node.get("merged_at"),
+                f"location {owner['location_id']} owner Entity {owner_id} merged_at",
+            )
     for location in dossier["locations"]:
         add(location.get("updated_at"), f"location {location['id']} updated_at")
         add(location.get("merged_at"), f"location {location['id']} merged_at")
@@ -193,10 +258,13 @@ def _location_signature(location: dict[str, Any]) -> dict[str, Any]:
 
 
 def _input_signature(
-    dossier: dict[str, Any], domains: list[dict[str, Any]]
+    dossier: dict[str, Any],
+    domains: list[dict[str, Any]],
+    location_owner_resolution: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Capture all state that can change or materially support the v1 assessment."""
     return {
+        "location_owner_resolution": location_owner_resolution,
         "locations": [_location_signature(location) for location in dossier["locations"]],
         "facts": [
             {
@@ -370,6 +438,7 @@ def persist_dossier_assessment(
             evaluated_at=computed_at,
         )
         entity = str(dossier["business_entity"]["id"])
+        location_owner_resolution = _location_owner_resolution_state(conn, dossier)
         domains = derive_domain_assessments(dossier)
         mandatory = {
             seed.name
@@ -385,7 +454,7 @@ def persist_dossier_assessment(
             )
         )
         analysis_ready = not blocking and not dossier["integrity_issues"]
-        facts_as_of = _input_watermark(dossier)
+        facts_as_of = _input_watermark(dossier, location_owner_resolution)
         if parse_timestamp(facts_as_of, field="facts_as_of") > parse_timestamp(
             computed_at, field="computed_at"
         ):
@@ -393,7 +462,7 @@ def persist_dossier_assessment(
                 "dossier input watermark is later than the assessment clock; refusing impossible chronology"
             )
 
-        signature = _input_signature(dossier, domains)
+        signature = _input_signature(dossier, domains, location_owner_resolution)
         identity_payload = {
             "business_entity_id": entity,
             "policy_version": DOSSIER_POLICY_VERSION,
