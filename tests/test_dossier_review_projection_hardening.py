@@ -119,6 +119,45 @@ def test_malformed_normalized_review_is_reported_and_excluded_without_aborting(
     conn.close()
 
 
+def test_malformed_review_retrieved_at_is_reported_and_excluded_without_aborting(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared_review_business(tmp_path / "malformed-retrieved-at.sqlite")
+    observation_id, evidence_id = conn.execute(
+        "SELECT id,evidence_id FROM observations "
+        "WHERE predicate='reputation.customer_review'"
+    ).fetchone()
+
+    conn.execute("DROP TRIGGER evidence_items_immutable")
+    conn.execute(
+        "UPDATE evidence_items SET retrieved_at='not-a-timestamp' WHERE id=?",
+        (evidence_id,),
+    )
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn,
+        business_id=1,
+        evaluated_at="2026-09-28T10:00:00+00:00",
+    )
+    assert dossier["customer_voice"]["review_count"] == 0
+    assert any(
+        issue["code"] == "customer_review_retrieved_at_invalid"
+        and issue["observation_id"] == observation_id
+        and issue["evidence_id"] == evidence_id
+        for issue in dossier["integrity_issues"]
+    )
+
+    assessment = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-28T10:00:00+00:00",
+    )
+    assert assessment.analysis_ready is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 1
+    conn.close()
+
+
 def _preview_reputation(*, retrieved_at: str, evaluated_at: datetime) -> dict:
     domains = preview_domains(
         facts=[],
@@ -149,6 +188,33 @@ def test_review_only_preview_remains_partial_while_review_collection_is_current(
         retrieved_at="2026-09-01T00:00:00+00:00",
         evaluated_at=datetime(2026, 9, 15, tzinfo=timezone.utc),
     )
+    assert reputation["state"] == "partial"
+    assert reputation["reasons"] == [
+        "current_reputation_evidence_exists_but_preview_never_claims_sufficiency"
+    ]
+
+
+def test_current_review_prevents_reputation_not_applicable_preview() -> None:
+    domains = preview_domains(
+        facts=[
+            {
+                "id": "fact-reputation-not-applicable",
+                "domain": "reputation",
+                "status": "not_applicable",
+                "freshness": {"is_stale": False},
+            }
+        ],
+        unknowns=[],
+        integrity_issues=[],
+        customer_voice=[
+            {
+                "observation_id": "review-preview-current",
+                "evidence": {"retrieved_at": "2026-09-01T00:00:00+00:00"},
+            }
+        ],
+        evaluated_at=datetime(2026, 9, 15, tzinfo=timezone.utc),
+    )
+    reputation = next(item for item in domains if item["domain"] == "reputation")
     assert reputation["state"] == "partial"
     assert reputation["reasons"] == [
         "current_reputation_evidence_exists_but_preview_never_claims_sufficiency"
