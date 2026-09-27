@@ -34,8 +34,8 @@ class DossierDomainSeed:
 
 # Phase 2 installed the first 16 predicates. Phase 3 adds one predicate that
 # the v0.2 Maps-backfill contract explicitly requires for the legacy `status`
-# field. Keep the original tuple immutable so the historical phase boundary is
-# reviewable instead of silently redefining "v1" after it shipped.
+# field. Keep the historical tuples immutable so old deployed databases remain
+# readable while additive feature vocabularies are introduced separately.
 PREDICATE_SEED_V1: tuple[PredicateSeed, ...] = (
     PredicateSeed(
         "business.name.trading",
@@ -214,8 +214,30 @@ PREDICATE_SEED_PHASE3: tuple[PredicateSeed, ...] = (
 )
 
 
-PREDICATE_SEEDS: tuple[PredicateSeed, ...] = PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3
-VOCABULARY_VERSION = "business-understanding-v2"
+# Review Intelligence deliberately adds an evidence-only observation predicate
+# without changing the Business Understanding schema. Individual customer
+# statements are durable source observations, not reconciled operational Facts.
+PREDICATE_SEED_REVIEW_INTELLIGENCE: tuple[PredicateSeed, ...] = (
+    PredicateSeed(
+        "reputation.customer_review",
+        "reputation",
+        "location",
+        "json",
+        "multi",
+        "evidence_only",
+        None,
+        "A location-scoped customer review retained as attributed source evidence; it does not by itself establish an operational Fact.",
+    ),
+)
+
+
+FOUNDATION_PREDICATE_SEEDS: tuple[PredicateSeed, ...] = (
+    PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3
+)
+PREDICATE_SEEDS: tuple[PredicateSeed, ...] = (
+    FOUNDATION_PREDICATE_SEEDS + PREDICATE_SEED_REVIEW_INTELLIGENCE
+)
+VOCABULARY_VERSION = "business-understanding-v3"
 DOSSIER_POLICY_VERSION = "business-understanding-v1"
 
 
@@ -276,7 +298,7 @@ def _predicate_values(seed: PredicateSeed) -> tuple[object, ...]:
 def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
     if current_schema_version(conn) != 1:
         raise VocabularySeedError(
-            "vocabulary seed v2 requires Business Understanding schema version 1 exactly"
+            "vocabulary seed v3 requires Business Understanding schema version 1 exactly"
         )
     expected = MIGRATIONS[0]
     row = conn.execute(
@@ -288,27 +310,54 @@ def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
         )
 
 
-def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
-    """Fail closed unless the current controlled predicate vocabulary is installed exactly."""
+def _read_predicate(conn: sqlite3.Connection, seed: PredicateSeed) -> tuple[object, ...] | None:
+    row = conn.execute(
+        "SELECT domain, subject_kind, value_type, cardinality, "
+        "reconciliation_policy, freshness_days, description, active "
+        "FROM predicate_definitions WHERE name = ?",
+        (seed.name,),
+    ).fetchone()
+    return None if row is None else tuple(row)
+
+
+def _verify_predicates(
+    conn: sqlite3.Connection,
+    seeds: tuple[PredicateSeed, ...],
+    *,
+    required: bool,
+) -> None:
     _require_exact_phase_one_history(conn)
-    for seed in PREDICATE_SEEDS:
-        row = conn.execute(
-            "SELECT domain, subject_kind, value_type, cardinality, "
-            "reconciliation_policy, freshness_days, description, active "
-            "FROM predicate_definitions WHERE name = ?",
-            (seed.name,),
-        ).fetchone()
-        if row is None:
-            raise VocabularySeedError(
-                f"controlled predicate {seed.name!r} is not installed; run vocabulary seeding first"
-            )
-        actual = tuple(row)
+    for seed in seeds:
+        actual = _read_predicate(conn, seed)
+        if actual is None:
+            if required:
+                raise VocabularySeedError(
+                    f"controlled predicate {seed.name!r} is not installed; run vocabulary seeding first"
+                )
+            continue
         expected = _predicate_values(seed)
         if actual != expected:
             raise VocabularySeedError(
                 f"predicate seed drift for {seed.name!r}: "
                 f"database={actual!r}, expected={expected!r}"
             )
+
+
+def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
+    """Verify the shipped foundation and any installed additive vocabulary.
+
+    Additive feature predicates do not become a deployment-order prerequisite
+    for already-shipped readers such as ``sara-dossier``. If an additive
+    predicate is present, however, its semantics must still match this build;
+    optional does not mean unverified.
+    """
+    _verify_predicates(conn, FOUNDATION_PREDICATE_SEEDS, required=True)
+    _verify_predicates(conn, PREDICATE_SEED_REVIEW_INTELLIGENCE, required=False)
+
+
+def verify_review_intelligence_vocabulary(conn: sqlite3.Connection) -> None:
+    """Verify the foundation plus the required Review Intelligence predicate."""
+    _verify_predicates(conn, PREDICATE_SEEDS, required=True)
 
 
 def seed_business_understanding_vocabulary(
@@ -320,9 +369,9 @@ def seed_business_understanding_vocabulary(
     predicate name already exists, every seeded field must match this build
     exactly; seeding never silently rewrites an existing semantic definition.
 
-    The original Phase-2 16-predicate tuple remains available as
-    ``PREDICATE_SEED_V1``. Current builds additionally install the Phase-3
-    operating-status predicate required by the Maps backfill contract.
+    Historical predicate tuples remain separately named and immutable. Current
+    builds additionally install the Review Intelligence evidence-only predicate.
+    Existing readers continue to require only the foundational vocabulary.
     """
     if conn.in_transaction:
         raise VocabularySeedError(
@@ -340,14 +389,9 @@ def seed_business_understanding_vocabulary(
     try:
         conn.execute("BEGIN IMMEDIATE")
         for seed in PREDICATE_SEEDS:
-            row = conn.execute(
-                "SELECT domain, subject_kind, value_type, cardinality, "
-                "reconciliation_policy, freshness_days, description, active "
-                "FROM predicate_definitions WHERE name = ?",
-                (seed.name,),
-            ).fetchone()
+            actual = _read_predicate(conn, seed)
             expected = _predicate_values(seed)
-            if row is None:
+            if actual is None:
                 conn.execute(
                     "INSERT INTO predicate_definitions("
                     "name, domain, subject_kind, value_type, cardinality, "
@@ -357,7 +401,6 @@ def seed_business_understanding_vocabulary(
                 )
                 inserted.append(seed.name)
                 continue
-            actual = tuple(row)
             if actual != expected:
                 raise VocabularySeedError(
                     f"predicate seed drift for {seed.name!r}: "

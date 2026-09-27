@@ -10,14 +10,17 @@ from sara.storage import connect as storage_connect
 from sara.understanding_vocabulary import (
     DOSSIER_DOMAIN_SEED_V1,
     DOSSIER_POLICY_VERSION,
+    FOUNDATION_PREDICATE_SEEDS,
     PREDICATE_SEEDS,
     PREDICATE_SEED_PHASE3,
+    PREDICATE_SEED_REVIEW_INTELLIGENCE,
     PREDICATE_SEED_V1,
     VOCABULARY_VERSION,
     VocabularySeedError,
     mandatory_dossier_domains,
     seed_business_understanding_vocabulary,
     verify_business_understanding_vocabulary,
+    verify_review_intelligence_vocabulary,
     vocabulary_checksum,
 )
 
@@ -42,7 +45,13 @@ EXPECTED_PREDICATE_NAMES_V1 = (
 )
 
 EXPECTED_PHASE3_PREDICATE_NAMES = ("location.operating_status",)
-EXPECTED_PREDICATE_NAMES = EXPECTED_PREDICATE_NAMES_V1 + EXPECTED_PHASE3_PREDICATE_NAMES
+EXPECTED_REVIEW_PREDICATE_NAMES = ("reputation.customer_review",)
+EXPECTED_FOUNDATION_PREDICATE_NAMES = (
+    EXPECTED_PREDICATE_NAMES_V1 + EXPECTED_PHASE3_PREDICATE_NAMES
+)
+EXPECTED_PREDICATE_NAMES = (
+    EXPECTED_FOUNDATION_PREDICATE_NAMES + EXPECTED_REVIEW_PREDICATE_NAMES
+)
 
 EXPECTED_DOSSIER_DOMAINS = (
     "identity",
@@ -91,12 +100,34 @@ def migrated_conn(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _insert_seeds(conn: sqlite3.Connection, seeds) -> None:
+    for seed in seeds:
+        conn.execute(
+            "INSERT INTO predicate_definitions("
+            "name,domain,subject_kind,value_type,cardinality,reconciliation_policy,"
+            "freshness_days,description,active) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                seed.name,
+                seed.domain,
+                seed.subject_kind,
+                seed.value_type,
+                seed.cardinality,
+                seed.reconciliation_policy,
+                seed.freshness_days,
+                seed.description,
+                seed.active,
+            ),
+        )
+    conn.commit()
+
+
 def test_seed_is_explicit_idempotent_and_does_not_create_business_state(tmp_path: Path) -> None:
     conn = migrated_conn(tmp_path / "seed.sqlite")
 
     assert seed_business_understanding_vocabulary(conn) == EXPECTED_PREDICATE_NAMES
     assert seed_business_understanding_vocabulary(conn) == ()
     verify_business_understanding_vocabulary(conn)
+    verify_review_intelligence_vocabulary(conn)
     assert current_schema_version(conn) == 1
 
     rows = list(
@@ -118,31 +149,37 @@ def test_seed_is_explicit_idempotent_and_does_not_create_business_state(tmp_path
     conn.close()
 
 
-def test_phase_three_predicate_upgrades_an_existing_phase_two_seed(tmp_path: Path) -> None:
-    conn = migrated_conn(tmp_path / "upgrade.sqlite")
-    for seed in PREDICATE_SEED_V1:
-        conn.execute(
-            "INSERT INTO predicate_definitions("
-            "name,domain,subject_kind,value_type,cardinality,reconciliation_policy,"
-            "freshness_days,description,active) VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                seed.name,
-                seed.domain,
-                seed.subject_kind,
-                seed.value_type,
-                seed.cardinality,
-                seed.reconciliation_policy,
-                seed.freshness_days,
-                seed.description,
-                seed.active,
-            ),
-        )
-    conn.commit()
+def test_current_seed_upgrades_an_existing_phase_two_seed(tmp_path: Path) -> None:
+    conn = migrated_conn(tmp_path / "phase2-upgrade.sqlite")
+    _insert_seeds(conn, PREDICATE_SEED_V1)
 
     with pytest.raises(VocabularySeedError, match="location.operating_status"):
         verify_business_understanding_vocabulary(conn)
-    assert seed_business_understanding_vocabulary(conn) == EXPECTED_PHASE3_PREDICATE_NAMES
+    assert seed_business_understanding_vocabulary(conn) == (
+        EXPECTED_PHASE3_PREDICATE_NAMES + EXPECTED_REVIEW_PREDICATE_NAMES
+    )
     verify_business_understanding_vocabulary(conn)
+    verify_review_intelligence_vocabulary(conn)
+    conn.close()
+
+
+def test_review_predicate_is_additive_to_existing_business_understanding_v2(tmp_path: Path) -> None:
+    conn = migrated_conn(tmp_path / "review-upgrade.sqlite")
+    _insert_seeds(conn, PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3)
+
+    verify_business_understanding_vocabulary(conn)
+    with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
+        verify_review_intelligence_vocabulary(conn)
+
+    assert seed_business_understanding_vocabulary(conn) == EXPECTED_REVIEW_PREDICATE_NAMES
+    verify_business_understanding_vocabulary(conn)
+    verify_review_intelligence_vocabulary(conn)
+
+    row = conn.execute(
+        "SELECT domain,subject_kind,value_type,cardinality,reconciliation_policy,freshness_days "
+        "FROM predicate_definitions WHERE name='reputation.customer_review'"
+    ).fetchone()
+    assert tuple(row) == ("reputation", "location", "json", "multi", "evidence_only", None)
     conn.close()
 
 
@@ -211,7 +248,7 @@ def test_seed_fails_closed_and_rolls_back_partial_inserts_on_semantic_drift(tmp_
     conn.close()
 
 
-def test_seed_detects_post_install_drift_in_mutable_metadata(tmp_path: Path) -> None:
+def test_verifiers_detect_drift_in_their_required_or_installed_predicates(tmp_path: Path) -> None:
     conn = migrated_conn(tmp_path / "metadata-drift.sqlite")
     seed_business_understanding_vocabulary(conn)
     conn.execute(
@@ -224,14 +261,36 @@ def test_seed_detects_post_install_drift_in_mutable_metadata(tmp_path: Path) -> 
         seed_business_understanding_vocabulary(conn)
     with pytest.raises(VocabularySeedError, match="business.website.official"):
         verify_business_understanding_vocabulary(conn)
+    with pytest.raises(VocabularySeedError, match="business.website.official"):
+        verify_review_intelligence_vocabulary(conn)
     conn.close()
+
+    review_drift = migrated_conn(tmp_path / "review-drift.sqlite")
+    seed_business_understanding_vocabulary(review_drift)
+    review_drift.execute(
+        "UPDATE predicate_definitions SET description='drifted' "
+        "WHERE name='reputation.customer_review'"
+    )
+    review_drift.commit()
+    with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
+        verify_business_understanding_vocabulary(review_drift)
+    with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
+        verify_review_intelligence_vocabulary(review_drift)
+    with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
+        seed_business_understanding_vocabulary(review_drift)
+    review_drift.close()
 
 
 def test_domain_policy_matches_the_agreed_business_understanding_surface() -> None:
-    assert VOCABULARY_VERSION == "business-understanding-v2"
+    assert VOCABULARY_VERSION == "business-understanding-v3"
     assert DOSSIER_POLICY_VERSION == "business-understanding-v1"
     assert tuple(seed.name for seed in PREDICATE_SEED_V1) == EXPECTED_PREDICATE_NAMES_V1
     assert tuple(seed.name for seed in PREDICATE_SEED_PHASE3) == EXPECTED_PHASE3_PREDICATE_NAMES
+    assert tuple(seed.name for seed in FOUNDATION_PREDICATE_SEEDS) == EXPECTED_FOUNDATION_PREDICATE_NAMES
+    assert (
+        tuple(seed.name for seed in PREDICATE_SEED_REVIEW_INTELLIGENCE)
+        == EXPECTED_REVIEW_PREDICATE_NAMES
+    )
     assert tuple(seed.name for seed in PREDICATE_SEEDS) == EXPECTED_PREDICATE_NAMES
     assert tuple(seed.name for seed in DOSSIER_DOMAIN_SEED_V1) == EXPECTED_DOSSIER_DOMAINS
     assert mandatory_dossier_domains() == EXPECTED_MANDATORY_DOMAINS

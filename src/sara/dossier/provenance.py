@@ -262,7 +262,7 @@ def controlled_unknowns(
 
     cursor = conn.execute(
         "SELECT name,domain,subject_kind FROM predicate_definitions "
-        "WHERE active=1 ORDER BY domain,name"
+        "WHERE active=1 AND reconciliation_policy <> 'evidence_only' ORDER BY domain,name"
     )
     result: list[dict[str, Any]] = []
     for row in cursor.fetchall():
