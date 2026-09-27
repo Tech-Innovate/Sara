@@ -57,12 +57,12 @@ Locations carry `relationship_to_entity` so identity history remains inspectable
 The surface preserves Sara's semantic distinctions:
 
 - `unknown` means the fact cannot currently be established;
-- `not_observed` is only reported when that explicit fact state exists; integrity checks require acquisition provenance and an absence-specific `supports_absence` support edge rather than treating generic research context as evidence of non-observation;
+- `not_observed` is only reported when that explicit fact state exists; integrity checks require an absence-specific `supports_absence` edge to a **completed acquisition targeting the same Fact subject**. Failed/blocked/partial acquisition attempts and acquisitions aimed at another subject do not establish bounded inspection and are surfaced as integrity issues;
 - confirmed `false` remains a supported value and is not converted into an unknown;
 - `single_source` is checked against exactly one distinct usable supporting source; multiple observations from that same source still count as one source;
 - a controlled Fact-eligible predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
 
-Evidence observations include their asserted and normalized values so disagreements in current Fact provenance can be inspected rather than inferred from support-edge IDs alone. Customer voice is a narrower privacy-bounded projection and exposes only its normalized review value. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, missing absence provenance, and customer-review provenance/value-integrity problems rather than silently hiding them.
+Evidence observations include their asserted and normalized values so disagreements in current Fact provenance can be inspected rather than inferred from support-edge IDs alone. Customer voice is a narrower privacy-bounded projection and exposes only its normalized review value. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, invalid or missing absence provenance, and customer-review provenance/value-integrity problems rather than silently hiding them.
 
 ## Persisted dossier assessment
 
@@ -79,7 +79,7 @@ The active policy is `business-understanding-v1`, with derivation implementation
 - immutable parent state in `dossier_assessments`;
 - exactly one row for every controlled dossier domain in `dossier_domain_assessments`;
 - domain state, deterministic reason JSON, fact count, and fresh-fact count;
-- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot, including Location redirect `merged_at` timestamps that affect canonical identity;
+- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot, including Location redirect `merged_at` and external-identifier observation timestamps that affect current identity;
 - `computed_at`, the actual policy-evaluation time;
 - `analysis_ready` and the mandatory domains that block it;
 - a deterministic input-signature hash and bounded claim ceiling in `summary_json`;
@@ -121,7 +121,7 @@ The v1 assessment policy is intentionally conservative:
 - `business_model` requires a fresh transaction-model fact;
 - `communication` requires a fresh public phone for every current Location;
 - `digital_presence` requires a fresh official-website fact;
-- `digital_capabilities` requires bounded inspection of online booking, online ordering, and WhatsApp. A current `not_observed` fact counts as inspection only when it has `supports_absence` acquisition provenance; it never becomes confirmed absence;
+- `digital_capabilities` requires bounded inspection of online booking, online ordering, and WhatsApp. A current `not_observed` fact counts as inspection only when it has a `supports_absence` edge to a completed acquisition whose `target_subject_id` matches that Fact's subject; failed, blocked, partial, cancelled, or subject-mismatched acquisitions never satisfy inspection and are reported as integrity issues. `not_observed` never becomes confirmed absence;
 - `reputation` requires current platform rating/review-count facts plus retained customer-review evidence retrieved within the policy's 30-day review-collection freshness window before it can become `sufficient`. If at least one required reputation component remains current while others are missing/expired, the domain is `partial`; when retained platform/customer-voice evidence is wholly expired, the domain becomes `stale` rather than remaining permanently `partial`;
 - `provenance` requires material current facts/customer voice to trace cleanly to retained evidence;
 - `unknowns` evaluates whether controlled Fact-eligible unresolved state is explicitly enumerated rather than invented away.
