@@ -18,6 +18,13 @@ from sara.storage import connect, ingest_records
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 
 
+_CAPABILITY_PREDICATES = (
+    "capability.online_booking",
+    "capability.online_ordering",
+    "capability.whatsapp",
+)
+
+
 def _prepared(path: Path, *, with_review: bool = False):
     conn = connect(path)
     assert apply_migrations(conn) == (1,)
@@ -74,6 +81,83 @@ def _prepared(path: Path, *, with_review: bool = False):
     return conn
 
 
+def _entity_and_location(conn) -> tuple[str, str]:
+    row = conn.execute(
+        "SELECT bl.business_entity_id,m.location_id "
+        "FROM maps_business_location_links m "
+        "JOIN business_locations bl ON bl.id=m.location_id "
+        "WHERE m.business_id=1"
+    ).fetchone()
+    assert row is not None
+    return str(row[0]), str(row[1])
+
+
+def _insert_not_observed_capability_fact(conn, *, predicate: str, suffix: str) -> str:
+    entity_id, _location_id = _entity_and_location(conn)
+    fact_id = f"fact_test_capability_{suffix}"
+    observed_at = "2026-09-27T10:00:00+00:00"
+    conn.execute(
+        "INSERT INTO facts("
+        "id,subject_id,predicate,fact_slot,value_json,normalized_value_json,value_hash,status,"
+        "valid_from,valid_to,last_verified_at,reconciled_at,reconciliation_version,created_at"
+        ") VALUES (?,?,?,'default',NULL,NULL,NULL,'not_observed',?,NULL,?,?,?,?)",
+        (
+            fact_id,
+            entity_id,
+            predicate,
+            observed_at,
+            observed_at,
+            observed_at,
+            "test-absence-v1",
+            observed_at,
+        ),
+    )
+    return fact_id
+
+
+def _insert_absence_session(
+    conn,
+    *,
+    session_id: str,
+    target_subject_id: str,
+    status: str,
+) -> str:
+    source_id = str(
+        conn.execute(
+            "SELECT source_id FROM acquisition_sessions WHERE legacy_run_id='r1'"
+        ).fetchone()[0]
+    )
+    finished_at = "2026-09-27T10:05:00+00:00"
+    error = None if status == "complete" else "test acquisition did not complete"
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,'{}',?,?,?,?,NULL,0,0)",
+        (
+            session_id,
+            target_subject_id,
+            source_id,
+            "test-absence-collector",
+            "1",
+            "0" * 64,
+            status,
+            "2026-09-27T10:00:00+00:00",
+            finished_at,
+            error,
+        ),
+    )
+    return session_id
+
+
+def _attach_absence_support(conn, *, fact_id: str, session_id: str) -> None:
+    conn.execute(
+        "INSERT INTO fact_acquisition_support(fact_id,acquisition_session_id,support_role) "
+        "VALUES (?,?,'supports_absence')",
+        (fact_id, session_id),
+    )
+
+
 def test_assessment_clock_is_obtained_after_writer_transaction_begins(tmp_path: Path) -> None:
     conn = _prepared(tmp_path / "clock.sqlite")
     seen = {"called": False}
@@ -87,6 +171,130 @@ def test_assessment_clock_is_obtained_after_writer_transaction_begins(tmp_path: 
     assert seen["called"] is True
     assert result.computed_at == "2026-09-28T10:00:00+00:00"
     assert conn.in_transaction is False
+    conn.close()
+
+
+def test_completed_subject_matched_absence_support_counts_as_capability_inspection(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "valid-absence-support.sqlite")
+    entity_id, _location_id = _entity_and_location(conn)
+    for index, predicate in enumerate(_CAPABILITY_PREDICATES, start=1):
+        fact_id = _insert_not_observed_capability_fact(
+            conn,
+            predicate=predicate,
+            suffix=f"valid_{index}",
+        )
+        session_id = _insert_absence_session(
+            conn,
+            session_id=f"acq_test_valid_absence_{index}",
+            target_subject_id=entity_id,
+            status="complete",
+        )
+        _attach_absence_support(conn, fact_id=fact_id, session_id=session_id)
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn,
+        business_id=1,
+        evaluated_at="2026-09-28T10:00:00+00:00",
+    )
+    assert not any(
+        issue["code"].startswith("not_observed_absence_support_")
+        for issue in dossier["integrity_issues"]
+    )
+    support_targets = {
+        support["target_subject_id"]
+        for fact in dossier["facts"]
+        if fact["predicate"] in _CAPABILITY_PREDICATES
+        for support in fact["acquisition_support"]
+        if support["support_role"] == "supports_absence"
+    }
+    assert support_targets == {entity_id}
+
+    assessment = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-28T10:00:00+00:00",
+    )
+    states = {item["domain"]: item["state"] for item in assessment.domains}
+    assert states["digital_capabilities"] == "sufficient"
+    conn.close()
+
+
+def test_failed_or_wrong_subject_absence_support_does_not_satisfy_capability_inspection(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "invalid-absence-support.sqlite")
+    entity_id, location_id = _entity_and_location(conn)
+
+    booking = _insert_not_observed_capability_fact(
+        conn,
+        predicate="capability.online_booking",
+        suffix="failed",
+    )
+    failed_session = _insert_absence_session(
+        conn,
+        session_id="acq_test_failed_absence",
+        target_subject_id=entity_id,
+        status="failed",
+    )
+    _attach_absence_support(conn, fact_id=booking, session_id=failed_session)
+
+    ordering = _insert_not_observed_capability_fact(
+        conn,
+        predicate="capability.online_ordering",
+        suffix="wrong_subject",
+    )
+    wrong_subject_session = _insert_absence_session(
+        conn,
+        session_id="acq_test_wrong_subject_absence",
+        target_subject_id=location_id,
+        status="complete",
+    )
+    _attach_absence_support(conn, fact_id=ordering, session_id=wrong_subject_session)
+
+    whatsapp = _insert_not_observed_capability_fact(
+        conn,
+        predicate="capability.whatsapp",
+        suffix="valid",
+    )
+    valid_session = _insert_absence_session(
+        conn,
+        session_id="acq_test_valid_absence_control",
+        target_subject_id=entity_id,
+        status="complete",
+    )
+    _attach_absence_support(conn, fact_id=whatsapp, session_id=valid_session)
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn,
+        business_id=1,
+        evaluated_at="2026-09-28T10:00:00+00:00",
+    )
+    issues = dossier["integrity_issues"]
+    assert any(
+        issue["code"] == "not_observed_absence_support_not_complete"
+        and issue["acquisition_session_id"] == failed_session
+        for issue in issues
+    )
+    assert any(
+        issue["code"] == "not_observed_absence_support_subject_mismatch"
+        and issue["acquisition_session_id"] == wrong_subject_session
+        and issue["fact_subject_id"] == entity_id
+        and issue["target_subject_id"] == location_id
+        for issue in issues
+    )
+
+    assessment = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-28T10:00:00+00:00",
+    )
+    states = {item["domain"]: item["state"] for item in assessment.domains}
+    assert states["digital_capabilities"] == "partial"
+    assert assessment.analysis_ready is False
     conn.close()
 
 
