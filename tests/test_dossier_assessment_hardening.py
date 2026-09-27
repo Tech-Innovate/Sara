@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from sara.dossier import build_business_dossier, persist_dossier_assessment
+import pytest
+
+from sara.dossier import DossierAssessmentError, build_business_dossier, persist_dossier_assessment
 from sara.maps_backfill import (
     backfill_maps_business_understanding,
     business_entity_id_for_maps_business,
@@ -133,6 +135,55 @@ def test_customer_voice_survives_cross_owner_location_convergence(tmp_path: Path
     assert review["canonical_location_id"] == target_location
     assert review["location_resolution_chain"] == [source_location, target_location]
     assert review["normalized_value"]["review_id"] == "review-a"
+    conn.close()
+
+
+def test_location_redirect_timestamp_participates_in_assessment_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "redirect-chronology.sqlite")
+    ingest_records(
+        conn,
+        "r1",
+        [
+            _record("a", latitude=21.55, with_review=True),
+            _record("b", latitude=21.56, with_review=False),
+        ],
+        finalize_run=("complete", 0, None),
+    )
+    _backfill(conn)
+    business_a, business_b = [
+        int(row[0]) for row in conn.execute("SELECT id FROM businesses ORDER BY id")
+    ]
+    source_location = location_id_for_maps_business(business_a)
+    target_location = location_id_for_maps_business(business_b)
+    extract_retained_reviews(
+        conn,
+        business_id=business_a,
+        now=lambda: "2026-09-27T12:00:00+00:00",
+    )
+
+    conn.execute("DELETE FROM businesses WHERE id=?", (business_b,))
+    conn.execute(
+        "UPDATE maps_business_location_links SET location_id=? WHERE business_id=?",
+        (target_location, business_a),
+    )
+    future_merge = "2026-09-30T13:00:00+00:00"
+    conn.execute(
+        "UPDATE knowledge_subjects SET record_state='merged',merged_into_subject_id=?,"
+        "merged_at=?,updated_at=? WHERE id=?",
+        (target_location, future_merge, future_merge, source_location),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=business_a,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
     conn.close()
 
 
