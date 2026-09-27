@@ -26,7 +26,9 @@ The JSON result identifies its scopes explicitly:
 
 - `fact_scope=current_only`: current facts for the canonical entity and its current locations;
 - `evidence_scope=current_fact_provenance`: retained evidence reached through those current facts' support links;
-- `unknown_scope=controlled_active_predicates_on_current_subjects`: unresolved controlled predicates plus explicit `unknown` and `not_observed` fact states.
+- `unknown_scope=controlled_active_fact_predicates_on_current_subjects`: unresolved controlled predicates eligible for Fact reconciliation, plus explicit `unknown` and `not_observed` fact states.
+
+Controlled predicates whose reconciliation policy is `evidence_only` are intentionally excluded from the Fact-unknown set. For example, Review Intelligence's `reputation.customer_review` represents attributed customer evidence and is not expected to have a current Fact, so its absence from `facts` is not reported as an unresolved factual attribute.
 
 Locations carry `relationship_to_entity` so identity history remains inspectable:
 
@@ -40,7 +42,7 @@ The surface preserves Sara's semantic distinctions:
 - `not_observed` is only reported when that explicit fact state exists; integrity checks require acquisition provenance and an absence-specific `supports_absence` support edge rather than treating generic research context as evidence of non-observation;
 - confirmed `false` remains a supported value and is not converted into an unknown;
 - `single_source` is checked against exactly one distinct usable supporting source; multiple observations from that same source still count as one source;
-- a controlled predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
+- a controlled Fact-eligible predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
 
 Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, and missing absence provenance rather than silently hiding them.
 
@@ -51,6 +53,8 @@ If a sealed dossier assessment exists for the active dossier policy, the command
 Persisted assessments are reported as immutable historical snapshots. Phase 5 does not claim that an old `analysis_ready` value remains current after later fact changes. Snapshot integrity issues such as impossible chronology, `fresh_fact_count > fact_count`, or `analysis_ready` with a mandatory domain below sufficiency are surfaced separately.
 
 The `read_only_preview` is intentionally conservative. It may expose states such as `not_started`, `insufficient`, `partial`, `stale`, `conflicted`, or `not_applicable`, but it never promotes a business to `sufficient`, `strong`, or `analysis_ready`. Exact sufficiency policy and persisted assessment computation remain separate work.
+
+Review Intelligence customer-review observations are not yet projected into this Phase-5 dossier surface. Their absence here does not mean review evidence was not extracted; a dedicated customer-voice inspection/read model remains separate work.
 
 ## Read-only guarantee
 
