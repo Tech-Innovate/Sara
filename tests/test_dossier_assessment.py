@@ -84,7 +84,7 @@ def test_assessment_seals_complete_policy_snapshot_and_is_conservative(tmp_path:
     result = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-26T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:00:00+00:00",
     )
 
     states = _states(result)
@@ -120,12 +120,12 @@ def test_same_logical_state_reuses_deterministic_sealed_snapshot(tmp_path: Path)
     first = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-26T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:00:00+00:00",
     )
     second = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-27T10:00:00+00:00",
+        now=lambda: "2026-09-29T10:00:00+00:00",
     )
 
     assert second.assessment_id == first.assessment_id
@@ -144,12 +144,12 @@ def test_freshness_transition_creates_new_snapshot_without_rewriting_history(tmp
     fresh = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-26T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:00:00+00:00",
     )
     stale = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2027-09-26T10:00:00+00:00",
+        now=lambda: "2027-09-28T10:00:00+00:00",
     )
 
     assert stale.assessment_id != fresh.assessment_id
@@ -161,7 +161,7 @@ def test_freshness_transition_creates_new_snapshot_without_rewriting_history(tmp
         "SELECT analysis_ready,computed_at FROM dossier_assessments WHERE id=?",
         (fresh.assessment_id,),
     ).fetchone()
-    assert tuple(old) == (0, "2026-09-26T10:00:00+00:00")
+    assert tuple(old) == (0, "2026-09-28T10:00:00+00:00")
     conn.close()
 
 
@@ -171,14 +171,14 @@ def test_review_observations_project_as_customer_voice_without_profile_metadata(
     extraction = extract_retained_reviews(
         conn,
         business_id=1,
-        now=lambda: "2026-09-25T12:00:00+00:00",
+        now=lambda: "2026-09-27T12:00:00+00:00",
     )
     assert extraction.observations_created == 1
 
     dossier = build_business_dossier(
         conn,
         business_id=1,
-        evaluated_at="2026-09-26T10:00:00+00:00",
+        evaluated_at="2026-09-28T10:00:00+00:00",
     )
     assert dossier["customer_voice"]["review_count"] == 1
     review = dossier["customer_voice"]["reviews"][0]
@@ -197,7 +197,7 @@ def test_review_observations_project_as_customer_voice_without_profile_metadata(
     assessment = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-26T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:00:00+00:00",
     )
     assert _states(assessment)["reputation"] == "sufficient"
     assert assessment.analysis_ready is False
@@ -247,7 +247,7 @@ def test_readonly_dossier_surfaces_latest_sealed_assessment_after_writer(tmp_pat
     written = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-26T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:00:00+00:00",
     )
     conn.close()
 
@@ -255,7 +255,7 @@ def test_readonly_dossier_surfaces_latest_sealed_assessment_after_writer(tmp_pat
     dossier = build_business_dossier(
         ro,
         business_id=1,
-        evaluated_at="2026-09-26T11:00:00+00:00",
+        evaluated_at="2026-09-28T11:00:00+00:00",
     )
     ro.close()
     persisted = dossier["dossier_status"]["persisted_current_policy"]
