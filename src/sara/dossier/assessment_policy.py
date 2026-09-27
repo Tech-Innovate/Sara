@@ -452,7 +452,7 @@ def _reputation_domain(
                 "review_retrieval_freshness_days": 30,
             },
         )
-    if voice or rating or review_count:
+    if rating or review_count or current_voice:
         return "partial", _reason(
             code="reputation_evidence_incomplete",
             facts=facts,
@@ -464,11 +464,27 @@ def _reputation_domain(
                 "total_review_observation_count": len(voice),
             },
         )
-    if facts and any(
+    stale_metrics = any(
         fact["status"] == "stale" or fact["freshness"]["is_stale"] for fact in facts
-    ):
+    )
+    expired_voice = bool(voice) and not current_voice
+    if stale_metrics or expired_voice:
         return "stale", _reason(
-            code="reputation_evidence_stale", facts=facts, unknowns=unknowns
+            code="reputation_evidence_stale",
+            facts=facts,
+            unknowns=unknowns,
+            extra={
+                "has_stale_platform_metrics": stale_metrics,
+                "expired_review_observation_count": len(voice) - len(current_voice),
+                "total_review_observation_count": len(voice),
+                "review_retrieval_freshness_days": 30,
+            },
+        )
+    if facts or voice:
+        return "insufficient", _reason(
+            code="reputation_evidence_not_current_or_supported",
+            facts=facts,
+            unknowns=unknowns,
         )
     return "not_started", _reason(
         code="no_reputation_or_customer_voice_evidence",
