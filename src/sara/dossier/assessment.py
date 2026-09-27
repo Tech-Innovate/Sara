@@ -138,6 +138,10 @@ def _input_watermark(
         for identifier in location["external_identifiers"]:
             identifier_id = identifier["id"]
             add(
+                identifier.get("created_at"),
+                f"external identifier {identifier_id} created_at",
+            )
+            add(
                 identifier.get("first_observed_at"),
                 f"external identifier {identifier_id} first_observed_at",
             )
@@ -162,7 +166,17 @@ def _input_watermark(
                 f"fact {fact['id']} acquisition {session_id} finished_at",
             )
     for evidence in dossier["evidence"]:
-        add(evidence.get("retrieved_at"), f"evidence {evidence['id']} retrieved_at")
+        evidence_id = evidence["id"]
+        session_id = evidence["acquisition_session_id"]
+        add(evidence.get("retrieved_at"), f"evidence {evidence_id} retrieved_at")
+        add(
+            evidence.get("acquisition_started_at"),
+            f"evidence {evidence_id} acquisition {session_id} started_at",
+        )
+        add(
+            evidence.get("acquisition_finished_at"),
+            f"evidence {evidence_id} acquisition {session_id} finished_at",
+        )
         for observation in evidence["observations"]:
             add(
                 observation.get("observed_at"),
@@ -206,6 +220,12 @@ def _observation_support_signature(fact: dict[str, Any]) -> list[dict[str, Any]]
             "source_id": support["source_id"],
             "evidence_status": support["evidence_status"],
             "observation_value_hash": support["observation_value_hash"],
+            "acquisition_session_id": support["acquisition_session_id"],
+            "collector_name": support["collector_name"],
+            "collector_version": support["collector_version"],
+            "acquisition_status": support["acquisition_status"],
+            "acquisition_started_at": support["acquisition_started_at"],
+            "acquisition_finished_at": support["acquisition_finished_at"],
         }
         for support in fact["observation_support"]
     ]
@@ -255,6 +275,7 @@ def _location_signature(location: dict[str, Any]) -> dict[str, Any]:
             "status": identifier["status"],
             "first_observed_at": identifier["first_observed_at"],
             "last_observed_at": identifier["last_observed_at"],
+            "created_at": identifier["created_at"],
         }
         for identifier in location["external_identifiers"]
     ]
