@@ -13,6 +13,8 @@ _CAPABILITY_PREDICATES = (
     "capability.online_ordering",
     "capability.whatsapp",
 )
+_GOOGLE_MAPS_SOURCE_ID = "src_google_maps"
+_GOOGLE_MAPS_SOURCE_TYPE = "google_maps"
 
 
 def _fresh_value(fact: dict[str, Any]) -> bool:
@@ -195,6 +197,8 @@ def _identity_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             if location["current_for_entity"]
             for identifier in location["external_identifiers"]
             if identifier["status"] == "active"
+            and identifier["source_id"] == _GOOGLE_MAPS_SOURCE_ID
+            and identifier["source_type"] == _GOOGLE_MAPS_SOURCE_TYPE
             and identifier["namespace"] in {"place_id", "cid", "data_id"}
         }
     )
