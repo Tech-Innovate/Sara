@@ -140,6 +140,7 @@ def preview_domains(
                 domain_facts
                 and all(fact["status"] == "not_applicable" for fact in domain_facts)
                 and not domain_unknowns
+                and not customer_voice
             ):
                 state, reasons = "not_applicable", ["all_current_domain_facts_are_not_applicable"]
             elif any(fact["status"] == "conflicted" for fact in domain_facts):
