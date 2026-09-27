@@ -158,6 +158,70 @@ def test_malformed_review_retrieved_at_is_reported_and_excluded_without_aborting
     conn.close()
 
 
+def test_review_acquisition_target_mismatch_is_reported_and_excluded(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared_review_business(tmp_path / "review-target-mismatch.sqlite")
+    observation_id, evidence_id, session_id, source_location_id = conn.execute(
+        "SELECT o.id,o.evidence_id,e.acquisition_session_id,o.subject_id "
+        "FROM observations o JOIN evidence_items e ON e.id=o.evidence_id "
+        "WHERE o.predicate='reputation.customer_review'"
+    ).fetchone()
+    entity_id = conn.execute(
+        "SELECT business_entity_id FROM business_locations WHERE id=?",
+        (source_location_id,),
+    ).fetchone()[0]
+    other_location_id = "loc_review_target_mismatch"
+    created_at = "2026-09-27T12:30:00+00:00"
+    conn.execute(
+        "INSERT INTO knowledge_subjects("
+        "id,kind,record_state,merged_into_subject_id,created_at,updated_at,merged_at"
+        ") VALUES (?,'location','active',NULL,?,?,NULL)",
+        (other_location_id, created_at, created_at),
+    )
+    conn.execute(
+        "INSERT INTO business_locations("
+        "id,business_entity_id,label,location_type,created_at,updated_at"
+        ") VALUES (?,?,?,'restaurant',?,?)",
+        (
+            other_location_id,
+            entity_id,
+            "Other review acquisition target",
+            created_at,
+            created_at,
+        ),
+    )
+    conn.execute("DROP TRIGGER acquisition_sessions_identity_immutable")
+    conn.execute(
+        "UPDATE acquisition_sessions SET target_subject_id=? WHERE id=?",
+        (other_location_id, session_id),
+    )
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn,
+        business_id=1,
+        evaluated_at="2026-09-28T10:00:00+00:00",
+    )
+    assert dossier["customer_voice"]["review_count"] == 0
+    assert any(
+        issue["code"] == "customer_review_acquisition_target_mismatch"
+        and issue["observation_id"] == observation_id
+        and issue["evidence_id"] == evidence_id
+        and issue["subject_id"] == source_location_id
+        and issue["acquisition_target_subject_id"] == other_location_id
+        for issue in dossier["integrity_issues"]
+    )
+
+    assessment = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-28T10:00:00+00:00",
+    )
+    assert assessment.analysis_ready is False
+    conn.close()
+
+
 def _preview_reputation(*, retrieved_at: str, evaluated_at: datetime) -> dict:
     domains = preview_domains(
         facts=[],
