@@ -71,6 +71,27 @@ def _input_watermark(dossier: dict[str, Any]) -> str:
         add(fact.get("valid_from"), f"fact {fact['id']} valid_from")
         add(fact.get("last_verified_at"), f"fact {fact['id']} last_verified_at")
         add(fact.get("reconciled_at"), f"fact {fact['id']} reconciled_at")
+        for support in fact["acquisition_support"]:
+            session_id = support["acquisition_session_id"]
+            add(
+                support.get("started_at"),
+                f"fact {fact['id']} acquisition {session_id} started_at",
+            )
+            add(
+                support.get("finished_at"),
+                f"fact {fact['id']} acquisition {session_id} finished_at",
+            )
+    for evidence in dossier["evidence"]:
+        add(evidence.get("retrieved_at"), f"evidence {evidence['id']} retrieved_at")
+        for observation in evidence["observations"]:
+            add(
+                observation.get("observed_at"),
+                f"observation {observation['id']} observed_at",
+            )
+            add(
+                observation.get("extracted_at"),
+                f"observation {observation['id']} extracted_at",
+            )
     for review in dossier["customer_voice"]["reviews"]:
         add(review.get("observed_at"), f"review {review['observation_id']} observed_at")
         add(review.get("extracted_at"), f"review {review['observation_id']} extracted_at")
@@ -85,10 +106,58 @@ def _input_watermark(dossier: dict[str, Any]) -> str:
     return max(candidates).astimezone(timezone.utc).isoformat()
 
 
+def _observation_support_signature(fact: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [
+        {
+            "support_role": support["support_role"],
+            "observation_id": support["observation_id"],
+            "evidence_id": support["evidence_id"],
+            "source_id": support["source_id"],
+            "evidence_status": support["evidence_status"],
+            "observation_value_hash": support["observation_value_hash"],
+        }
+        for support in fact["observation_support"]
+    ]
+    return sorted(
+        rows,
+        key=lambda item: (
+            str(item["support_role"]),
+            str(item["observation_id"]),
+            str(item["evidence_id"]),
+            str(item["source_id"]),
+        ),
+    )
+
+
+def _acquisition_support_signature(fact: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [
+        {
+            "support_role": support["support_role"],
+            "acquisition_session_id": support["acquisition_session_id"],
+            "source_id": support["source_id"],
+            "collector_name": support["collector_name"],
+            "collector_version": support["collector_version"],
+            "status": support["status"],
+            "started_at": support["started_at"],
+            "finished_at": support["finished_at"],
+            "legacy_run_id": support["legacy_run_id"],
+        }
+        for support in fact["acquisition_support"]
+    ]
+    return sorted(
+        rows,
+        key=lambda item: (
+            str(item["support_role"]),
+            str(item["acquisition_session_id"]),
+            str(item["source_id"]),
+        ),
+    )
+
+
 def _input_signature(
     dossier: dict[str, Any], domains: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Capture all state that can change the v1 assessment outcome."""
+    """Capture all state that can change or materially support the v1 assessment."""
     return {
         "facts": [
             {
@@ -101,6 +170,8 @@ def _input_signature(
                 "last_verified_at": fact["last_verified_at"],
                 "reconciliation_version": fact["reconciliation_version"],
                 "is_stale": bool(fact["freshness"]["is_stale"]),
+                "observation_support": _observation_support_signature(fact),
+                "acquisition_support": _acquisition_support_signature(fact),
             }
             for fact in dossier["facts"]
         ],
@@ -165,6 +236,20 @@ def _verify_existing_assessment(
         raise DossierAssessmentError(
             f"existing deterministic dossier assessment {assessment_id} has incompatible parent state"
         )
+
+    stored_facts_as_of = _validated_timestamp(
+        row[2], field=f"existing dossier assessment {assessment_id} facts_as_of"
+    )
+    stored_computed_at = _validated_timestamp(
+        row[4], field=f"existing dossier assessment {assessment_id} computed_at"
+    )
+    if parse_timestamp(stored_facts_as_of, field="stored facts_as_of") > parse_timestamp(
+        stored_computed_at, field="stored computed_at"
+    ):
+        raise DossierAssessmentError(
+            f"existing deterministic dossier assessment {assessment_id} has impossible chronology"
+        )
+
     seal = conn.execute(
         "SELECT sealed_at FROM dossier_assessment_seals WHERE assessment_id=?",
         (assessment_id,),
@@ -173,6 +258,16 @@ def _verify_existing_assessment(
         raise DossierAssessmentError(
             f"existing deterministic dossier assessment {assessment_id} is unsealed"
         )
+    sealed_at = _validated_timestamp(
+        seal[0], field=f"existing dossier assessment {assessment_id} sealed_at"
+    )
+    if parse_timestamp(sealed_at, field="stored sealed_at") < parse_timestamp(
+        stored_computed_at, field="stored computed_at"
+    ):
+        raise DossierAssessmentError(
+            f"existing deterministic dossier assessment {assessment_id} was sealed before computation"
+        )
+
     rows = conn.execute(
         "SELECT domain,state,reason_json,fact_count,fresh_fact_count "
         "FROM dossier_domain_assessments WHERE assessment_id=? ORDER BY domain",
@@ -193,7 +288,7 @@ def _verify_existing_assessment(
         raise DossierAssessmentError(
             f"existing deterministic dossier assessment {assessment_id} domain state has drifted"
         )
-    return str(row[4])
+    return stored_computed_at
 
 
 def persist_dossier_assessment(
