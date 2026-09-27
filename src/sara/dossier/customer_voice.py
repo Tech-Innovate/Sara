@@ -178,10 +178,21 @@ def customer_review_observations(
         if not provenance_valid:
             continue
 
-        normalized = json_value(
-            item["normalized_value_json"],
-            field=f"review observation {observation_id} normalized_value_json",
-        )
+        try:
+            normalized = json_value(
+                item["normalized_value_json"],
+                field=f"review observation {observation_id} normalized_value_json",
+            )
+        except DossierQueryError as exc:
+            issues.append(
+                {
+                    "code": "customer_review_normalized_value_malformed",
+                    "observation_id": observation_id,
+                    "evidence_id": evidence_id,
+                    "error": str(exc),
+                }
+            )
+            continue
         if not isinstance(normalized, dict):
             issues.append(
                 {
