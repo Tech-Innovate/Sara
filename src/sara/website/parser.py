@@ -216,7 +216,12 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         )
         pairs = [
             (key, item)
-            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            for key, item in parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                encoding="utf-8",
+                errors="strict",
+            )
             if key.lower() not in _TRACKING_QUERY_KEYS
             and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
         ]

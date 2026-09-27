@@ -229,3 +229,8 @@ def test_reversible_idna_hosts_remain_supported() -> None:
     assert normalize_http_url("https://例え.テスト/道") == (
         "https://xn--r8jz45g.xn--zckzah/%E9%81%93"
     )
+
+
+def test_invalid_percent_encoded_query_utf8_fails_closed() -> None:
+    assert normalize_http_url("https://example.com/?q=%FF") is None
+    assert normalize_http_url("https://example.com/?q=%C3%28") is None
