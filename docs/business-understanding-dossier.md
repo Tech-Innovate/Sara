@@ -42,6 +42,8 @@ Controlled predicates whose reconciliation policy is `evidence_only` are intenti
 
 Review observations remain attached to their immutable source-time Location. The read model scopes review lookup to the selected entity's already-resolved Location lineage before decoding review state, then requires each source Location to resolve to a selected current Location. Unrelated businesses' review records therefore cannot contaminate a single-entity dossier.
 
+Before a review is promoted into `customer_voice`, the projection also requires usable evidence, a usable acquisition lifecycle, source/session consistency, the expected customer-generated evidence role, object-shaped review values, and a `value_hash` that matches the canonical normalized review payload. Structurally reachable but invalid review state is surfaced as an integrity issue instead of being counted as customer voice.
+
 Customer statements remain customer evidence. The dossier does not turn review text, rating, or owner response into an operational Fact about the business.
 
 ### Identity history
@@ -60,7 +62,7 @@ The surface preserves Sara's semantic distinctions:
 - `single_source` is checked against exactly one distinct usable supporting source; multiple observations from that same source still count as one source;
 - a controlled Fact-eligible predicate with no current fact is reported as `unresolved`, not fabricated as an `unknown` fact.
 
-Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, missing absence provenance, and customer-review provenance problems rather than silently hiding them.
+Evidence observations include their asserted and normalized values so disagreements can be inspected rather than inferred from support-edge IDs alone. `integrity_issues` exposes broken joins, subject/predicate mismatches, selected-value mismatches, non-usable supporting evidence, malformed conflicts, source-count/status mismatches, missing absence provenance, and customer-review provenance/value-integrity problems rather than silently hiding them.
 
 ## Persisted dossier assessment
 
@@ -77,17 +79,19 @@ The active policy is `business-understanding-v1`, with derivation implementation
 - immutable parent state in `dossier_assessments`;
 - exactly one row for every controlled dossier domain in `dossier_domain_assessments`;
 - domain state, deterministic reason JSON, fact count, and fresh-fact count;
-- `facts_as_of`, the latest timestamped structural/factual/customer-voice input represented by the snapshot;
+- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot;
 - `computed_at`, the actual policy-evaluation time;
 - `analysis_ready` and the mandatory domains that block it;
 - a deterministic input-signature hash and bounded claim ceiling in `summary_json`;
 - a seal in `dossier_assessment_seals` after all rows pass foreign-key validation.
 
-The writer holds one `BEGIN IMMEDIATE` transaction across identity resolution, dossier reading, policy derivation, idempotency verification, writes, and sealing. Failure rolls the entire assessment back.
+The writer holds one `BEGIN IMMEDIATE` transaction across identity resolution, dossier reading, policy derivation, idempotency verification, writes, and sealing. Failure rolls the entire assessment back. When a deterministic assessment already exists, the writer verifies its parent state, complete domain rows, timestamp chronology, and seal chronology before reusing it; incompatible or corrupted history fails closed.
 
 ### Determinism and history
 
 The deterministic assessment identity excludes wall-clock time itself. Re-evaluating the same logical input while it remains in the same freshness state reuses the existing sealed snapshot rather than manufacturing duplicate history.
+
+Fact-support provenance is part of that logical input. Appending a new observation-support or acquisition-support edge therefore creates a new assessment identity even when the domain state remains in the same semantic bucket. This prevents a materially changed provenance graph from being silently represented by an older snapshot.
 
 Time still matters semantically. If the same factual input later crosses a freshness threshold, the derived state changes and Sara creates a new immutable assessment even though `facts_as_of` may be unchanged. Older assessments remain sealed historical judgments.
 
