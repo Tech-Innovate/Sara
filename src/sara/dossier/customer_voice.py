@@ -7,28 +7,53 @@ from ..reviews.model import REVIEW_PREDICATE
 from .core import DossierQueryError, json_value, resolve_subject, row_dict
 
 
+def _location_lineage(
+    conn: sqlite3.Connection, current_location_ids: list[str]
+) -> list[str]:
+    """Return every Location that currently redirects into the selected locations.
+
+    Location ownership is intentionally not part of this traversal. A historical
+    source-time Location may remain owned by its immutable source Entity even
+    after it redirects into a current Location owned by a different canonical
+    Entity. Review observations on that historical Location must remain visible
+    to the current dossier without rewriting their subject.
+    """
+    current_ids = sorted(set(current_location_ids))
+    if not current_ids:
+        return []
+    placeholders = ",".join("?" for _ in current_ids)
+    rows = conn.execute(
+        "WITH RECURSIVE lineage(id) AS ("
+        f"SELECT id FROM knowledge_subjects WHERE kind='location' AND id IN ({placeholders}) "
+        "UNION "
+        "SELECT ks.id FROM knowledge_subjects ks "
+        "JOIN lineage l ON ks.merged_into_subject_id=l.id "
+        "WHERE ks.kind='location' AND ks.record_state='merged'"
+        ") SELECT id FROM lineage ORDER BY id",
+        tuple(current_ids),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def customer_review_observations(
     conn: sqlite3.Connection,
-    source_location_ids: list[str],
     current_location_ids: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Project evidence-only customer reviews onto the current dossier identity.
 
-    ``source_location_ids`` is the selected entity's already-resolved Location
-    lineage from the dossier identity model. Restricting SQL to that lineage
-    prevents malformed or redirected review state for an unrelated business
-    from contaminating this single-entity read. Review observations remain on
-    their immutable source-time Location; a review is exposed only when that
-    Location resolves to one of the selected entity's current active Locations.
+    Review lookup is restricted to the reverse redirect closure of the selected
+    current Locations before any review payload is decoded. Review observations
+    remain on their immutable source-time Location and are exposed only when that
+    Location still resolves to one of the selected current Locations.
 
-    The projection exposes the normalized customer statement plus bounded
+    The projection exposes normalized customer statements plus bounded
     provenance, not raw evidence metadata that may contain reviewer profile or
     display identifiers.
     """
-    if not source_location_ids or not current_location_ids:
+    source_ids = _location_lineage(conn, current_location_ids)
+    if not source_ids:
         return [], []
 
-    source_ids = sorted(set(source_location_ids))
     current = set(current_location_ids)
     placeholders = ",".join("?" for _ in source_ids)
     cursor = conn.execute(
@@ -143,7 +168,9 @@ def customer_review_observations(
                 }
             )
 
-        value = json_value(item["value_json"], field=f"review observation {observation_id} value_json")
+        value = json_value(
+            item["value_json"], field=f"review observation {observation_id} value_json"
+        )
         normalized = json_value(
             item["normalized_value_json"],
             field=f"review observation {observation_id} normalized_value_json",
@@ -156,6 +183,7 @@ def customer_review_observations(
                     "evidence_id": evidence_id,
                 }
             )
+            continue
 
         reviews.append(
             {
