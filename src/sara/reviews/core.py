@@ -119,20 +119,28 @@ def _maps_source_evidence(
     run_id = business.get("last_run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ReviewIntelligenceError("canonical Maps business has no last_run_id")
+    business_id = int(business["id"])
     canonical_key = business.get("canonical_key")
+    expected_evidence_ids = (
+        mb._evidence_id(business_id, raw_hash),
+        ms._sync_evidence_id(business_id, run_id, raw_hash),
+    )
     candidates: list[dict[str, Any]] = []
     cursor = conn.execute(
         "SELECT e.id,e.acquisition_session_id,e.source_id,e.source_locator,e.source_role,e.status,"
         "e.retrieved_at,e.content_sha256,e.artifact_ref,e.metadata_json,e.created_at,"
         "a.collector_name,a.collector_version,a.status AS session_status,a.legacy_run_id "
         "FROM evidence_items e JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
-        "WHERE e.source_id=? AND a.source_id=? AND e.source_role='platform' AND e.status='usable' "
-        "AND a.collector_name IN (?,?)",
+        "WHERE e.id IN (?,?) AND e.source_id=? AND a.source_id=? "
+        "AND e.source_role='platform' AND e.status='usable' "
+        "AND a.collector_name IN (?,?) AND a.legacy_run_id=?",
         (
+            *expected_evidence_ids,
             mb.GOOGLE_MAPS_SOURCE_ID,
             mb.GOOGLE_MAPS_SOURCE_ID,
             mb.BACKFILL_COLLECTOR_NAME,
             ms.SYNC_COLLECTOR_NAME,
+            run_id,
         ),
     )
     for row in cursor.fetchall():
@@ -150,7 +158,7 @@ def _maps_source_evidence(
         metadata = _parse_json_object(item["metadata_json"], field=f"Maps evidence {item['id']} metadata")
         if metadata.get("import_kind") != expected_kind:
             continue
-        if metadata.get("legacy_business_id") != int(business["id"]):
+        if metadata.get("legacy_business_id") != business_id:
             continue
         if metadata.get("legacy_canonical_key") != canonical_key:
             continue
@@ -167,8 +175,8 @@ def _maps_source_evidence(
                 f"Maps evidence {item['id']} retrieval time disagrees with canonical Maps state"
             )
         if expected_kind == "legacy_maps_business_snapshot":
-            frozen_entity_id = mb.business_entity_id_for_maps_business(int(business["id"]))
-            frozen_location_id = mb.location_id_for_maps_business(int(business["id"]))
+            frozen_entity_id = mb.business_entity_id_for_maps_business(business_id)
+            frozen_location_id = mb.location_id_for_maps_business(business_id)
         else:
             frozen_entity_id = metadata.get("sync_entity_id")
             frozen_location_id = metadata.get("sync_location_id")
