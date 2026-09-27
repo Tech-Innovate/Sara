@@ -1,10 +1,109 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from typing import Any
 
 from ..reviews.model import REVIEW_PREDICATE, canonical_json, sha256_text
 from .core import DossierQueryError, json_value, parse_timestamp, resolve_subject, row_dict
+
+
+_REVIEW_NORMALIZED_FIELDS = frozenset(
+    {
+        "review_id",
+        "source",
+        "rating",
+        "rating_scale",
+        "text_original",
+        "text_translated",
+        "language",
+        "translated_language",
+        "published_at",
+        "updated_at",
+        "source_when",
+        "owner_response",
+    }
+)
+_OWNER_RESPONSE_FIELDS = frozenset(
+    {"text", "language", "translated_language", "published_at", "updated_at"}
+)
+_REVIEW_TEXT_FIELDS = (
+    "review_id",
+    "source",
+    "text_original",
+    "text_translated",
+    "language",
+    "translated_language",
+    "published_at",
+    "updated_at",
+    "source_when",
+)
+
+
+def _bounded_normalized_review(value: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the explicitly permitted review projection or reject schema drift.
+
+    ``normalized_value_json`` is shared producer storage, not a privacy boundary.
+    The dossier therefore accepts only the bounded Review Intelligence schema
+    emitted by ``reviews.parser`` and reconstructs the object from that allowlist
+    before exposing it. This prevents a hash-valid producer-specific extension
+    (for example reviewer profile/display metadata) from crossing into the
+    Business Understanding read model.
+    """
+    if set(value) != _REVIEW_NORMALIZED_FIELDS:
+        return None
+
+    for field in _REVIEW_TEXT_FIELDS:
+        field_value = value[field]
+        if field_value is not None and not isinstance(field_value, str):
+            return None
+
+    rating = value["rating"]
+    if rating is not None:
+        if isinstance(rating, bool) or not isinstance(rating, (int, float)):
+            return None
+        if not math.isfinite(float(rating)) or float(rating) < 0:
+            return None
+
+    rating_scale = value["rating_scale"]
+    if rating_scale is not None:
+        if isinstance(rating_scale, bool) or not isinstance(rating_scale, int):
+            return None
+        if rating_scale <= 0:
+            return None
+    if rating is not None and rating_scale is not None and float(rating) > rating_scale:
+        return None
+
+    owner_response = value["owner_response"]
+    bounded_response: dict[str, Any] | None = None
+    if owner_response is not None:
+        if not isinstance(owner_response, dict) or set(owner_response) != _OWNER_RESPONSE_FIELDS:
+            return None
+        if any(
+            owner_response[field] is not None
+            and not isinstance(owner_response[field], str)
+            for field in _OWNER_RESPONSE_FIELDS
+        ):
+            return None
+        bounded_response = {
+            field: owner_response[field]
+            for field in ("text", "language", "translated_language", "published_at", "updated_at")
+        }
+
+    return {
+        "review_id": value["review_id"],
+        "source": value["source"],
+        "rating": rating,
+        "rating_scale": rating_scale,
+        "text_original": value["text_original"],
+        "text_translated": value["text_translated"],
+        "language": value["language"],
+        "translated_language": value["translated_language"],
+        "published_at": value["published_at"],
+        "updated_at": value["updated_at"],
+        "source_when": value["source_when"],
+        "owner_response": bounded_response,
+    }
 
 
 def _location_lineage(
@@ -318,6 +417,16 @@ def customer_review_observations(
                 }
             )
             continue
+        bounded_normalized = _bounded_normalized_review(normalized)
+        if bounded_normalized is None:
+            issues.append(
+                {
+                    "code": "customer_review_normalized_schema_invalid",
+                    "observation_id": observation_id,
+                    "evidence_id": evidence_id,
+                }
+            )
+            continue
 
         reviews.append(
             {
@@ -325,7 +434,7 @@ def customer_review_observations(
                 "source_location_id": source_subject_id,
                 "canonical_location_id": canonical_location_id,
                 "location_resolution_chain": list(resolved["chain"]),
-                "normalized_value": normalized,
+                "normalized_value": bounded_normalized,
                 "value_hash": item["value_hash"],
                 "observation_kind": item["observation_kind"],
                 "observed_at": item["observed_at"],
