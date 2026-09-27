@@ -192,12 +192,13 @@ def _provenance_record_state(
     conn: sqlite3.Connection,
     dossier: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Seal creation chronology for material source/evidence/observation rows.
+    """Seal lifecycle chronology for material Maps and provenance storage rows.
 
-    Storage creation timestamps are assessment-only chronology. Keeping them
-    here avoids widening the read-only dossier contract while preventing an
-    assessment clock from predating provenance records it evaluates.
+    Storage creation/first-seen timestamps are assessment-only chronology.
+    Keeping them here avoids widening the read-only dossier contract while
+    preventing an assessment clock from predating records it evaluates.
     """
+    maps_business_ids: set[int] = set()
     source_ids: set[str] = set()
     evidence_ids: set[str] = set()
     observation_ids: set[str] = set()
@@ -205,6 +206,9 @@ def _provenance_record_state(
     def collect(value: object, target: set[str]) -> None:
         if value not in (None, ""):
             target.add(str(value))
+
+    for business in dossier["maps_businesses"]:
+        maps_business_ids.add(int(business["id"]))
 
     for location in dossier["locations"]:
         for identifier in location["external_identifiers"]:
@@ -231,6 +235,22 @@ def _provenance_record_state(
         collect(evidence.get("source_id"), source_ids)
 
     result: list[dict[str, Any]] = []
+    for business_id in sorted(maps_business_ids):
+        row = conn.execute(
+            "SELECT id,first_seen_at FROM businesses WHERE id=?",
+            (business_id,),
+        ).fetchone()
+        if row is None:
+            raise DossierAssessmentError(
+                f"material Maps business {business_id!r} disappeared during assessment"
+            )
+        result.append(
+            {
+                "kind": "maps_business",
+                "id": int(row[0]),
+                "first_seen_at": row[1],
+            }
+        )
     for source_id in sorted(source_ids):
         row = conn.execute(
             "SELECT id,source_type,created_at FROM sources WHERE id=?",
@@ -311,10 +331,16 @@ def _chronology_inputs(
         add(node.get("updated_at"), f"{subject_label} updated_at")
         add(node.get("merged_at"), f"{subject_label} merged_at")
     for record in provenance_record_state:
-        add(
-            record.get("created_at"),
-            f"{record['kind']} {record['id']} created_at",
-        )
+        if record["kind"] == "maps_business":
+            add(
+                record.get("first_seen_at"),
+                f"Maps business {record['id']} first_seen_at",
+            )
+        else:
+            add(
+                record.get("created_at"),
+                f"{record['kind']} {record['id']} created_at",
+            )
     for owner in location_owner_resolution:
         for node in owner["resolution_chain"]:
             owner_id = node["id"]
