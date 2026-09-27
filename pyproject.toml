@@ -20,6 +20,7 @@ sara-maps-sync = "sara.maps_sync:main"
 sara-dossier = "sara.dossier:main"
 sara-website = "sara.website:main"
 sara-website-validate = "sara.website_validation_cli:main"
+sara-reviews = "sara.reviews:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
