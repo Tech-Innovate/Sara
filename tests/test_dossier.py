@@ -214,11 +214,26 @@ def test_unknown_not_observed_and_confirmed_false_remain_distinct(tmp_path: Path
     db = tmp_path / "semantics.sqlite"
     conn = _phase5_fixture(db)
     entity_id = business_entity_id_for_maps_business(1)
-    session_id = conn.execute(
-        "SELECT id FROM acquisition_sessions WHERE legacy_run_id='r1'"
-    ).fetchone()[0]
     evidence_id = conn.execute("SELECT id FROM evidence_items LIMIT 1").fetchone()[0]
     stamp = "2026-09-25T10:00:00+00:00"
+    session_id = "acq_test_subject_matched_absence"
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,'complete',?,?,NULL,NULL,0,0)",
+        (
+            session_id,
+            entity_id,
+            "src_google_maps",
+            "test.subject_matched_absence",
+            "1",
+            "{}",
+            "0" * 64,
+            stamp,
+            stamp,
+        ),
+    )
 
     conn.execute(
         "INSERT INTO facts(id,subject_id,predicate,fact_slot,status,valid_from,last_verified_at,"
