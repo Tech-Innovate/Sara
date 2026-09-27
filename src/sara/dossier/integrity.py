@@ -51,7 +51,6 @@ def additional_fact_integrity(facts: list[dict[str, Any]]) -> list[dict[str, Any
                 target_subject_id = support.get("target_subject_id")
                 if (
                     "target_subject_id" in support
-                    and target_subject_id is not None
                     and fact_subject_id is not None
                     and target_subject_id != fact_subject_id
                 ):
