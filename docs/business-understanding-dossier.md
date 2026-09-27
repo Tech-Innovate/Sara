@@ -42,7 +42,7 @@ Controlled predicates whose reconciliation policy is `evidence_only` are intenti
 
 Review observations remain attached to their immutable source-time Location. The read model scopes review lookup to the selected entity's already-resolved Location lineage before decoding review state, then requires each source Location to resolve to a selected current Location. Unrelated businesses' review records therefore cannot contaminate a single-entity dossier.
 
-Before a review is promoted into `customer_voice`, the projection also requires usable evidence, a usable acquisition lifecycle, source/session consistency, the expected customer-generated evidence role, an object-shaped normalized review value, and a `value_hash` that matches the canonical normalized review payload. Structurally reachable but invalid review state is surfaced as an integrity issue instead of being counted as customer voice.
+Before a review is promoted into `customer_voice`, the projection also requires usable evidence, a usable acquisition lifecycle, source/session consistency, the expected customer-generated evidence role, timestamp-valid retrieval/extraction/acquisition provenance, a terminal acquisition whose finish is not earlier than its start, an object-shaped normalized review value, and a `value_hash` that matches the canonical normalized review payload. Structurally reachable but invalid review state is surfaced as an integrity issue instead of being counted as customer voice.
 
 Customer statements remain customer evidence. The dossier does not turn review text, rating, or owner response into an operational Fact about the business.
 
@@ -79,7 +79,7 @@ The active policy is `business-understanding-v1`, with derivation implementation
 - immutable parent state in `dossier_assessments`;
 - exactly one row for every controlled dossier domain in `dossier_domain_assessments`;
 - domain state, deterministic reason JSON, fact count, and fresh-fact count;
-- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot, including Location redirect `merged_at` and external-identifier observation timestamps that affect current identity;
+- `facts_as_of`, the latest timestamped structural, factual, fact-support provenance, or customer-voice input represented by the snapshot, including Entity/Location redirect chronology, external-identifier creation and observation timestamps, acquisition lifecycle timestamps behind Fact-supporting evidence, and retained-review acquisition lifecycle;
 - `computed_at`, the actual policy-evaluation time;
 - `analysis_ready` and the mandatory domains that block it;
 - a deterministic input-signature hash and bounded claim ceiling in `summary_json`;
@@ -91,7 +91,7 @@ The writer holds one `BEGIN IMMEDIATE` transaction across identity resolution, d
 
 The deterministic assessment identity excludes wall-clock time itself. Re-evaluating the same logical input while it remains in the same freshness state reuses the existing sealed snapshot rather than manufacturing duplicate history.
 
-Fact-support provenance is part of that logical input. Appending a new observation-support or acquisition-support edge therefore creates a new assessment identity even when the domain state remains in the same semantic bucket. Location structural state is also part of the signature: redirects, canonical targets, resolution chains, relationship-to-entity state, and retained external identifiers cannot change underneath an older assessment without changing the logical input identity. This prevents materially changed provenance or identity structure from being silently represented by an older snapshot.
+Fact-support provenance is part of that logical input. Appending a new observation-support or acquisition-support edge therefore creates a new assessment identity even when the domain state remains in the same semantic bucket. The acquisition identity, collector, status, and lifecycle behind Fact-supporting evidence are also sealed, so a materially changed support lifecycle cannot silently reuse an older assessment merely because another input keeps the same `facts_as_of` maximum. Location structural state is also part of the signature: redirects, canonical targets, resolution chains, relationship-to-entity state, and retained external identifiers—including their creation/observation chronology—cannot change underneath an older assessment without changing the logical input identity. This prevents materially changed provenance or identity structure from being silently represented by an older snapshot.
 
 Time still matters semantically. If the same factual input later crosses a freshness threshold, the derived state changes and Sara creates a new immutable assessment even though `facts_as_of` may be unchanged. Older assessments remain sealed historical judgments.
 
@@ -114,7 +114,7 @@ not_applicable
 
 The v1 assessment policy is intentionally conservative:
 
-- `identity` requires a fresh trading-name fact plus at least one active strong Maps Location identifier (`place_id`, `cid`, or `data_id`);
+- `identity` requires a fresh trading-name fact plus at least one active strong Maps Location identifier (`place_id`, `cid`, or `data_id`) attributed to Sara's canonical Google Maps source (`src_google_maps`, source type `google_maps`); namespace text from another source is not a Maps identity anchor;
 - `classification` requires a fresh primary-category fact;
 - `locations` requires current address, latitude, and longitude coverage for every current Location;
 - `offerings` requires a fresh service/offering fact;
