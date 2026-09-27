@@ -65,8 +65,11 @@ def build_business_dossier(
     )
     facts = current_facts(conn, canonical_entity_id, current_location_ids, evaluation)
     evidence, integrity_issues = attach_provenance(conn, facts)
+    source_location_ids = sorted({str(item["id"]) for item in location_rows})
     customer_voice, customer_voice_issues = customer_review_observations(
-        conn, current_location_ids
+        conn,
+        source_location_ids,
+        current_location_ids,
     )
     integrity_issues = sort_integrity_issues(
         [
@@ -89,7 +92,7 @@ def build_business_dossier(
         "schema": "sara-business-dossier-v1",
         "fact_scope": "current_only",
         "evidence_scope": "current_fact_provenance",
-        "customer_voice_scope": "review_observations_resolving_to_current_locations",
+        "customer_voice_scope": "review_observations_from_selected_location_lineage_resolving_current",
         "unknown_scope": "controlled_active_fact_predicates_on_current_subjects",
         "evaluated_at": evaluation.isoformat(),
         "selection": selection,
