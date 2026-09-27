@@ -211,3 +211,21 @@ def test_existing_percent_escapes_are_not_double_encoded() -> None:
 def test_malformed_unicode_url_fails_closed() -> None:
     assert normalize_http_url("https://example.com/\ud800") is None
     assert normalize_http_url("https://\ud800.example/path") is None
+
+
+def test_ambiguous_or_invalid_idna_host_fails_closed() -> None:
+    # The stdlib IDNA codec maps these non-reversibly or leaves invalid ASCII
+    # hostname characters untouched. Sara must not silently change destination.
+    for raw in (
+        "https://faß.de/",
+        "https://e\u0301xample.com/",
+        "https://exa_mple.com/",
+        "https://example com/",
+    ):
+        assert normalize_http_url(raw) is None
+
+
+def test_reversible_idna_hosts_remain_supported() -> None:
+    assert normalize_http_url("https://例え.テスト/道") == (
+        "https://xn--r8jz45g.xn--zckzah/%E9%81%93"
+    )

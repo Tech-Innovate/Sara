@@ -120,6 +120,20 @@ class ParsedPage:
     whatsapp_detected: bool
 
 
+def _valid_ascii_hostname(host: str) -> bool:
+    if not host or len(host) > 253:
+        return False
+    labels = host.split(".")
+    return all(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and re.fullmatch(r"[a-z0-9-]+", label) is not None
+        for label in labels
+    )
+
+
 def _ascii_host(value: str) -> str | None:
     host = value.lower().rstrip(".")
     if not host:
@@ -133,11 +147,19 @@ def _ascii_host(value: str) -> str | None:
         except UnicodeError:
             return None
         return host
+
+    if host.isascii():
+        return host if _valid_ascii_hostname(host) else None
+
     try:
         ascii_host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        round_trip = ascii_host.encode("ascii").decode("idna").lower().rstrip(".")
     except UnicodeError:
         return None
-    if not ascii_host:
+    # The stdlib codec implements legacy IDNA mappings (for example ß -> ss).
+    # Do not silently contact a different ASCII hostname when the mapping is not
+    # reversible. A future IDNA2008/UTS-46 dependency can broaden this safely.
+    if round_trip != host or not _valid_ascii_hostname(ascii_host):
         return None
     return ascii_host
 
