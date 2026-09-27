@@ -82,7 +82,6 @@ def preview_domains(
     facts: list[dict[str, Any]],
     unknowns: list[dict[str, Any]],
     integrity_issues: list[dict[str, Any]],
-    *,
     customer_voice: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     customer_voice = customer_voice or []
