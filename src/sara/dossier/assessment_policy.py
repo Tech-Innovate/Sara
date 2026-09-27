@@ -28,6 +28,8 @@ def _absence_inspection_current(fact: dict[str, Any]) -> bool:
         and not bool(fact["freshness"]["is_stale"])
         and any(
             support["support_role"] == "supports_absence"
+            and support.get("status") == "complete"
+            and support.get("target_subject_id") == fact["subject_id"]
             for support in fact["acquisition_support"]
         )
     )
