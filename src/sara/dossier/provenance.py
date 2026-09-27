@@ -161,9 +161,11 @@ def attach_provenance(
             tuple(fact_ids),
         )
     }
+    has_target_subject_id = _table_has_column(
+        conn, "acquisition_sessions", "target_subject_id"
+    )
     target_subject_expression = (
-        "a.target_subject_id" if _table_has_column(conn, "acquisition_sessions", "target_subject_id")
-        else "NULL AS target_subject_id"
+        "a.target_subject_id" if has_target_subject_id else "NULL AS target_subject_id"
     )
     cursor = conn.execute(
         "SELECT fas.fact_id,fas.support_role,a.id AS acquisition_session_id,a.source_id,"
@@ -179,6 +181,8 @@ def attach_provenance(
     for row in cursor.fetchall():
         item = row_dict(cursor, row)
         fact_id = str(item.pop("fact_id"))
+        if not has_target_subject_id:
+            item.pop("target_subject_id", None)
         joined_acquisition_counts[fact_id] = joined_acquisition_counts.get(fact_id, 0) + 1
         fact_by_id[fact_id]["acquisition_support"].append(item)
 
