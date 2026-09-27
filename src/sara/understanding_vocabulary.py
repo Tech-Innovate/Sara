@@ -214,8 +214,29 @@ PREDICATE_SEED_PHASE3: tuple[PredicateSeed, ...] = (
 )
 
 
-PREDICATE_SEEDS: tuple[PredicateSeed, ...] = PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3
-VOCABULARY_VERSION = "business-understanding-v2"
+# Review Intelligence deliberately adds an evidence-only observation predicate
+# without changing the Business Understanding schema. Individual customer
+# statements are durable source observations, not reconciled operational Facts.
+PREDICATE_SEED_REVIEW_INTELLIGENCE: tuple[PredicateSeed, ...] = (
+    PredicateSeed(
+        "reputation.customer_review",
+        "reputation",
+        "location",
+        "json",
+        "multi",
+        "evidence_only",
+        None,
+        "A location-scoped customer review retained as attributed source evidence; it does not by itself establish an operational Fact.",
+    ),
+)
+
+
+PREDICATE_SEEDS: tuple[PredicateSeed, ...] = (
+    PREDICATE_SEED_V1
+    + PREDICATE_SEED_PHASE3
+    + PREDICATE_SEED_REVIEW_INTELLIGENCE
+)
+VOCABULARY_VERSION = "business-understanding-v3"
 DOSSIER_POLICY_VERSION = "business-understanding-v1"
 
 
@@ -276,7 +297,7 @@ def _predicate_values(seed: PredicateSeed) -> tuple[object, ...]:
 def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
     if current_schema_version(conn) != 1:
         raise VocabularySeedError(
-            "vocabulary seed v2 requires Business Understanding schema version 1 exactly"
+            "vocabulary seed v3 requires Business Understanding schema version 1 exactly"
         )
     expected = MIGRATIONS[0]
     row = conn.execute(
@@ -320,9 +341,8 @@ def seed_business_understanding_vocabulary(
     predicate name already exists, every seeded field must match this build
     exactly; seeding never silently rewrites an existing semantic definition.
 
-    The original Phase-2 16-predicate tuple remains available as
-    ``PREDICATE_SEED_V1``. Current builds additionally install the Phase-3
-    operating-status predicate required by the Maps backfill contract.
+    Historical predicate tuples remain separately named and immutable. Current
+    builds additionally install the Review Intelligence evidence-only predicate.
     """
     if conn.in_transaction:
         raise VocabularySeedError(
