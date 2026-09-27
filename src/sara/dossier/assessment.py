@@ -362,6 +362,12 @@ def _chronology_inputs(
         add(location.get("merged_at"), f"location {location['id']} merged_at")
         for identifier in location["external_identifiers"]:
             identifier_id = identifier["id"]
+            status_changed_at = identifier.get("status_changed_at")
+            if identifier.get("status") != "active" and status_changed_at in (None, ""):
+                raise DossierAssessmentError(
+                    f"external identifier {identifier_id} has non-active status without a "
+                    "recorded transition timestamp"
+                )
             add(
                 identifier.get("created_at"),
                 f"external identifier {identifier_id} created_at",
@@ -373,6 +379,10 @@ def _chronology_inputs(
             add(
                 identifier.get("last_observed_at"),
                 f"external identifier {identifier_id} last_observed_at",
+            )
+            add(
+                status_changed_at,
+                f"external identifier {identifier_id} status_changed_at",
             )
     for business in dossier["maps_businesses"]:
         business_id = business["id"]
@@ -528,6 +538,7 @@ def _location_signature(location: dict[str, Any]) -> dict[str, Any]:
             "namespace": identifier["namespace"],
             "value": identifier["value"],
             "status": identifier["status"],
+            "status_changed_at": identifier.get("status_changed_at"),
             "first_observed_at": identifier["first_observed_at"],
             "last_observed_at": identifier["last_observed_at"],
             "created_at": identifier["created_at"],
@@ -578,7 +589,7 @@ def _input_signature(
                 "valid_from": fact["valid_from"],
                 "last_verified_at": fact["last_verified_at"],
                 "reconciliation_version": fact["reconciliation_version"],
-                "is_stale": bool(fact["freshness"]["is_stale"]),
+                "freshness": dict(fact["freshness"]),
                 "observation_support": _observation_support_signature(fact),
                 "acquisition_support": _acquisition_support_signature(fact),
             }
