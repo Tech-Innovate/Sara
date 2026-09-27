@@ -133,7 +133,7 @@ def _insert_absence_session(
         "INSERT INTO acquisition_sessions("
         "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
         "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,'{}',?,?,?,?,NULL,0,0)",
+        ") VALUES (?,?,?,?,?,'{}',?,?,?,?,?,NULL,0,0)",
         (
             session_id,
             target_subject_id,
