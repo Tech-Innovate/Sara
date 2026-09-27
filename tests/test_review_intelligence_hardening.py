@@ -6,6 +6,9 @@ import pytest
 
 import sara.reviews.core as review_core
 from sara.maps_backfill import (
+    BACKFILL_COLLECTOR_NAME,
+    BACKFILL_VERSION,
+    GOOGLE_MAPS_SOURCE_ID,
     backfill_maps_business_understanding,
     business_entity_id_for_maps_business,
     location_id_for_maps_business,
@@ -184,6 +187,71 @@ def test_review_session_and_observation_stay_on_source_subject_after_location_co
             (REVIEW_PREDICATE,),
         )
     } == {source_location}
+    conn.close()
+
+
+def test_unrelated_malformed_maps_metadata_does_not_poison_selected_business(
+    tmp_path: Path,
+) -> None:
+    conn = prepared_conn(tmp_path / "unrelated-corruption.sqlite")
+    business_id = ingest_businesses(conn, [record("selected", latitude=21.55)])[0]
+
+    # A single-target extraction must not decode every other Maps evidence row
+    # in the database. This unrelated, structurally valid evidence row has
+    # deliberately malformed metadata and would have poisoned the old broad
+    # source scan before the selected snapshot was isolated.
+    add_run(conn, "unrelated-run")
+    config_json = "{}"
+    session_id = "acq_unrelated_corrupt_maps"
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,NULL,?,?,?,?,?,'complete',?,?,NULL,?,1,0)",
+        (
+            session_id,
+            GOOGLE_MAPS_SOURCE_ID,
+            BACKFILL_COLLECTOR_NAME,
+            BACKFILL_VERSION,
+            config_json,
+            review_core.sha256_text(config_json),
+            "2026-09-27T07:00:00+00:00",
+            "2026-09-27T07:01:00+00:00",
+            "unrelated-run",
+        ),
+    )
+    corrupt_evidence_id = "ev_unrelated_corrupt_maps"
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,'platform','usable',?,NULL,NULL,'application/json',?,NULL,?,?)",
+        (
+            corrupt_evidence_id,
+            session_id,
+            GOOGLE_MAPS_SOURCE_ID,
+            "https://maps.example/unrelated-corrupt",
+            "2026-09-27T07:01:00+00:00",
+            "0" * 64,
+            "{not-valid-json",
+            "2026-09-27T07:01:00+00:00",
+        ),
+    )
+    conn.commit()
+
+    stats = extract_retained_reviews(
+        conn,
+        business_id=business_id,
+        now=lambda: "2026-09-27T08:00:00+00:00",
+    )
+
+    assert stats.business_id == business_id
+    assert stats.observations_created == 1
+    assert stats.source_evidence_id != corrupt_evidence_id
+    assert conn.execute(
+        "SELECT metadata_json FROM evidence_items WHERE id=?",
+        (corrupt_evidence_id,),
+    ).fetchone()[0] == "{not-valid-json"
     conn.close()
 
 
