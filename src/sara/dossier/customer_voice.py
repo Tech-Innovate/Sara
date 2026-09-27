@@ -9,20 +9,28 @@ from .core import DossierQueryError, json_value, resolve_subject, row_dict
 
 def customer_review_observations(
     conn: sqlite3.Connection,
+    source_location_ids: list[str],
     current_location_ids: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Project evidence-only customer reviews onto the current dossier identity.
 
-    Review observations remain attached to their immutable source-time Location.
-    A review is included when that Location currently resolves to one of the
-    selected entity's active Locations. The projection deliberately exposes the
-    normalized customer statement plus bounded provenance, not raw evidence
-    metadata that may contain reviewer profile/display identifiers.
+    ``source_location_ids`` is the selected entity's already-resolved Location
+    lineage from the dossier identity model. Restricting SQL to that lineage
+    prevents malformed or redirected review state for an unrelated business
+    from contaminating this single-entity read. Review observations remain on
+    their immutable source-time Location; a review is exposed only when that
+    Location resolves to one of the selected entity's current active Locations.
+
+    The projection exposes the normalized customer statement plus bounded
+    provenance, not raw evidence metadata that may contain reviewer profile or
+    display identifiers.
     """
-    if not current_location_ids:
+    if not source_location_ids or not current_location_ids:
         return [], []
 
+    source_ids = sorted(set(source_location_ids))
     current = set(current_location_ids)
+    placeholders = ",".join("?" for _ in source_ids)
     cursor = conn.execute(
         "SELECT o.id,o.subject_id,o.value_json,o.normalized_value_json,o.value_hash,"
         "o.observation_kind,o.observed_at,o.extracted_at,o.extraction_method,"
@@ -36,8 +44,9 @@ def customer_review_observations(
         "LEFT JOIN evidence_items e ON e.id=o.evidence_id "
         "LEFT JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
         "LEFT JOIN sources s ON s.id=e.source_id "
-        "WHERE o.predicate=? ORDER BY o.observed_at,o.id",
-        (REVIEW_PREDICATE,),
+        f"WHERE o.predicate=? AND o.subject_id IN ({placeholders}) "
+        "ORDER BY o.observed_at,o.id",
+        (REVIEW_PREDICATE, *source_ids),
     )
 
     reviews: list[dict[str, Any]] = []
@@ -60,6 +69,14 @@ def customer_review_observations(
             continue
         canonical_location_id = str(resolved["canonical"]["id"])
         if canonical_location_id not in current:
+            issues.append(
+                {
+                    "code": "customer_review_source_location_left_selected_lineage",
+                    "observation_id": observation_id,
+                    "subject_id": source_subject_id,
+                    "canonical_location_id": canonical_location_id,
+                }
+            )
             continue
 
         evidence_id = item["evidence_id"]
