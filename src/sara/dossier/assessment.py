@@ -88,6 +88,7 @@ def _location_owner_resolution_state(
                         "id": str(row["id"]),
                         "record_state": row["record_state"],
                         "merged_into_subject_id": row["merged_into_subject_id"],
+                        "created_at": row["created_at"],
                         "updated_at": row["updated_at"],
                         "merged_at": row["merged_at"],
                     }
@@ -107,9 +108,90 @@ def _location_owner_resolution_state(
     return sorted(result, key=lambda item: str(item["location_id"]))
 
 
+def _structural_subject_state(
+    conn: sqlite3.Connection,
+    dossier: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Seal every Entity/Location subject that materially participates in resolution.
+
+    This is assessment-only state. It intentionally does not change the dossier
+    read model or Location-admission semantics. In particular, a historical
+    cross-owner Location alias remains admitted through its Location redirect;
+    its original owner chain is merely sealed as structural provenance.
+    """
+    expected_kinds: dict[str, str] = {}
+
+    def add(subject_id: object, kind: str) -> None:
+        if subject_id in (None, ""):
+            return
+        key = str(subject_id)
+        previous = expected_kinds.get(key)
+        if previous is not None and previous != kind:
+            raise DossierAssessmentError(
+                f"Understanding subject {key!r} participates with conflicting kinds "
+                f"{previous!r} and {kind!r}"
+            )
+        expected_kinds[key] = kind
+
+    def add_chain(values: object, kind: str) -> None:
+        if not isinstance(values, (list, tuple)):
+            return
+        for value in values:
+            add(value, kind)
+
+    add(dossier["business_entity"]["id"], "business_entity")
+    selection = dossier.get("selection", {})
+    if isinstance(selection, dict):
+        add_chain(selection.get("entity_resolution_chain"), "business_entity")
+        add_chain(selection.get("location_resolution_chain"), "location")
+        add(selection.get("linked_location_id"), "location")
+        add(selection.get("canonical_location_id"), "location")
+
+    for location in dossier["locations"]:
+        add(location["id"], "location")
+        add_chain(location.get("resolution_chain"), "location")
+        owner_entity_id = str(location["business_entity_id"])
+        try:
+            owner = resolve_subject(conn, owner_entity_id, "business_entity")
+        except DossierQueryError as exc:
+            raise DossierAssessmentError(
+                f"cannot resolve owner Entity for dossier location {location['id']}: {exc}"
+            ) from exc
+        add_chain(owner["chain"], "business_entity")
+
+    for review in dossier["customer_voice"]["reviews"]:
+        add(review.get("source_location_id"), "location")
+        add(review.get("canonical_location_id"), "location")
+        add_chain(review.get("location_resolution_chain"), "location")
+
+    result: list[dict[str, Any]] = []
+    try:
+        for subject_id, kind in sorted(
+            expected_kinds.items(), key=lambda item: (item[1], item[0])
+        ):
+            row = subject(conn, subject_id, kind)
+            result.append(
+                {
+                    "id": subject_id,
+                    "kind": kind,
+                    "record_state": row["record_state"],
+                    "merged_into_subject_id": row["merged_into_subject_id"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                    "merged_at": row["merged_at"],
+                }
+            )
+    except DossierQueryError as exc:
+        raise DossierAssessmentError(
+            f"cannot read structural Understanding subject state: {exc}"
+        ) from exc
+    return result
+
+
 def _chronology_inputs(
     dossier: dict[str, Any],
     location_owner_resolution: list[dict[str, Any]],
+    structural_subject_state: list[dict[str, Any]],
 ) -> list[dict[str, object]]:
     """Return every timestamped logical input used to derive ``facts_as_of``.
 
@@ -127,9 +209,18 @@ def _chronology_inputs(
     entity = dossier["business_entity"]
     add(entity.get("created_at"), "business entity created_at")
     add(entity.get("updated_at"), "business entity updated_at")
+    for node in structural_subject_state:
+        subject_label = f"{node['kind']} subject {node['id']}"
+        add(node.get("created_at"), f"{subject_label} created_at")
+        add(node.get("updated_at"), f"{subject_label} updated_at")
+        add(node.get("merged_at"), f"{subject_label} merged_at")
     for owner in location_owner_resolution:
         for node in owner["resolution_chain"]:
             owner_id = node["id"]
+            add(
+                node.get("created_at"),
+                f"location {owner['location_id']} owner Entity {owner_id} created_at",
+            )
             add(
                 node.get("updated_at"),
                 f"location {owner['location_id']} owner Entity {owner_id} updated_at",
@@ -179,6 +270,7 @@ def _chronology_inputs(
         evidence_id = evidence["id"]
         session_id = evidence["acquisition_session_id"]
         add(evidence.get("retrieved_at"), f"evidence {evidence_id} retrieved_at")
+        add(evidence.get("published_at"), f"evidence {evidence_id} published_at")
         add(
             evidence.get("acquisition_started_at"),
             f"evidence {evidence_id} acquisition {session_id} started_at",
@@ -207,6 +299,10 @@ def _chronology_inputs(
             f"review evidence {evidence_id} retrieved_at",
         )
         add(
+            evidence.get("published_at"),
+            f"review evidence {evidence_id} published_at",
+        )
+        add(
             evidence.get("acquisition_started_at"),
             f"review evidence {evidence_id} acquisition {session_id} started_at",
         )
@@ -223,9 +319,14 @@ def _chronology_inputs(
 def _input_watermark(
     dossier: dict[str, Any],
     location_owner_resolution: list[dict[str, Any]],
+    structural_subject_state: list[dict[str, Any]],
 ) -> str:
     """Return the latest timestamped input represented by the dossier snapshot."""
-    chronology = _chronology_inputs(dossier, location_owner_resolution)
+    chronology = _chronology_inputs(
+        dossier,
+        location_owner_resolution,
+        structural_subject_state,
+    )
     if not chronology:
         raise DossierAssessmentError(
             "dossier has no timestamped state from which to derive facts_as_of"
@@ -322,11 +423,17 @@ def _input_signature(
     dossier: dict[str, Any],
     domains: list[dict[str, Any]],
     location_owner_resolution: list[dict[str, Any]],
+    structural_subject_state: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Capture all state that can change or materially support the v1 assessment."""
     return {
-        "chronology_inputs": _chronology_inputs(dossier, location_owner_resolution),
+        "chronology_inputs": _chronology_inputs(
+            dossier,
+            location_owner_resolution,
+            structural_subject_state,
+        ),
         "location_owner_resolution": location_owner_resolution,
+        "structural_subject_state": structural_subject_state,
         "locations": [_location_signature(location) for location in dossier["locations"]],
         "facts": [
             {
@@ -358,6 +465,7 @@ def _input_signature(
                 "source_id": review["evidence"]["source_id"],
                 "content_sha256": review["evidence"]["content_sha256"],
                 "retrieved_at": review["evidence"]["retrieved_at"],
+                "published_at": review["evidence"]["published_at"],
                 "acquisition_session_id": review["evidence"]["acquisition_session_id"],
                 "acquisition_target_subject_id": review["evidence"][
                     "acquisition_target_subject_id"
@@ -514,6 +622,7 @@ def persist_dossier_assessment(
         )
         entity = str(dossier["business_entity"]["id"])
         location_owner_resolution = _location_owner_resolution_state(conn, dossier)
+        structural_subject_state = _structural_subject_state(conn, dossier)
         domains = derive_domain_assessments(dossier)
         mandatory = {
             seed.name
@@ -529,7 +638,11 @@ def persist_dossier_assessment(
             )
         )
         analysis_ready = not blocking and not dossier["integrity_issues"]
-        facts_as_of = _input_watermark(dossier, location_owner_resolution)
+        facts_as_of = _input_watermark(
+            dossier,
+            location_owner_resolution,
+            structural_subject_state,
+        )
         if parse_timestamp(facts_as_of, field="facts_as_of") > parse_timestamp(
             computed_at, field="computed_at"
         ):
@@ -537,7 +650,12 @@ def persist_dossier_assessment(
                 "dossier input watermark is later than the assessment clock; refusing impossible chronology"
             )
 
-        signature = _input_signature(dossier, domains, location_owner_resolution)
+        signature = _input_signature(
+            dossier,
+            domains,
+            location_owner_resolution,
+            structural_subject_state,
+        )
         identity_payload = {
             "business_entity_id": entity,
             "policy_version": DOSSIER_POLICY_VERSION,
