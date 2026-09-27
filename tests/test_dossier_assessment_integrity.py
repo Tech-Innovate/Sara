@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -67,7 +68,8 @@ def _prepared(path: Path, *, with_review: bool = False):
             }
         ]
     ingest_records(conn, "r1", [record], finalize_run=("complete", 0, None))
-    backfill_maps_business_understanding(conn)
+    with patch("sara.maps_backfill._utc_now", return_value="2026-09-26T10:00:00+00:00"):
+        backfill_maps_business_understanding(conn)
     return conn
 
 
