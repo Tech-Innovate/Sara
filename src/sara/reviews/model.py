@@ -36,10 +36,12 @@ class ReviewExtractionStats:
     session_id: str
     business_id: int
     business_entity_id: str
-    location_id: str
+    source_business_entity_id: str
+    source_location_id: str
+    canonical_location_id: str
     source_evidence_id: str
     source_review_records: int
-    unique_review_evidence: int
+    review_evidence_records: int
     evidence_items_created: int
     observations_created: int
     duplicate_source_records_collapsed: int
