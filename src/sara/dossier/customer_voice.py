@@ -39,16 +39,17 @@ def customer_review_observations(
     conn: sqlite3.Connection,
     current_location_ids: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Project evidence-only customer reviews onto the current dossier identity.
+    """Project provenance-valid evidence-only reviews onto the current dossier.
 
     Review lookup is restricted to the reverse redirect closure of the selected
     current Locations before any review payload is decoded. Review observations
     remain on their immutable source-time Location and are exposed only when that
     Location still resolves to one of the selected current Locations.
 
-    The projection exposes normalized customer statements plus bounded
-    provenance, not raw evidence metadata that may contain reviewer profile or
-    display identifiers.
+    A structurally reachable review whose evidence/session provenance is invalid
+    is reported as an integrity issue but is not promoted into ``customer_voice``.
+    The projection never exposes raw evidence metadata that may contain reviewer
+    profile or display identifiers.
     """
     source_ids = _location_lineage(conn, current_location_ids)
     if not source_ids:
@@ -132,7 +133,9 @@ def customer_review_observations(
             )
             continue
 
+        provenance_valid = True
         if item["evidence_status"] != "usable":
+            provenance_valid = False
             issues.append(
                 {
                     "code": "customer_review_uses_nonusable_evidence",
@@ -142,6 +145,7 @@ def customer_review_observations(
                 }
             )
         if item["source_role"] != "customer_generated":
+            provenance_valid = False
             issues.append(
                 {
                     "code": "customer_review_source_role_mismatch",
@@ -151,6 +155,7 @@ def customer_review_observations(
                 }
             )
         if item["acquisition_source_id"] != item["source_id"]:
+            provenance_valid = False
             issues.append(
                 {
                     "code": "customer_review_source_session_mismatch",
@@ -159,6 +164,7 @@ def customer_review_observations(
                 }
             )
         if item["acquisition_status"] not in {"complete", "partial"}:
+            provenance_valid = False
             issues.append(
                 {
                     "code": "customer_review_from_unusable_acquisition_state",
@@ -167,6 +173,8 @@ def customer_review_observations(
                     "acquisition_status": item["acquisition_status"],
                 }
             )
+        if not provenance_valid:
+            continue
 
         value = json_value(
             item["value_json"], field=f"review observation {observation_id} value_json"
