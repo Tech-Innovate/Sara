@@ -20,7 +20,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Apply guarded patch
-        run: python scripts/_patch_unicode_idna_hardening.py
+        run: |
+          python scripts/_patch_unicode_idna_hardening.py
+          python scripts/_patch_unicode_idna_version_pin.py
       - name: Install and verify
         run: |
           python -m pip install -e ".[dev]"
@@ -30,6 +32,7 @@ jobs:
       - name: Commit source patch and remove helpers
         run: |
           rm scripts/_patch_unicode_idna_hardening.py
+          rm scripts/_patch_unicode_idna_version_pin.py
           rm .github/workflows/patch-unicode-idna-hardening.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
