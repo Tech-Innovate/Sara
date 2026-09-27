@@ -65,6 +65,7 @@ def _input_watermark(dossier: dict[str, Any]) -> str:
     add(entity.get("updated_at"), "business entity updated_at")
     for location in dossier["locations"]:
         add(location.get("updated_at"), f"location {location['id']} updated_at")
+        add(location.get("merged_at"), f"location {location['id']} merged_at")
     for business in dossier["maps_businesses"]:
         add(business.get("last_seen_at"), f"Maps business {business['id']} last_seen_at")
     for fact in dossier["facts"]:
@@ -154,11 +155,39 @@ def _acquisition_support_signature(fact: dict[str, Any]) -> list[dict[str, Any]]
     )
 
 
+def _location_signature(location: dict[str, Any]) -> dict[str, Any]:
+    identifiers = [
+        {
+            "id": identifier["id"],
+            "source_id": identifier["source_id"],
+            "namespace": identifier["namespace"],
+            "value": identifier["value"],
+            "status": identifier["status"],
+            "first_observed_at": identifier["first_observed_at"],
+            "last_observed_at": identifier["last_observed_at"],
+        }
+        for identifier in location["external_identifiers"]
+    ]
+    return {
+        "id": location["id"],
+        "business_entity_id": location["business_entity_id"],
+        "record_state": location["record_state"],
+        "merged_into_subject_id": location["merged_into_subject_id"],
+        "merged_at": location["merged_at"],
+        "canonical_location_id": location["canonical_location_id"],
+        "resolution_chain": list(location["resolution_chain"]),
+        "current_for_entity": bool(location["current_for_entity"]),
+        "relationship_to_entity": location["relationship_to_entity"],
+        "external_identifiers": identifiers,
+    }
+
+
 def _input_signature(
     dossier: dict[str, Any], domains: list[dict[str, Any]]
 ) -> dict[str, Any]:
     """Capture all state that can change or materially support the v1 assessment."""
     return {
+        "locations": [_location_signature(location) for location in dossier["locations"]],
         "facts": [
             {
                 "id": fact["id"],
@@ -180,6 +209,7 @@ def _input_signature(
                 "observation_id": review["observation_id"],
                 "source_location_id": review["source_location_id"],
                 "canonical_location_id": review["canonical_location_id"],
+                "location_resolution_chain": list(review["location_resolution_chain"]),
                 "value_hash": review["value_hash"],
                 "evidence_id": review["evidence"]["id"],
                 "content_sha256": review["evidence"]["content_sha256"],
