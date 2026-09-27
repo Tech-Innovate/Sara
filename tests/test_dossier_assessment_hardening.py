@@ -187,6 +187,58 @@ def test_location_redirect_timestamp_participates_in_assessment_chronology(
     conn.close()
 
 
+def test_owner_entity_redirect_timestamp_participates_in_assessment_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "owner-entity-redirect-chronology.sqlite")
+    ingest_records(
+        conn,
+        "r1",
+        [
+            _record("a", latitude=21.55, with_review=False),
+            _record("b", latitude=21.56, with_review=False),
+        ],
+        finalize_run=("complete", 0, None),
+    )
+    _backfill(conn)
+    business_a, business_b = [
+        int(row[0]) for row in conn.execute("SELECT id FROM businesses ORDER BY id")
+    ]
+    source_entity = business_entity_id_for_maps_business(business_a)
+    target_entity = business_entity_id_for_maps_business(business_b)
+    source_location = location_id_for_maps_business(business_a)
+    assert source_entity != target_entity
+
+    future_merge = "2026-09-30T13:00:00+00:00"
+    conn.execute(
+        "UPDATE knowledge_subjects SET record_state='merged',merged_into_subject_id=?,"
+        "merged_at=?,updated_at=? WHERE id=?",
+        (target_entity, future_merge, future_merge, source_entity),
+    )
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn,
+        entity_id=target_entity,
+        evaluated_at="2026-09-28T10:00:00+00:00",
+    )
+    source_location_row = next(
+        item for item in dossier["locations"] if item["id"] == source_location
+    )
+    assert source_location_row["business_entity_id"] == source_entity
+    assert source_location_row["current_for_entity"] is True
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            entity_id=target_entity,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
 def test_external_identifier_observation_timestamp_participates_in_assessment_chronology(
     tmp_path: Path,
 ) -> None:
