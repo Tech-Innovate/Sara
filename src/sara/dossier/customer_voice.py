@@ -192,18 +192,80 @@ def customer_review_observations(
         if not provenance_valid:
             continue
 
-        try:
-            parse_timestamp(
+        parsed_timestamps: dict[str, Any] = {}
+        timestamp_specs = (
+            (
+                "retrieved_at",
                 item["retrieved_at"],
-                field=f"review evidence {evidence_id} retrieved_at",
-            )
-        except DossierQueryError as exc:
+                "customer_review_retrieved_at_invalid",
+                f"review evidence {evidence_id} retrieved_at",
+            ),
+            (
+                "extracted_at",
+                item["extracted_at"],
+                "customer_review_extracted_at_invalid",
+                f"review observation {observation_id} extracted_at",
+            ),
+            (
+                "acquisition_started_at",
+                item["acquisition_started_at"],
+                "customer_review_acquisition_started_at_invalid",
+                f"review acquisition {item['acquisition_session_id']} started_at",
+            ),
+            (
+                "acquisition_finished_at",
+                item["acquisition_finished_at"],
+                "customer_review_acquisition_finished_at_invalid",
+                f"review acquisition {item['acquisition_session_id']} finished_at",
+            ),
+        )
+        timestamp_valid = True
+        for timestamp_key, timestamp_value, issue_code, field_name in timestamp_specs:
+            try:
+                parsed_timestamps[timestamp_key] = parse_timestamp(
+                    timestamp_value,
+                    field=field_name,
+                )
+            except DossierQueryError as exc:
+                timestamp_valid = False
+                issues.append(
+                    {
+                        "code": issue_code,
+                        "observation_id": observation_id,
+                        "evidence_id": evidence_id,
+                        "error": str(exc),
+                    }
+                )
+        if item["observed_at"] is not None:
+            try:
+                parse_timestamp(
+                    item["observed_at"],
+                    field=f"review observation {observation_id} observed_at",
+                )
+            except DossierQueryError as exc:
+                timestamp_valid = False
+                issues.append(
+                    {
+                        "code": "customer_review_observed_at_invalid",
+                        "observation_id": observation_id,
+                        "evidence_id": evidence_id,
+                        "error": str(exc),
+                    }
+                )
+        if not timestamp_valid:
+            continue
+        if (
+            parsed_timestamps["acquisition_finished_at"]
+            < parsed_timestamps["acquisition_started_at"]
+        ):
             issues.append(
                 {
-                    "code": "customer_review_retrieved_at_invalid",
+                    "code": "customer_review_acquisition_chronology_invalid",
                     "observation_id": observation_id,
                     "evidence_id": evidence_id,
-                    "error": str(exc),
+                    "acquisition_session_id": item["acquisition_session_id"],
+                    "acquisition_started_at": item["acquisition_started_at"],
+                    "acquisition_finished_at": item["acquisition_finished_at"],
                 }
             )
             continue
