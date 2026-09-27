@@ -34,8 +34,8 @@ class DossierDomainSeed:
 
 # Phase 2 installed the first 16 predicates. Phase 3 adds one predicate that
 # the v0.2 Maps-backfill contract explicitly requires for the legacy `status`
-# field. Keep the original tuple immutable so the historical phase boundary is
-# reviewable instead of silently redefining "v1" after it shipped.
+# field. Keep the historical tuples immutable so old deployed databases remain
+# readable while additive feature vocabularies are introduced separately.
 PREDICATE_SEED_V1: tuple[PredicateSeed, ...] = (
     PredicateSeed(
         "business.name.trading",
@@ -231,10 +231,11 @@ PREDICATE_SEED_REVIEW_INTELLIGENCE: tuple[PredicateSeed, ...] = (
 )
 
 
+FOUNDATION_PREDICATE_SEEDS: tuple[PredicateSeed, ...] = (
+    PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3
+)
 PREDICATE_SEEDS: tuple[PredicateSeed, ...] = (
-    PREDICATE_SEED_V1
-    + PREDICATE_SEED_PHASE3
-    + PREDICATE_SEED_REVIEW_INTELLIGENCE
+    FOUNDATION_PREDICATE_SEEDS + PREDICATE_SEED_REVIEW_INTELLIGENCE
 )
 VOCABULARY_VERSION = "business-understanding-v3"
 DOSSIER_POLICY_VERSION = "business-understanding-v1"
@@ -309,10 +310,12 @@ def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
         )
 
 
-def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
-    """Fail closed unless the current controlled predicate vocabulary is installed exactly."""
+def _verify_predicates(
+    conn: sqlite3.Connection,
+    seeds: tuple[PredicateSeed, ...],
+) -> None:
     _require_exact_phase_one_history(conn)
-    for seed in PREDICATE_SEEDS:
+    for seed in seeds:
         row = conn.execute(
             "SELECT domain, subject_kind, value_type, cardinality, "
             "reconciliation_policy, freshness_days, description, active "
@@ -332,6 +335,21 @@ def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
             )
 
 
+def verify_business_understanding_vocabulary(conn: sqlite3.Connection) -> None:
+    """Verify the foundational vocabulary required by existing readers/writers.
+
+    Additive feature predicates do not become a deployment-order prerequisite
+    for already-shipped read-only surfaces such as ``sara-dossier``. They have
+    feature-specific verification gates instead.
+    """
+    _verify_predicates(conn, FOUNDATION_PREDICATE_SEEDS)
+
+
+def verify_review_intelligence_vocabulary(conn: sqlite3.Connection) -> None:
+    """Verify the foundation plus the Review Intelligence evidence predicate."""
+    _verify_predicates(conn, PREDICATE_SEEDS)
+
+
 def seed_business_understanding_vocabulary(
     conn: sqlite3.Connection,
 ) -> tuple[str, ...]:
@@ -343,6 +361,7 @@ def seed_business_understanding_vocabulary(
 
     Historical predicate tuples remain separately named and immutable. Current
     builds additionally install the Review Intelligence evidence-only predicate.
+    Existing readers continue to require only the foundational vocabulary.
     """
     if conn.in_transaction:
         raise VocabularySeedError(
