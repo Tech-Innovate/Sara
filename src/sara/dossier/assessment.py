@@ -175,9 +175,20 @@ def _input_watermark(
     for review in dossier["customer_voice"]["reviews"]:
         add(review.get("observed_at"), f"review {review['observation_id']} observed_at")
         add(review.get("extracted_at"), f"review {review['observation_id']} extracted_at")
+        evidence = review["evidence"]
+        evidence_id = evidence["id"]
+        session_id = evidence["acquisition_session_id"]
         add(
-            review["evidence"].get("retrieved_at"),
-            f"review evidence {review['evidence']['id']} retrieved_at",
+            evidence.get("retrieved_at"),
+            f"review evidence {evidence_id} retrieved_at",
+        )
+        add(
+            evidence.get("acquisition_started_at"),
+            f"review evidence {evidence_id} acquisition {session_id} started_at",
+        )
+        add(
+            evidence.get("acquisition_finished_at"),
+            f"review evidence {evidence_id} acquisition {session_id} finished_at",
         )
     if not candidates:
         raise DossierAssessmentError(
@@ -294,8 +305,18 @@ def _input_signature(
                 "location_resolution_chain": list(review["location_resolution_chain"]),
                 "value_hash": review["value_hash"],
                 "evidence_id": review["evidence"]["id"],
+                "source_id": review["evidence"]["source_id"],
                 "content_sha256": review["evidence"]["content_sha256"],
                 "retrieved_at": review["evidence"]["retrieved_at"],
+                "acquisition_session_id": review["evidence"]["acquisition_session_id"],
+                "acquisition_target_subject_id": review["evidence"][
+                    "acquisition_target_subject_id"
+                ],
+                "collector_name": review["evidence"]["collector_name"],
+                "collector_version": review["evidence"]["collector_version"],
+                "acquisition_status": review["evidence"]["acquisition_status"],
+                "acquisition_started_at": review["evidence"]["acquisition_started_at"],
+                "acquisition_finished_at": review["evidence"]["acquisition_finished_at"],
             }
             for review in dossier["customer_voice"]["reviews"]
         ],
