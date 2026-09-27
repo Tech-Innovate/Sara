@@ -153,3 +153,8 @@ Passing this gate authorizes consideration of primary-database migration/enablem
 - gap analysis or scoring;
 - automated outreach or CRM behavior;
 - parallel multi-process acquisition without a separately reviewed shared per-origin coordinator.
+
+
+## Unicode/IDNA transport hardening
+
+Official-site URLs are canonicalized to an ASCII network representation before DNS, TLS, robots, SSRF checks, origin comparison, and HTTP request serialization. Unicode hostname labels are IDNA-encoded; raw Unicode path/query characters are UTF-8 percent-encoded. Invalid Unicode/IDNA fails closed. This transport-normalization change is versioned with website collector version `4`; website reconciliation remains `official-web-v2`.

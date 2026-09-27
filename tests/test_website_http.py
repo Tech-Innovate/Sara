@@ -207,3 +207,46 @@ def test_configured_request_interval_is_enforced_per_origin() -> None:
     clock.value += 1.0
     client._pace("https://example.com/third")
     assert clock.sleeps == pytest.approx([2.5, 1.5])
+
+
+def test_unicode_site_uses_ascii_idna_for_dns_and_security() -> None:
+    lookups: list[tuple[str, int]] = []
+
+    def lookup(host, port, **_kwargs):
+        lookups.append((host, port))
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    client = SafeHttpClient(
+        site_url="https://مثال.إختبار/قائمة",
+        user_agent="SaraBusinessUnderstanding/1.0",
+        timeout_seconds=2,
+        max_response_bytes=65536,
+        dns_lookup=lookup,
+    )
+    assert client.site_url == "https://xn--mgbh0fb.xn--kgbechtv/%D9%82%D8%A7%D8%A6%D9%85%D8%A9"
+    assert client._resolve_public_addresses(client.site_url) == ("93.184.216.34",)
+    assert lookups == [("xn--mgbh0fb.xn--kgbechtv", 443)]
+    client._assert_allowed_site("https://xn--mgbh0fb.xn--kgbechtv/%D9%81%D8%B1%D8%B9")
+
+
+def test_unicode_site_still_runs_ssrf_guard_after_idna_normalization() -> None:
+    def lookup(_host, port, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    client = SafeHttpClient(
+        site_url="https://مثال.إختبار/قائمة",
+        user_agent="SaraBusinessUnderstanding/1.0",
+        timeout_seconds=2,
+        max_response_bytes=65536,
+        dns_lookup=lookup,
+    )
+    with pytest.raises(WebsiteBlockedError, match="non-public"):
+        client._assert_public_host(client.site_url)
+
+
+def test_unicode_request_target_is_ascii_serializable() -> None:
+    client = _client("93.184.216.34")
+    normalized = client.site_url.replace("example.com/", "example.com/%D9%82%D8%A7%D8%A6%D9%85%D8%A9")
+    target = client._request_target(__import__("urllib.parse", fromlist=["urlsplit"]).urlsplit(normalized))
+    assert target == "/%D9%82%D8%A7%D8%A6%D9%85%D8%A9"
+    target.encode("ascii")

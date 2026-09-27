@@ -173,3 +173,41 @@ def test_platform_host_hints_require_real_domain_boundary() -> None:
         '<a href="https://team.calendly.com/example">Schedule</a>',
     )
     assert true_booking.booking_detected is True
+
+
+def test_unicode_transport_urls_are_canonical_ascii() -> None:
+    # Production businesses 141 and 248 exposed this shape: an ASCII host with
+    # raw non-ASCII URL characters. The exact retained production URLs are not
+    # fixtures in this repository, so use representative Arabic path/query data
+    # on the observed hosts.
+    for raw in (
+        "https://mandi-hdoon.com/منيو/المندي?branch=جدة",
+        "https://stovejeddah.com/مطعم/جدة?menu=العشاء",
+    ):
+        normalized = normalize_http_url(raw)
+        assert normalized is not None
+        normalized.encode("ascii")
+        assert "%D8%" in normalized
+
+
+def test_unicode_hostname_is_idna_encoded_before_transport() -> None:
+    normalized = normalize_http_url("https://مثال.إختبار/قائمة?فرع=جدة")
+    assert normalized == (
+        "https://xn--mgbh0fb.xn--kgbechtv/%D9%82%D8%A7%D8%A6%D9%85%D8%A9"
+        "?%D9%81%D8%B1%D8%B9=%D8%AC%D8%AF%D8%A9"
+    )
+    assert same_site(
+        "https://مثال.إختبار/قائمة",
+        "https://xn--mgbh0fb.xn--kgbechtv/",
+    )
+
+
+def test_existing_percent_escapes_are_not_double_encoded() -> None:
+    assert normalize_http_url("https://example.com/%D9%82%D8%A7%D8%A6%D9%85%D8%A9") == (
+        "https://example.com/%D9%82%D8%A7%D8%A6%D9%85%D8%A9"
+    )
+
+
+def test_malformed_unicode_url_fails_closed() -> None:
+    assert normalize_http_url("https://example.com/\ud800") is None
+    assert normalize_http_url("https://\ud800.example/path") is None

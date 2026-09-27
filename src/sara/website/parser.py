@@ -4,7 +4,7 @@ import html
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 
 _TRACKING_QUERY_PREFIXES = ("utm_",)
@@ -120,12 +120,36 @@ class ParsedPage:
     whatsapp_detected: bool
 
 
+def _ascii_host(value: str) -> str | None:
+    host = value.lower().rstrip(".")
+    if not host:
+        return None
+    if ":" in host:
+        # Bracketed IPv6 literals are returned by ``urlsplit().hostname``
+        # without brackets. They must already be ASCII; address validity and
+        # public/private classification remain the HTTP client's responsibility.
+        try:
+            host.encode("ascii")
+        except UnicodeError:
+            return None
+        return host
+    try:
+        ascii_host = host.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError:
+        return None
+    if not ascii_host:
+        return None
+    return ascii_host
+
+
 def _host(value: str) -> str:
     try:
         parsed = urlsplit(value)
         _ = parsed.port
-        host = (parsed.hostname or "").lower().rstrip(".")
-    except ValueError:
+        host = _ascii_host(parsed.hostname or "")
+    except (UnicodeError, ValueError):
+        return ""
+    if host is None:
         return ""
     return host[4:] if host.startswith("www.") else host
 
@@ -144,9 +168,9 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         absolute = urljoin(base_url, value) if base_url else value
         parsed = urlsplit(absolute)
         scheme = parsed.scheme.lower()
-        host = (parsed.hostname or "").lower().rstrip(".")
+        host = _ascii_host(parsed.hostname or "")
         port = parsed.port
-    except ValueError:
+    except (UnicodeError, ValueError):
         return None
     if scheme not in {"http", "https"} or not host:
         return None
@@ -158,15 +182,31 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         netloc = f"{display_host}:{port}"
     else:
         netloc = display_host
-    path = parsed.path or "/"
-    pairs = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.lower() not in _TRACKING_QUERY_KEYS
-        and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
-    ]
-    query = urlencode(pairs, doseq=True)
-    return urlunsplit((scheme, netloc, path, query, ""))
+    try:
+        # HTTP request targets are byte-oriented. Keep RFC 3986 path delimiters
+        # and existing percent escapes, while UTF-8 percent-encoding raw Unicode
+        # before the value can reach ``http.client``'s ASCII serialization.
+        path = quote(
+            parsed.path or "/",
+            safe="/!$&'()*+,;=:@-._~%",
+            encoding="utf-8",
+            errors="strict",
+        )
+        pairs = [
+            (key, item)
+            for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() not in _TRACKING_QUERY_KEYS
+            and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
+        ]
+        query = urlencode(pairs, doseq=True, encoding="utf-8", errors="strict")
+    except (UnicodeError, ValueError):
+        return None
+    normalized = urlunsplit((scheme, netloc, path, query, ""))
+    try:
+        normalized.encode("ascii")
+    except UnicodeError:
+        return None
+    return normalized
 
 
 def _tokens(value: str) -> set[str]:
