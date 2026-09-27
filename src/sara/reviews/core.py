@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from .. import maps_backfill as mb
 from .. import maps_sync as ms
-from ..dossier.core import DossierQueryError, resolve_selection
+from ..dossier.core import DossierQueryError, resolve_selection, resolve_subject
 from ..migrations import MigrationError, apply_migrations
 from ..storage import connect_existing
 from ..understanding_vocabulary import (
@@ -110,6 +110,7 @@ def _maps_source_evidence(
     conn: sqlite3.Connection,
     *,
     business: dict[str, Any],
+    location_id: str,
 ) -> dict[str, Any]:
     raw_json = business.get("raw_json")
     if not isinstance(raw_json, str):
@@ -165,7 +166,26 @@ def _maps_source_evidence(
             raise ReviewIntelligenceError(
                 f"Maps evidence {item['id']} retrieval time disagrees with canonical Maps state"
             )
+        if expected_kind == "legacy_maps_business_snapshot":
+            frozen_location_id = mb.location_id_for_maps_business(int(business["id"]))
+        else:
+            frozen_location_id = metadata.get("sync_location_id")
+            if not isinstance(frozen_location_id, str) or not frozen_location_id:
+                raise ReviewIntelligenceError(
+                    f"Maps evidence {item['id']} has no valid frozen location anchor"
+                )
+        try:
+            resolved_location = resolve_subject(conn, frozen_location_id, "location")
+        except DossierQueryError as exc:
+            raise ReviewIntelligenceError(
+                f"Maps evidence {item['id']} has an invalid frozen location anchor: {exc}"
+            ) from exc
+        if str(resolved_location["canonical"]["id"]) != location_id:
+            raise ReviewIntelligenceError(
+                f"Maps evidence {item['id']} does not resolve to the selected current location"
+            )
         item["metadata"] = metadata
+        item["frozen_location_id"] = frozen_location_id
         candidates.append(item)
     if not candidates:
         raise ReviewIntelligenceError(
@@ -196,6 +216,7 @@ def _session_config(
             "location_id": location_id,
             "source_evidence_id": source_evidence["id"],
             "source_content_sha256": source_evidence["content_sha256"],
+            "source_frozen_location_id": source_evidence["frozen_location_id"],
             "review_array_fields": list(REVIEW_ARRAY_FIELDS),
             "source_review_records": source_review_records,
             "review_evidence_records": review_evidence_records,
@@ -235,6 +256,7 @@ def _review_metadata(
             "location_id": location_id,
             "parent_evidence_id": source_evidence["id"],
             "parent_content_sha256": source_evidence["content_sha256"],
+            "parent_frozen_location_id": source_evidence["frozen_location_id"],
             "parent_source_locator": source_evidence.get("source_locator"),
             "parent_artifact_ref": source_evidence.get("artifact_ref"),
             "review_identity": review.identity_key,
@@ -422,53 +444,61 @@ def extract_retained_reviews(
             "SQLite foreign-key enforcement must be enabled for review extraction"
         )
 
-    resolved_business_id, entity_id, location_id, business = _resolve_target(
-        conn, business_id=business_id, canonical_key=canonical_key
-    )
-    source_evidence = _maps_source_evidence(conn, business=business)
-    raw = _parse_json_object(business["raw_json"], field="canonical Maps raw_json")
-    reviews, source_review_records = extract_reviews(raw)
-    config_json = _session_config(
-        business_id=resolved_business_id,
-        entity_id=entity_id,
-        location_id=location_id,
-        source_evidence=source_evidence,
-        source_review_records=source_review_records,
-        review_evidence_records=len(reviews),
-    )
-    session_id = opaque_id(
-        "acq",
-        "retained-maps-reviews",
-        source_evidence["id"],
-        location_id,
-        COLLECTOR_VERSION,
-    )
-    existing = _verify_existing(
-        conn,
-        session_id=session_id,
-        config_json=config_json,
-        location_id=location_id,
-        business_id=resolved_business_id,
-        entity_id=entity_id,
-        source_evidence=source_evidence,
-        reviews=reviews,
-        source_review_records=source_review_records,
-    )
-    if existing is not None:
-        return existing
-
-    extracted_at = _validated_timestamp(now(), field="review extraction time")
-    rows = _expected_review_rows(
-        session_id=session_id,
-        business_id=resolved_business_id,
-        entity_id=entity_id,
-        location_id=location_id,
-        source_evidence=source_evidence,
-        reviews=reviews,
-        extracted_at=extracted_at,
-    )
     try:
+        # Freeze current Maps state, Understanding identity, retained source
+        # evidence, parsing, idempotency verification, and writes under one
+        # writer transaction. There is no network work inside this boundary.
         conn.execute("BEGIN IMMEDIATE")
+        resolved_business_id, entity_id, location_id, business = _resolve_target(
+            conn, business_id=business_id, canonical_key=canonical_key
+        )
+        source_evidence = _maps_source_evidence(
+            conn,
+            business=business,
+            location_id=location_id,
+        )
+        raw = _parse_json_object(business["raw_json"], field="canonical Maps raw_json")
+        reviews, source_review_records = extract_reviews(raw)
+        config_json = _session_config(
+            business_id=resolved_business_id,
+            entity_id=entity_id,
+            location_id=location_id,
+            source_evidence=source_evidence,
+            source_review_records=source_review_records,
+            review_evidence_records=len(reviews),
+        )
+        session_id = opaque_id(
+            "acq",
+            "retained-maps-reviews",
+            source_evidence["id"],
+            location_id,
+            COLLECTOR_VERSION,
+        )
+        existing = _verify_existing(
+            conn,
+            session_id=session_id,
+            config_json=config_json,
+            location_id=location_id,
+            business_id=resolved_business_id,
+            entity_id=entity_id,
+            source_evidence=source_evidence,
+            reviews=reviews,
+            source_review_records=source_review_records,
+        )
+        if existing is not None:
+            conn.commit()
+            return existing
+
+        extracted_at = _validated_timestamp(now(), field="review extraction time")
+        rows = _expected_review_rows(
+            session_id=session_id,
+            business_id=resolved_business_id,
+            entity_id=entity_id,
+            location_id=location_id,
+            source_evidence=source_evidence,
+            reviews=reviews,
+            extracted_at=extracted_at,
+        )
         collision = conn.execute(
             "SELECT id FROM acquisition_sessions WHERE id=?", (session_id,)
         ).fetchone()
@@ -547,24 +577,25 @@ def extract_retained_reviews(
             raise ReviewIntelligenceError(
                 f"foreign-key violations after review extraction: {violations!r}"
             )
+        stats = ReviewExtractionStats(
+            session_id=session_id,
+            business_id=resolved_business_id,
+            business_entity_id=entity_id,
+            location_id=location_id,
+            source_evidence_id=str(source_evidence["id"]),
+            source_review_records=source_review_records,
+            unique_review_evidence=len(reviews),
+            evidence_items_created=len(reviews),
+            observations_created=len(reviews),
+            duplicate_source_records_collapsed=source_review_records - len(reviews),
+            already_extracted=False,
+        )
         conn.commit()
+        return stats
     except BaseException:
-        conn.rollback()
+        if conn.in_transaction:
+            conn.rollback()
         raise
-
-    return ReviewExtractionStats(
-        session_id=session_id,
-        business_id=resolved_business_id,
-        business_entity_id=entity_id,
-        location_id=location_id,
-        source_evidence_id=str(source_evidence["id"]),
-        source_review_records=source_review_records,
-        unique_review_evidence=len(reviews),
-        evidence_items_created=len(reviews),
-        observations_created=len(reviews),
-        duplicate_source_records_collapsed=source_review_records - len(reviews),
-        already_extracted=False,
-    )
 
 
 def _positive_int(value: str) -> int:
