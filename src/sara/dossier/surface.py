@@ -81,7 +81,7 @@ def build_business_dossier(
         "schema": "sara-business-dossier-v1",
         "fact_scope": "current_only",
         "evidence_scope": "current_fact_provenance",
-        "unknown_scope": "controlled_active_predicates_on_current_subjects",
+        "unknown_scope": "controlled_active_fact_predicates_on_current_subjects",
         "evaluated_at": evaluation.isoformat(),
         "selection": selection,
         "business_entity": entity,
