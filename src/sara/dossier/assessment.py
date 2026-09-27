@@ -206,12 +206,13 @@ def persist_dossier_assessment(
 ) -> DossierAssessmentResult:
     """Compute and seal one immutable dossier sufficiency snapshot.
 
-    Current database state is frozen under one writer transaction. The operation
-    performs no acquisition, migration, vocabulary seeding, synchronization, or
-    external I/O. Customer reviews remain evidence-only inputs. A repeated run
-    with the same logical input and freshness state reuses the same deterministic
-    snapshot; a later freshness transition creates a new immutable snapshot even
-    when the underlying factual watermark is unchanged.
+    Current database state and the assessment clock are frozen under one writer
+    transaction. The operation performs no acquisition, migration, vocabulary
+    seeding, synchronization, or external I/O. Customer reviews remain
+    evidence-only inputs. A repeated run with the same logical input and
+    freshness state reuses the same deterministic snapshot; a later freshness
+    transition creates a new immutable snapshot even when the underlying factual
+    watermark is unchanged.
     """
     if conn.in_transaction:
         raise DossierAssessmentError(
@@ -223,9 +224,9 @@ def persist_dossier_assessment(
             "SQLite foreign-key enforcement must be enabled for dossier assessment"
         )
 
-    computed_at = _validated_timestamp(now(), field="dossier assessment time")
     try:
         conn.execute("BEGIN IMMEDIATE")
+        computed_at = _validated_timestamp(now(), field="dossier assessment time")
         dossier = build_business_dossier(
             conn,
             business_id=business_id,
