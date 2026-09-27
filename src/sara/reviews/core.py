@@ -110,7 +110,6 @@ def _maps_source_evidence(
     conn: sqlite3.Connection,
     *,
     business: dict[str, Any],
-    entity_id: str,
     location_id: str,
 ) -> dict[str, Any]:
     raw_json = business.get("raw_json")
@@ -191,7 +190,7 @@ def _maps_source_evidence(
             )
         try:
             resolved_location = resolve_subject(conn, frozen_location_id, "location")
-            resolved_entity = resolve_subject(conn, frozen_entity_id, "business_entity")
+            resolve_subject(conn, frozen_entity_id, "business_entity")
         except DossierQueryError as exc:
             raise ReviewIntelligenceError(
                 f"Maps evidence {item['id']} has an invalid frozen subject anchor: {exc}"
@@ -200,10 +199,10 @@ def _maps_source_evidence(
             raise ReviewIntelligenceError(
                 f"Maps evidence {item['id']} does not resolve to the selected current location"
             )
-        if str(resolved_entity["canonical"]["id"]) != entity_id:
-            raise ReviewIntelligenceError(
-                f"Maps evidence {item['id']} does not resolve to the selected current entity"
-            )
+        # Location convergence can legitimately move the canonical Location
+        # under another provisional Business Entity while the source-time
+        # Location keeps its immutable historical owner. Preserve that source
+        # entity instead of requiring it to equal today's canonical owner.
         item["metadata"] = metadata
         item["frozen_entity_id"] = frozen_entity_id
         item["frozen_location_id"] = frozen_location_id
@@ -490,7 +489,6 @@ def extract_retained_reviews(
         source_evidence = _maps_source_evidence(
             conn,
             business=business,
-            entity_id=entity_id,
             location_id=canonical_location_id,
         )
         raw = _parse_json_object(business["raw_json"], field="canonical Maps raw_json")
