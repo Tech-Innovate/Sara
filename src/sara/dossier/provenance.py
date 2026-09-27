@@ -63,8 +63,9 @@ def attach_provenance(
         "o.confidence,e.id AS evidence_id,e.source_id,e.source_locator,e.source_role,"
         "e.status AS evidence_status,e.retrieved_at,e.published_at,e.language,e.media_type,"
         "e.content_sha256,e.artifact_ref,a.id AS acquisition_session_id,a.collector_name,"
-        "a.collector_version,a.status AS acquisition_status,s.source_type,s.name AS source_name,"
-        "s.base_url,s.active AS source_active "
+        "a.collector_version,a.status AS acquisition_status,"
+        "a.started_at AS acquisition_started_at,a.finished_at AS acquisition_finished_at,"
+        "s.source_type,s.name AS source_name,s.base_url,s.active AS source_active "
         "FROM fact_observation_support fos "
         "JOIN observations o ON o.id=fos.observation_id "
         "JOIN evidence_items e ON e.id=o.evidence_id "
@@ -98,6 +99,12 @@ def attach_provenance(
             "evidence_id": item["evidence_id"],
             "source_id": item["source_id"],
             "evidence_status": item["evidence_status"],
+            "acquisition_session_id": item["acquisition_session_id"],
+            "collector_name": item["collector_name"],
+            "collector_version": item["collector_version"],
+            "acquisition_status": item["acquisition_status"],
+            "acquisition_started_at": item["acquisition_started_at"],
+            "acquisition_finished_at": item["acquisition_finished_at"],
         }
         fact_by_id[fact_id]["observation_support"].append(support)
         evidence_id = str(item["evidence_id"])
@@ -123,6 +130,8 @@ def attach_provenance(
                 "collector_name": item["collector_name"],
                 "collector_version": item["collector_version"],
                 "acquisition_status": item["acquisition_status"],
+                "acquisition_started_at": item["acquisition_started_at"],
+                "acquisition_finished_at": item["acquisition_finished_at"],
                 "observations": [],
             },
         )
