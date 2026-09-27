@@ -150,8 +150,9 @@ def attach_provenance(
     }
     cursor = conn.execute(
         "SELECT fas.fact_id,fas.support_role,a.id AS acquisition_session_id,a.source_id,"
-        "a.collector_name,a.collector_version,a.status,a.started_at,a.finished_at,a.legacy_run_id,"
-        "s.source_type,s.name AS source_name FROM fact_acquisition_support fas "
+        "a.collector_name,a.collector_version,a.target_subject_id,a.status,a.started_at,"
+        "a.finished_at,a.legacy_run_id,s.source_type,s.name AS source_name "
+        "FROM fact_acquisition_support fas "
         "JOIN acquisition_sessions a ON a.id=fas.acquisition_session_id "
         "JOIN sources s ON s.id=a.source_id "
         f"WHERE fas.fact_id IN ({placeholders}) ORDER BY fas.fact_id,fas.support_role,a.id",
