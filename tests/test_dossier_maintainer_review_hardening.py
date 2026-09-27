@@ -329,3 +329,101 @@ def test_external_identifier_created_at_participates_in_assessment_chronology(
     assert conn.in_transaction is False
     assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
     conn.close()
+
+
+def test_business_entity_created_at_participates_in_assessment_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "entity-created-at-future.sqlite")
+    entity_id = str(conn.execute("SELECT id FROM business_entities").fetchone()[0])
+    conn.execute(
+        "UPDATE business_entities SET created_at='2026-09-30T13:00:00+00:00' WHERE id=?",
+        (entity_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_business_location_created_at_participates_in_assessment_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "location-created-at-future.sqlite")
+    location_id = location_id_for_maps_business(1)
+    conn.execute(
+        "UPDATE business_locations SET created_at='2026-09-30T13:00:00+00:00' WHERE id=?",
+        (location_id,),
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_maps_linked_at_participates_in_assessment_chronology(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "maps-linked-at-future.sqlite")
+    conn.execute(
+        "UPDATE maps_business_location_links "
+        "SET linked_at='2026-09-30T13:00:00+00:00' WHERE business_id=1"
+    )
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=1,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
+def test_maps_linked_at_changes_signature_below_stable_watermark(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "maps-linked-at-signature.sqlite")
+    location_id = location_id_for_maps_business(1)
+    stable_later_watermark = "2026-09-29T00:00:00+00:00"
+    conn.execute(
+        "UPDATE external_identifiers SET last_observed_at=? "
+        "WHERE subject_id=? AND namespace='place_id' AND status='active'",
+        (stable_later_watermark, location_id),
+    )
+    conn.commit()
+
+    first = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-30T10:00:00+00:00",
+    )
+    assert first.facts_as_of == stable_later_watermark
+
+    conn.execute(
+        "UPDATE maps_business_location_links "
+        "SET linked_at='2026-09-28T12:00:00+00:00' WHERE business_id=1"
+    )
+    conn.commit()
+
+    second = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-30T10:00:00+00:00",
+    )
+    assert second.facts_as_of == first.facts_as_of
+    assert second.assessment_id != first.assessment_id
+    assert second.already_assessed is False
+    conn.close()
