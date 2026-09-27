@@ -1246,11 +1246,40 @@ BUSINESS_UNDERSTANDING_V1: tuple[str, ...] = (
 )
 
 
+BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
+    """
+    ALTER TABLE external_identifiers ADD COLUMN status_changed_at TEXT
+    """,
+    """
+    CREATE TRIGGER external_identifiers_status_transition_timestamp
+    BEFORE UPDATE OF status, status_changed_at ON external_identifiers
+    WHEN (
+        NEW.status <> OLD.status
+        AND (
+            NEW.status_changed_at IS NULL
+            OR NEW.status_changed_at IS OLD.status_changed_at
+        )
+    ) OR (
+        NEW.status = OLD.status
+        AND NEW.status_changed_at IS NOT OLD.status_changed_at
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'external identifier status changes require a new transition timestamp');
+    END
+    """,
+)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
         name="business_understanding_foundation_v1",
         statements=BUSINESS_UNDERSTANDING_V1,
+    ),
+    Migration(
+        version=2,
+        name="external_identifier_status_chronology_v2",
+        statements=BUSINESS_UNDERSTANDING_V2,
     ),
 )
 
