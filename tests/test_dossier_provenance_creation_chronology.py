@@ -133,6 +133,19 @@ def test_material_observation_created_at_participates_in_assessment_chronology(
     conn.close()
 
 
+def test_maps_business_first_seen_at_participates_in_assessment_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "maps-first-seen-at-future.sqlite")
+    conn.execute(
+        "UPDATE businesses SET first_seen_at='2026-09-30T13:00:00+00:00' WHERE id=1"
+    )
+    conn.commit()
+
+    _assert_future_input_rolls_back(conn)
+    conn.close()
+
+
 def test_provenance_created_at_changes_signature_below_stable_watermark(
     tmp_path: Path,
 ) -> None:
