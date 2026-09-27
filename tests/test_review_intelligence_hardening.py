@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from sara.maps_backfill import (
     business_entity_id_for_maps_business,
     location_id_for_maps_business,
 )
+from sara.maps_sync import SYNC_COLLECTOR_NAME, SYNC_VERSION, sync_maps_business_understanding
 from sara.migrations import apply_migrations
 from sara.reviews import ReviewIntelligenceError, extract_retained_reviews
 from sara.reviews.model import REVIEW_PREDICATE
@@ -27,7 +29,12 @@ def prepared_conn(path: Path):
     return conn
 
 
-def add_run(conn, run_id: str) -> None:
+def add_run(
+    conn,
+    run_id: str,
+    *,
+    started_at: str = "2026-09-27T07:00:00+00:00",
+) -> None:
     conn.execute(
         "INSERT INTO runs("
         "id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,config_json,"
@@ -43,7 +50,7 @@ def add_run(conn, run_id: str) -> None:
             "gosom/google-maps-scraper:v1.18.1",
             '{"strict_bounds":true}',
             f"/evidence/{run_id}.jsonl",
-            "2026-09-27T07:00:00+00:00",
+            started_at,
         ),
     )
     conn.commit()
@@ -252,6 +259,47 @@ def test_unrelated_malformed_maps_metadata_does_not_poison_selected_business(
         "SELECT metadata_json FROM evidence_items WHERE id=?",
         (corrupt_evidence_id,),
     ).fetchone()[0] == "{not-valid-json"
+    conn.close()
+
+
+def test_current_maps_sync_snapshot_remains_valid_review_parent(tmp_path: Path) -> None:
+    conn = prepared_conn(tmp_path / "maps-sync-parent.sqlite")
+    business_id = ingest_businesses(conn, [record("sync", latitude=21.55)])[0]
+
+    updated = record("sync", latitude=21.55)
+    updated_review = updated["user_reviews"][0]
+    updated_review["Description"] = "Updated retained review"
+    updated_review["text_original"] = "Updated retained review"
+    updated_review["updated_at_unix_micros"] = 1_756_771_200_000_000
+    add_run(conn, "r2", started_at="2026-09-27T08:00:00+00:00")
+    ingest_records(conn, "r2", [updated], finalize_run=("complete", 0, None))
+
+    sync_stats = sync_maps_business_understanding(conn)
+    assert sync_stats.evidence_items_created == 1
+
+    stats = extract_retained_reviews(
+        conn,
+        business_id=business_id,
+        now=lambda: "2026-09-27T09:00:00+00:00",
+    )
+
+    parent = conn.execute(
+        "SELECT a.collector_name,a.collector_version,a.legacy_run_id,e.metadata_json "
+        "FROM evidence_items e JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+        "WHERE e.id=?",
+        (stats.source_evidence_id,),
+    ).fetchone()
+    assert tuple(parent[:3]) == (SYNC_COLLECTOR_NAME, SYNC_VERSION, "r2")
+    assert json.loads(parent["metadata_json"])["import_kind"] == "maps_sync_snapshot"
+    value = json.loads(
+        conn.execute(
+            "SELECT value_json FROM observations WHERE predicate=? "
+            "AND extractor_name=? AND extractor_version=?",
+            (REVIEW_PREDICATE, review_core.COLLECTOR_NAME, review_core.COLLECTOR_VERSION),
+        ).fetchone()[0]
+    )
+    assert value["review_id"] == "review-sync"
+    assert value["text_original"] == "Updated retained review"
     conn.close()
 
 
