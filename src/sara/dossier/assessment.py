@@ -188,10 +188,106 @@ def _structural_subject_state(
     return result
 
 
+def _provenance_record_state(
+    conn: sqlite3.Connection,
+    dossier: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Seal creation chronology for material source/evidence/observation rows.
+
+    Storage creation timestamps are assessment-only chronology. Keeping them
+    here avoids widening the read-only dossier contract while preventing an
+    assessment clock from predating provenance records it evaluates.
+    """
+    source_ids: set[str] = set()
+    evidence_ids: set[str] = set()
+    observation_ids: set[str] = set()
+
+    def collect(value: object, target: set[str]) -> None:
+        if value not in (None, ""):
+            target.add(str(value))
+
+    for location in dossier["locations"]:
+        for identifier in location["external_identifiers"]:
+            collect(identifier.get("source_id"), source_ids)
+
+    for fact in dossier["facts"]:
+        for support in fact["observation_support"]:
+            collect(support.get("source_id"), source_ids)
+            collect(support.get("evidence_id"), evidence_ids)
+            collect(support.get("observation_id"), observation_ids)
+        for support in fact["acquisition_support"]:
+            collect(support.get("source_id"), source_ids)
+
+    for evidence in dossier["evidence"]:
+        collect(evidence.get("id"), evidence_ids)
+        collect(evidence.get("source_id"), source_ids)
+        for observation in evidence["observations"]:
+            collect(observation.get("id"), observation_ids)
+
+    for review in dossier["customer_voice"]["reviews"]:
+        collect(review.get("observation_id"), observation_ids)
+        evidence = review["evidence"]
+        collect(evidence.get("id"), evidence_ids)
+        collect(evidence.get("source_id"), source_ids)
+
+    result: list[dict[str, Any]] = []
+    for source_id in sorted(source_ids):
+        row = conn.execute(
+            "SELECT id,source_type,created_at FROM sources WHERE id=?",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            raise DossierAssessmentError(
+                f"material provenance source {source_id!r} disappeared during assessment"
+            )
+        result.append(
+            {
+                "kind": "source",
+                "id": str(row[0]),
+                "source_type": row[1],
+                "created_at": row[2],
+            }
+        )
+    for evidence_id in sorted(evidence_ids):
+        row = conn.execute(
+            "SELECT id,created_at FROM evidence_items WHERE id=?",
+            (evidence_id,),
+        ).fetchone()
+        if row is None:
+            raise DossierAssessmentError(
+                f"material evidence item {evidence_id!r} disappeared during assessment"
+            )
+        result.append(
+            {
+                "kind": "evidence_item",
+                "id": str(row[0]),
+                "created_at": row[1],
+            }
+        )
+    for observation_id in sorted(observation_ids):
+        row = conn.execute(
+            "SELECT id,created_at FROM observations WHERE id=?",
+            (observation_id,),
+        ).fetchone()
+        if row is None:
+            raise DossierAssessmentError(
+                f"material observation {observation_id!r} disappeared during assessment"
+            )
+        result.append(
+            {
+                "kind": "observation",
+                "id": str(row[0]),
+                "created_at": row[1],
+            }
+        )
+    return sorted(result, key=lambda item: (str(item["kind"]), str(item["id"])))
+
+
 def _chronology_inputs(
     dossier: dict[str, Any],
     location_owner_resolution: list[dict[str, Any]],
     structural_subject_state: list[dict[str, Any]],
+    provenance_record_state: list[dict[str, Any]],
 ) -> list[dict[str, object]]:
     """Return every timestamped logical input used to derive ``facts_as_of``.
 
@@ -214,6 +310,11 @@ def _chronology_inputs(
         add(node.get("created_at"), f"{subject_label} created_at")
         add(node.get("updated_at"), f"{subject_label} updated_at")
         add(node.get("merged_at"), f"{subject_label} merged_at")
+    for record in provenance_record_state:
+        add(
+            record.get("created_at"),
+            f"{record['kind']} {record['id']} created_at",
+        )
     for owner in location_owner_resolution:
         for node in owner["resolution_chain"]:
             owner_id = node["id"]
@@ -320,12 +421,14 @@ def _input_watermark(
     dossier: dict[str, Any],
     location_owner_resolution: list[dict[str, Any]],
     structural_subject_state: list[dict[str, Any]],
+    provenance_record_state: list[dict[str, Any]],
 ) -> str:
     """Return the latest timestamped input represented by the dossier snapshot."""
     chronology = _chronology_inputs(
         dossier,
         location_owner_resolution,
         structural_subject_state,
+        provenance_record_state,
     )
     if not chronology:
         raise DossierAssessmentError(
@@ -424,6 +527,7 @@ def _input_signature(
     domains: list[dict[str, Any]],
     location_owner_resolution: list[dict[str, Any]],
     structural_subject_state: list[dict[str, Any]],
+    provenance_record_state: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Capture all state that can change or materially support the v1 assessment."""
     return {
@@ -431,9 +535,11 @@ def _input_signature(
             dossier,
             location_owner_resolution,
             structural_subject_state,
+            provenance_record_state,
         ),
         "location_owner_resolution": location_owner_resolution,
         "structural_subject_state": structural_subject_state,
+        "provenance_record_state": provenance_record_state,
         "locations": [_location_signature(location) for location in dossier["locations"]],
         "facts": [
             {
@@ -623,6 +729,7 @@ def persist_dossier_assessment(
         entity = str(dossier["business_entity"]["id"])
         location_owner_resolution = _location_owner_resolution_state(conn, dossier)
         structural_subject_state = _structural_subject_state(conn, dossier)
+        provenance_record_state = _provenance_record_state(conn, dossier)
         domains = derive_domain_assessments(dossier)
         mandatory = {
             seed.name
@@ -642,6 +749,7 @@ def persist_dossier_assessment(
             dossier,
             location_owner_resolution,
             structural_subject_state,
+            provenance_record_state,
         )
         if parse_timestamp(facts_as_of, field="facts_as_of") > parse_timestamp(
             computed_at, field="computed_at"
@@ -655,6 +763,7 @@ def persist_dossier_assessment(
             domains,
             location_owner_resolution,
             structural_subject_state,
+            provenance_record_state,
         )
         identity_payload = {
             "business_entity_id": entity,
