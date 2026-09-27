@@ -120,17 +120,13 @@ class ParsedPage:
     whatsapp_detected: bool
 
 
-def _valid_ascii_hostname(host: str) -> bool:
-    if not host or len(host) > 253:
-        return False
-    labels = host.split(".")
-    return all(
+def _valid_ascii_label(label: str) -> bool:
+    return bool(
         label
         and len(label) <= 63
         and not label.startswith("-")
         and not label.endswith("-")
         and re.fullmatch(r"[a-z0-9-]+", label) is not None
-        for label in labels
     )
 
 
@@ -148,20 +144,31 @@ def _ascii_host(value: str) -> str | None:
             return None
         return host
 
-    if host.isascii():
-        return host if _valid_ascii_hostname(host) else None
+    ascii_labels: list[str] = []
+    for label in host.split("."):
+        if not label:
+            return None
+        if label.isascii():
+            if not _valid_ascii_label(label):
+                return None
+            # Retain already-ASCII labels verbatim, including valid xn-- labels.
+            # Decoding them would change mixed Unicode/punycode host identity.
+            ascii_labels.append(label)
+            continue
+        try:
+            ascii_label = label.encode("idna").decode("ascii").lower()
+            round_trip = ascii_label.encode("ascii").decode("idna").lower()
+        except UnicodeError:
+            return None
+        # The stdlib codec implements legacy IDNA mappings (for example ß -> ss).
+        # Require reversibility for each Unicode label independently so mixed
+        # Unicode/punycode hostnames remain valid without destination rewriting.
+        if round_trip != label or not _valid_ascii_label(ascii_label):
+            return None
+        ascii_labels.append(ascii_label)
 
-    try:
-        ascii_host = host.encode("idna").decode("ascii").lower().rstrip(".")
-        round_trip = ascii_host.encode("ascii").decode("idna").lower().rstrip(".")
-    except UnicodeError:
-        return None
-    # The stdlib codec implements legacy IDNA mappings (for example ß -> ss).
-    # Do not silently contact a different ASCII hostname when the mapping is not
-    # reversible. A future IDNA2008/UTS-46 dependency can broaden this safely.
-    if round_trip != host or not _valid_ascii_hostname(ascii_host):
-        return None
-    return ascii_host
+    ascii_host = ".".join(ascii_labels)
+    return ascii_host if len(ascii_host) <= 253 else None
 
 
 def _host(value: str) -> str:
