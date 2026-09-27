@@ -7,6 +7,8 @@ from typing import Any
 from ..understanding_vocabulary import DOSSIER_DOMAIN_SEED_V1, DOSSIER_POLICY_VERSION
 from .core import DossierQueryError, NULL_STATUSES, json_value, parse_timestamp, row_dict
 
+_REVIEW_FRESHNESS_DAYS = 30
+
 
 def persisted_assessment(conn: sqlite3.Connection, entity_id: str) -> dict[str, Any] | None:
     cursor = conn.execute(
@@ -78,13 +80,32 @@ def persisted_assessment(conn: sqlite3.Connection, entity_id: str) -> dict[str, 
     return result
 
 
+def _current_customer_voice(
+    customer_voice: list[dict[str, Any]], evaluated_at: datetime
+) -> list[dict[str, Any]]:
+    current: list[dict[str, Any]] = []
+    for review in customer_voice:
+        evidence = review.get("evidence")
+        retrieved = evidence.get("retrieved_at") if isinstance(evidence, dict) else None
+        retrieved_at = parse_timestamp(
+            retrieved,
+            field=f"review evidence {review.get('observation_id', '<unknown>')} retrieved_at",
+        )
+        age_days = (evaluated_at - retrieved_at).total_seconds() / 86400
+        if 0 <= age_days <= _REVIEW_FRESHNESS_DAYS:
+            current.append(review)
+    return current
+
+
 def preview_domains(
     facts: list[dict[str, Any]],
     unknowns: list[dict[str, Any]],
     integrity_issues: list[dict[str, Any]],
-    customer_voice: list[dict[str, Any]] | None = None,
+    customer_voice: list[dict[str, Any]] | None,
+    evaluated_at: datetime,
 ) -> list[dict[str, Any]]:
     customer_voice = customer_voice or []
+    current_customer_voice = _current_customer_voice(customer_voice, evaluated_at)
     result: list[dict[str, Any]] = []
     for seed in DOSSIER_DOMAIN_SEED_V1:
         domain_facts = [fact for fact in facts if fact["domain"] == seed.name]
@@ -112,10 +133,28 @@ def preview_domains(
                 if unknowns
                 else "no_controlled_unresolved_items_detected_but_preview_never_claims_sufficiency"
             ]
-        elif seed.name == "reputation" and customer_voice and not domain_facts:
-            state, reasons = "partial", [
-                "customer_review_evidence_exists_but_preview_never_claims_sufficiency"
-            ]
+        elif seed.name == "reputation":
+            if not domain_facts and not customer_voice:
+                state, reasons = "not_started", ["no_current_reputation_or_customer_voice_evidence"]
+            elif all(fact["status"] == "not_applicable" for fact in domain_facts) and not domain_unknowns:
+                state, reasons = "not_applicable", ["all_current_domain_facts_are_not_applicable"]
+            elif any(fact["status"] == "conflicted" for fact in domain_facts):
+                state, reasons = "conflicted", ["one_or_more_current_facts_are_conflicted"]
+            elif fresh_value_facts or current_customer_voice:
+                state, reasons = "partial", [
+                    "current_reputation_evidence_exists_but_preview_never_claims_sufficiency"
+                ]
+            elif customer_voice or any(
+                fact["status"] == "stale" or fact["freshness"]["is_stale"]
+                for fact in domain_facts
+            ):
+                state, reasons = "stale", ["no_current_reputation_evidence_remains"]
+            elif all(fact["status"] in NULL_STATUSES for fact in domain_facts):
+                state, reasons = "insufficient", ["domain_has_only_null_semantic_fact_states"]
+            else:
+                state, reasons = "partial", [
+                    "some_current_evidence_exists_but_read_only_preview_does_not_promote_sufficiency"
+                ]
         elif not domain_facts:
             state, reasons = "not_started", ["no_current_facts_in_domain"]
         elif all(fact["status"] == "not_applicable" for fact in domain_facts) and not domain_unknowns:
