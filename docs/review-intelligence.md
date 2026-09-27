@@ -20,7 +20,7 @@ Exactly one Maps selector is required. Entity-only extraction is intentionally u
 
 The extractor reads only the `user_reviews` and `user_reviews_extended` arrays already present in the selected business's current retained Maps `raw_json`. It performs no Google Maps request, Docker execution, website request, or other network action.
 
-The current Maps row must have exact, usable Business Understanding evidence created by the current Maps backfill/synchronization contracts. The extractor binds the selected business, current canonical Location, retained Maps evidence ID and content hash, legacy run, and the Maps evidence's frozen Location lineage. If the current Maps row has changed without a matching synchronization record, extraction fails closed and asks for `sara-maps-sync`.
+The current Maps row must have exact, usable Business Understanding evidence created by the current Maps backfill/synchronization contracts. The extractor binds the selected business, retained Maps evidence ID and content hash, legacy run, and the Maps evidence's frozen source-time Business Entity and Location lineage. The frozen Location must resolve through the current redirect chain to the selected current canonical Location. If the current Maps row has changed without a matching synchronization record, extraction fails closed and asks for `sara-maps-sync`.
 
 The whole selection, evidence resolution, parsing, idempotency verification, and persistence path runs inside one `BEGIN IMMEDIATE` transaction. There is therefore no gap in which another writer can change the current Maps/Understanding identity between source selection and review persistence.
 
@@ -46,7 +46,13 @@ For each retained review evidence record Sara preserves:
 - owner-response text, language, and exact response timestamps when available;
 - the exact canonical JSON review sub-object in evidence metadata;
 - source array/index paths showing where the review appeared;
-- the immutable parent Maps evidence ID, content hash, source locator, artifact reference, and frozen Location anchor.
+- the immutable parent Maps evidence ID, content hash, source locator, artifact reference, and frozen source-time Entity/Location anchors.
+
+The review observation and review-extraction session remain attached to the **source-time Location subject**, even if that Location later redirects to another canonical Location after Maps identity convergence. This follows Sara's historical-integrity rule: observations are not rewritten merely because canonical identity changes later. Current consumers resolve the historical subject through `knowledge_subjects.merged_into_subject_id` when they need current identity.
+
+This also keeps extraction identity stable across convergence: a later Location merge does not create a second review session for the same retained parent Maps evidence. The command result reports both the source-time Location and the currently resolved canonical Location.
+
+A source-time Location can retain its original immutable Business Entity owner even when its canonical Location later belongs to another provisional Business Entity. That historical owner is preserved as provenance; it is not required to equal the current canonical Entity owner.
 
 The normalized observation intentionally does not repeat reviewer display name, profile-picture URL, or author URL. Those source fields remain available in the retained raw review evidence when present but are not promoted into Sara's normalized customer-voice semantics.
 
@@ -73,10 +79,10 @@ If the same source review ID appears with materially different raw representatio
 A review-extraction session is deterministic for:
 
 - the retained parent Maps evidence;
-- the selected canonical Location;
+- that evidence's frozen source-time Location;
 - the review collector version.
 
-Re-running the same extraction verifies the complete persisted session, evidence, and observations and returns an idempotent result without creating duplicate state. Drift in persisted review provenance fails closed.
+Re-running the same extraction verifies the complete persisted session, evidence, and observations and returns an idempotent result without creating duplicate state. A later canonical Location convergence does not change that identity. Drift in persisted review provenance fails closed.
 
 A later Maps snapshot receives a different parent evidence identity and therefore creates a separate extraction session. Historical review evidence remains immutable.
 
