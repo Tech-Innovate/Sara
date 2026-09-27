@@ -120,6 +120,7 @@ def build_business_dossier(
                     unknowns,
                     integrity_issues,
                     customer_voice,
+                    evaluation,
                 ),
             },
         },
