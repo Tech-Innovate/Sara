@@ -66,6 +66,7 @@ def customer_review_observations(
         "e.id AS evidence_id,e.source_id,e.source_locator,e.source_role,"
         "e.status AS evidence_status,e.retrieved_at,e.published_at,e.language,"
         "e.media_type,e.content_sha256,e.artifact_ref,e.acquisition_session_id,"
+        "a.target_subject_id AS acquisition_target_subject_id,"
         "a.source_id AS acquisition_source_id,a.collector_name,a.collector_version,"
         "a.status AS acquisition_status,s.source_type,s.name AS source_name,s.base_url "
         "FROM observations o "
@@ -165,6 +166,17 @@ def customer_review_observations(
                     "evidence_id": evidence_id,
                 }
             )
+        if item["acquisition_target_subject_id"] != source_subject_id:
+            provenance_valid = False
+            issues.append(
+                {
+                    "code": "customer_review_acquisition_target_mismatch",
+                    "observation_id": observation_id,
+                    "evidence_id": evidence_id,
+                    "subject_id": source_subject_id,
+                    "acquisition_target_subject_id": item["acquisition_target_subject_id"],
+                }
+            )
         if item["acquisition_status"] not in {"complete", "partial"}:
             provenance_valid = False
             issues.append(
@@ -260,6 +272,7 @@ def customer_review_observations(
                     "content_sha256": item["content_sha256"],
                     "artifact_ref": item["artifact_ref"],
                     "acquisition_session_id": item["acquisition_session_id"],
+                    "acquisition_target_subject_id": item["acquisition_target_subject_id"],
                     "collector_name": item["collector_name"],
                     "collector_version": item["collector_version"],
                     "acquisition_status": item["acquisition_status"],
