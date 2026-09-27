@@ -4,7 +4,7 @@ import sqlite3
 from typing import Any
 
 from ..reviews.model import REVIEW_PREDICATE, canonical_json, sha256_text
-from .core import DossierQueryError, json_value, resolve_subject, row_dict
+from .core import DossierQueryError, json_value, parse_timestamp, resolve_subject, row_dict
 
 
 def _location_lineage(
@@ -176,6 +176,22 @@ def customer_review_observations(
                 }
             )
         if not provenance_valid:
+            continue
+
+        try:
+            parse_timestamp(
+                item["retrieved_at"],
+                field=f"review evidence {evidence_id} retrieved_at",
+            )
+        except DossierQueryError as exc:
+            issues.append(
+                {
+                    "code": "customer_review_retrieved_at_invalid",
+                    "observation_id": observation_id,
+                    "evidence_id": evidence_id,
+                    "error": str(exc),
+                }
+            )
             continue
 
         try:
