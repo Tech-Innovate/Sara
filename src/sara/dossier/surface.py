@@ -19,6 +19,7 @@ from .core import (
     resolve_selection,
     verify_schema,
 )
+from .customer_voice import customer_review_observations
 from .identity import enrich_location_aliases
 from .integrity import (
     additional_assessment_integrity,
@@ -64,8 +65,15 @@ def build_business_dossier(
     )
     facts = current_facts(conn, canonical_entity_id, current_location_ids, evaluation)
     evidence, integrity_issues = attach_provenance(conn, facts)
+    customer_voice, customer_voice_issues = customer_review_observations(
+        conn, current_location_ids
+    )
     integrity_issues = sort_integrity_issues(
-        [*integrity_issues, *additional_fact_integrity(facts)]
+        [
+            *integrity_issues,
+            *additional_fact_integrity(facts),
+            *customer_voice_issues,
+        ]
     )
     unknowns = controlled_unknowns(conn, canonical_entity_id, current_location_ids, facts)
     persisted = persisted_assessment(conn, canonical_entity_id)
@@ -81,6 +89,7 @@ def build_business_dossier(
         "schema": "sara-business-dossier-v1",
         "fact_scope": "current_only",
         "evidence_scope": "current_fact_provenance",
+        "customer_voice_scope": "review_observations_resolving_to_current_locations",
         "unknown_scope": "controlled_active_fact_predicates_on_current_subjects",
         "evaluated_at": evaluation.isoformat(),
         "selection": selection,
@@ -89,19 +98,28 @@ def build_business_dossier(
         "locations": location_rows,
         "facts": facts,
         "evidence": evidence,
+        "customer_voice": {
+            "review_count": len(customer_voice),
+            "reviews": customer_voice,
+        },
         "unknowns": unknowns,
         "integrity_issues": integrity_issues,
         "dossier_status": {
             "active_policy_version": DOSSIER_POLICY_VERSION,
             "persisted_current_policy": persisted,
             "persisted_assessment_semantics": (
-                "immutable_snapshot_only; phase5 does not claim it is current after later fact changes"
+                "immutable_snapshot_only; an assessment is not silently recomputed after later state changes"
             ),
             "read_only_preview": {
-                "derivation_version": "phase5-readonly-v1",
+                "derivation_version": "phase5-readonly-v2",
                 "analysis_ready": False,
                 "promotion_policy": "never_promote_from_preview",
-                "domains": preview_domains(facts, unknowns, integrity_issues),
+                "domains": preview_domains(
+                    facts,
+                    unknowns,
+                    integrity_issues,
+                    customer_voice=customer_voice,
+                ),
             },
         },
     }
