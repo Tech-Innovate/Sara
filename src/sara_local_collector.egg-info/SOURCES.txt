@@ -89,5 +89,6 @@ tests/test_website_retry_failover_backoff.py
 tests/test_website_retry_hardening.py
 tests/test_website_retry_second_review.py
 tests/test_website_retry_tls_protocol.py
+tests/test_website_unicode_reconciliation.py
 tests/test_website_url_convergence.py
 tests/test_website_validation_controlled_merge_probe.py
