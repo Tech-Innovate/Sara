@@ -31,7 +31,7 @@ Disposable Business Understanding prep/validation copies created before this cha
 
 Website reconciliation does not globally collapse `http`/`https` or `www` variants. When a bounded official-site acquisition begins from the currently supported website fact and its retained usable home evidence records that exact `start_url` resolving to the verified home capture `final_url`, reconciliation may treat those two serialized URLs as representations of the same official site for that reconciliation event. The historical observation remains attached to its historical fact; it is not rewritten or attached as exact-value support to the new URL. Without that retained event-local evidence, differing URLs remain distinct and may contradict.
 
-This reconciliation behavior is versioned as `official-web-v2`; the website collector version remains unchanged because request/extraction behavior did not change.
+The evidence-backed alias behavior was introduced as `official-web-v2`. Unicode/IDNA URL canonicalization later changed shared website-value equivalence semantics and therefore advances current reconciliation provenance to `official-web-v3`.
 
 ## What the gate proves
 
@@ -153,3 +153,8 @@ Passing this gate authorizes consideration of primary-database migration/enablem
 - gap analysis or scoring;
 - automated outreach or CRM behavior;
 - parallel multi-process acquisition without a separately reviewed shared per-origin coordinator.
+
+
+## Unicode/IDNA transport hardening
+
+Official-site URLs are canonicalized to an ASCII network representation before DNS, TLS, robots, SSRF checks, origin comparison, and HTTP request serialization. Unicode hostname labels are IDNA-encoded; raw Unicode path/query characters are UTF-8 percent-encoded. Invalid Unicode/IDNA fails closed. This transport-normalization change is versioned with website collector version `4`; because the shared normalizer also changes website-value equivalence, reconciliation provenance advances to `official-web-v3`.

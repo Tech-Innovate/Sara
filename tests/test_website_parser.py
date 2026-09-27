@@ -173,3 +173,74 @@ def test_platform_host_hints_require_real_domain_boundary() -> None:
         '<a href="https://team.calendly.com/example">Schedule</a>',
     )
     assert true_booking.booking_detected is True
+
+
+def test_unicode_transport_urls_are_canonical_ascii() -> None:
+    # Production businesses 141 and 248 exposed this shape: an ASCII host with
+    # raw non-ASCII URL characters. The exact retained production URLs are not
+    # fixtures in this repository, so use representative Arabic path/query data
+    # on the observed hosts.
+    for raw in (
+        "https://mandi-hdoon.com/منيو/المندي?branch=جدة",
+        "https://stovejeddah.com/مطعم/جدة?menu=العشاء",
+    ):
+        normalized = normalize_http_url(raw)
+        assert normalized is not None
+        normalized.encode("ascii")
+        assert "%D8%" in normalized
+
+
+def test_unicode_hostname_is_idna_encoded_before_transport() -> None:
+    normalized = normalize_http_url("https://مثال.إختبار/قائمة?فرع=جدة")
+    assert normalized == (
+        "https://xn--mgbh0fb.xn--kgbechtv/%D9%82%D8%A7%D8%A6%D9%85%D8%A9"
+        "?%D9%81%D8%B1%D8%B9=%D8%AC%D8%AF%D8%A9"
+    )
+    assert same_site(
+        "https://مثال.إختبار/قائمة",
+        "https://xn--mgbh0fb.xn--kgbechtv/",
+    )
+
+
+def test_existing_percent_escapes_are_not_double_encoded() -> None:
+    assert normalize_http_url("https://example.com/%D9%82%D8%A7%D8%A6%D9%85%D8%A9") == (
+        "https://example.com/%D9%82%D8%A7%D8%A6%D9%85%D8%A9"
+    )
+
+
+def test_malformed_unicode_url_fails_closed() -> None:
+    assert normalize_http_url("https://example.com/\ud800") is None
+    assert normalize_http_url("https://\ud800.example/path") is None
+
+
+def test_ambiguous_or_invalid_idna_host_fails_closed() -> None:
+    # The stdlib IDNA codec maps these non-reversibly or leaves invalid ASCII
+    # hostname characters untouched. Sara must not silently change destination.
+    for raw in (
+        "https://faß.de/",
+        "https://e\u0301xample.com/",
+        "https://exa_mple.com/",
+        "https://example com/",
+    ):
+        assert normalize_http_url(raw) is None
+
+
+def test_reversible_idna_hosts_remain_supported() -> None:
+    assert normalize_http_url("https://例え.テスト/道") == (
+        "https://xn--r8jz45g.xn--zckzah/%E9%81%93"
+    )
+
+
+def test_invalid_percent_encoded_query_utf8_fails_closed() -> None:
+    assert normalize_http_url("https://example.com/?q=%FF") is None
+    assert normalize_http_url("https://example.com/?q=%C3%28") is None
+
+
+def test_mixed_punycode_and_unicode_labels_are_supported() -> None:
+    assert normalize_http_url("https://xn--r8jz45g.テスト/道") == (
+        "https://xn--r8jz45g.xn--zckzah/%E9%81%93"
+    )
+    assert same_site(
+        "https://xn--r8jz45g.テスト/道",
+        "https://xn--r8jz45g.xn--zckzah/",
+    )

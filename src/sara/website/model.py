@@ -15,8 +15,8 @@ class WebsiteAcquisitionError(RuntimeError):
 
 OFFICIAL_WEB_SOURCE_ID = "src_official_web"
 COLLECTOR_NAME = "sara.website"
-COLLECTOR_VERSION = "3"
-RECONCILIATION_VERSION = "official-web-v2"
+COLLECTOR_VERSION = "4"
+RECONCILIATION_VERSION = "official-web-v3"
 ID_NAMESPACE = "sara.business-understanding.official-web.v1"
 CAPABILITY_PREDICATES = (
     "capability.online_booking",

@@ -4,7 +4,7 @@ import html
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 
 _TRACKING_QUERY_PREFIXES = ("utm_",)
@@ -120,12 +120,65 @@ class ParsedPage:
     whatsapp_detected: bool
 
 
+def _valid_ascii_label(label: str) -> bool:
+    return bool(
+        label
+        and len(label) <= 63
+        and not label.startswith("-")
+        and not label.endswith("-")
+        and re.fullmatch(r"[a-z0-9-]+", label) is not None
+    )
+
+
+def _ascii_host(value: str) -> str | None:
+    host = value.lower().rstrip(".")
+    if not host:
+        return None
+    if ":" in host:
+        # Bracketed IPv6 literals are returned by ``urlsplit().hostname``
+        # without brackets. They must already be ASCII; address validity and
+        # public/private classification remain the HTTP client's responsibility.
+        try:
+            host.encode("ascii")
+        except UnicodeError:
+            return None
+        return host
+
+    ascii_labels: list[str] = []
+    for label in host.split("."):
+        if not label:
+            return None
+        if label.isascii():
+            if not _valid_ascii_label(label):
+                return None
+            # Retain already-ASCII labels verbatim, including valid xn-- labels.
+            # Decoding them would change mixed Unicode/punycode host identity.
+            ascii_labels.append(label)
+            continue
+        try:
+            ascii_label = label.encode("idna").decode("ascii").lower()
+            round_trip = ascii_label.encode("ascii").decode("idna").lower()
+        except UnicodeError:
+            return None
+        # The stdlib codec implements legacy IDNA mappings (for example ß -> ss).
+        # Require reversibility for each Unicode label independently so mixed
+        # Unicode/punycode hostnames remain valid without destination rewriting.
+        if round_trip != label or not _valid_ascii_label(ascii_label):
+            return None
+        ascii_labels.append(ascii_label)
+
+    ascii_host = ".".join(ascii_labels)
+    return ascii_host if len(ascii_host) <= 253 else None
+
+
 def _host(value: str) -> str:
     try:
         parsed = urlsplit(value)
         _ = parsed.port
-        host = (parsed.hostname or "").lower().rstrip(".")
-    except ValueError:
+        host = _ascii_host(parsed.hostname or "")
+    except (UnicodeError, ValueError):
+        return ""
+    if host is None:
         return ""
     return host[4:] if host.startswith("www.") else host
 
@@ -144,9 +197,9 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         absolute = urljoin(base_url, value) if base_url else value
         parsed = urlsplit(absolute)
         scheme = parsed.scheme.lower()
-        host = (parsed.hostname or "").lower().rstrip(".")
+        host = _ascii_host(parsed.hostname or "")
         port = parsed.port
-    except ValueError:
+    except (UnicodeError, ValueError):
         return None
     if scheme not in {"http", "https"} or not host:
         return None
@@ -158,15 +211,36 @@ def normalize_http_url(value: str, base_url: str | None = None) -> str | None:
         netloc = f"{display_host}:{port}"
     else:
         netloc = display_host
-    path = parsed.path or "/"
-    pairs = [
-        (key, item)
-        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
-        if key.lower() not in _TRACKING_QUERY_KEYS
-        and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
-    ]
-    query = urlencode(pairs, doseq=True)
-    return urlunsplit((scheme, netloc, path, query, ""))
+    try:
+        # HTTP request targets are byte-oriented. Keep RFC 3986 path delimiters
+        # and existing percent escapes, while UTF-8 percent-encoding raw Unicode
+        # before the value can reach ``http.client``'s ASCII serialization.
+        path = quote(
+            parsed.path or "/",
+            safe="/!$&'()*+,;=:@-._~%",
+            encoding="utf-8",
+            errors="strict",
+        )
+        pairs = [
+            (key, item)
+            for key, item in parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+                encoding="utf-8",
+                errors="strict",
+            )
+            if key.lower() not in _TRACKING_QUERY_KEYS
+            and not any(key.lower().startswith(prefix) for prefix in _TRACKING_QUERY_PREFIXES)
+        ]
+        query = urlencode(pairs, doseq=True, encoding="utf-8", errors="strict")
+    except (UnicodeError, ValueError):
+        return None
+    normalized = urlunsplit((scheme, netloc, path, query, ""))
+    try:
+        normalized.encode("ascii")
+    except UnicodeError:
+        return None
+    return normalized
 
 
 def _tokens(value: str) -> set[str]:

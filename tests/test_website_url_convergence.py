@@ -187,7 +187,7 @@ def test_verified_redirect_variant_is_not_a_contradiction(tmp_path: Path) -> Non
     ).fetchone()
     assert json.loads(current[0]) == NEW_URL
     assert current[1] == "single_source"
-    assert current[2] == "official-web-v2" == RECONCILIATION_VERSION
+    assert current[2] == "official-web-v3" == RECONCILIATION_VERSION
     assert _current_links(conn) == [("supports", OFFICIAL_WEB_SOURCE_ID)]
     conn.close()
 
