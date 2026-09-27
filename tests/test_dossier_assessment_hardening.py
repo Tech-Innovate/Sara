@@ -187,6 +187,39 @@ def test_location_redirect_timestamp_participates_in_assessment_chronology(
     conn.close()
 
 
+def test_external_identifier_observation_timestamp_participates_in_assessment_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(tmp_path / "identifier-chronology.sqlite")
+    ingest_records(
+        conn,
+        "r1",
+        [_record("a", latitude=21.55, with_review=False)],
+        finalize_run=("complete", 0, None),
+    )
+    _backfill(conn)
+    business_id = int(conn.execute("SELECT id FROM businesses").fetchone()[0])
+    location_id = location_id_for_maps_business(business_id)
+    future_observation = "2026-09-30T13:00:00+00:00"
+    updated = conn.execute(
+        "UPDATE external_identifiers SET last_observed_at=? "
+        "WHERE subject_id=? AND namespace='place_id' AND status='active'",
+        (future_observation, location_id),
+    )
+    assert updated.rowcount == 1
+    conn.commit()
+
+    with pytest.raises(DossierAssessmentError, match="later than the assessment clock"):
+        persist_dossier_assessment(
+            conn,
+            business_id=business_id,
+            now=lambda: "2026-09-28T10:00:00+00:00",
+        )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    conn.close()
+
+
 def test_unattempted_capability_domain_is_not_started_not_insufficient(tmp_path: Path) -> None:
     conn = _prepared(tmp_path / "not-started.sqlite")
     ingest_records(
