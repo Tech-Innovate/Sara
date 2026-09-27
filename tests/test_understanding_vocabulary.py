@@ -167,9 +167,6 @@ def test_review_predicate_is_additive_to_existing_business_understanding_v2(tmp_
     conn = migrated_conn(tmp_path / "review-upgrade.sqlite")
     _insert_seeds(conn, PREDICATE_SEED_V1 + PREDICATE_SEED_PHASE3)
 
-    # Existing Business Understanding readers remain valid before the additive
-    # Review Intelligence predicate is installed. Review writers fail closed
-    # until the extension is explicitly seeded.
     verify_business_understanding_vocabulary(conn)
     with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
         verify_review_intelligence_vocabulary(conn)
@@ -251,7 +248,7 @@ def test_seed_fails_closed_and_rolls_back_partial_inserts_on_semantic_drift(tmp_
     conn.close()
 
 
-def test_verifiers_detect_drift_in_their_own_required_predicates(tmp_path: Path) -> None:
+def test_verifiers_detect_drift_in_their_required_or_installed_predicates(tmp_path: Path) -> None:
     conn = migrated_conn(tmp_path / "metadata-drift.sqlite")
     seed_business_understanding_vocabulary(conn)
     conn.execute(
@@ -275,7 +272,8 @@ def test_verifiers_detect_drift_in_their_own_required_predicates(tmp_path: Path)
         "WHERE name='reputation.customer_review'"
     )
     review_drift.commit()
-    verify_business_understanding_vocabulary(review_drift)
+    with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
+        verify_business_understanding_vocabulary(review_drift)
     with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
         verify_review_intelligence_vocabulary(review_drift)
     with pytest.raises(VocabularySeedError, match="reputation.customer_review"):
