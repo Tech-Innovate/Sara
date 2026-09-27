@@ -66,6 +66,16 @@ def _input_watermark(dossier: dict[str, Any]) -> str:
     for location in dossier["locations"]:
         add(location.get("updated_at"), f"location {location['id']} updated_at")
         add(location.get("merged_at"), f"location {location['id']} merged_at")
+        for identifier in location["external_identifiers"]:
+            identifier_id = identifier["id"]
+            add(
+                identifier.get("first_observed_at"),
+                f"external identifier {identifier_id} first_observed_at",
+            )
+            add(
+                identifier.get("last_observed_at"),
+                f"external identifier {identifier_id} last_observed_at",
+            )
     for business in dossier["maps_businesses"]:
         add(business.get("last_seen_at"), f"Maps business {business['id']} last_seen_at")
     for fact in dossier["facts"]:
