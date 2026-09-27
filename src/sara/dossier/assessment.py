@@ -152,6 +152,7 @@ def _input_watermark(
     for business in dossier["maps_businesses"]:
         add(business.get("last_seen_at"), f"Maps business {business['id']} last_seen_at")
     for fact in dossier["facts"]:
+        add(fact.get("created_at"), f"fact {fact['id']} created_at")
         add(fact.get("valid_from"), f"fact {fact['id']} valid_from")
         add(fact.get("last_verified_at"), f"fact {fact['id']} last_verified_at")
         add(fact.get("reconciled_at"), f"fact {fact['id']} reconciled_at")
@@ -309,6 +310,7 @@ def _input_signature(
                 "predicate": fact["predicate"],
                 "status": fact["status"],
                 "value_hash": fact["value_hash"],
+                "created_at": fact["created_at"],
                 "valid_from": fact["valid_from"],
                 "last_verified_at": fact["last_verified_at"],
                 "reconciliation_version": fact["reconciliation_version"],
@@ -325,6 +327,8 @@ def _input_signature(
                 "canonical_location_id": review["canonical_location_id"],
                 "location_resolution_chain": list(review["location_resolution_chain"]),
                 "value_hash": review["value_hash"],
+                "observed_at": review["observed_at"],
+                "extracted_at": review["extracted_at"],
                 "evidence_id": review["evidence"]["id"],
                 "source_id": review["evidence"]["source_id"],
                 "content_sha256": review["evidence"]["content_sha256"],
