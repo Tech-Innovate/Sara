@@ -19,7 +19,7 @@ from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 
 def _prepared(path: Path, *, with_review: bool = False):
     conn = connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs("
@@ -270,7 +270,9 @@ def test_non_google_place_identifier_does_not_satisfy_maps_identity_anchor(
     conn = _prepared(tmp_path / "non-google-identity-anchor.sqlite")
     location_id = location_id_for_maps_business(1)
     conn.execute(
-        "UPDATE external_identifiers SET status='retired' WHERE subject_id=?",
+        "UPDATE external_identifiers "
+        "SET status='retired',status_changed_at='2026-09-27T12:00:00+00:00' "
+        "WHERE subject_id=?",
         (location_id,),
     )
     conn.execute(
@@ -312,7 +314,9 @@ def test_external_identifier_created_at_participates_in_assessment_chronology(
     conn = _prepared(tmp_path / "identifier-created-at-future.sqlite")
     location_id = location_id_for_maps_business(1)
     conn.execute(
-        "UPDATE external_identifiers SET status='retired' WHERE subject_id=?",
+        "UPDATE external_identifiers "
+        "SET status='retired',status_changed_at='2026-09-27T12:00:00+00:00' "
+        "WHERE subject_id=?",
         (location_id,),
     )
     conn.execute(

@@ -13,15 +13,17 @@ from sara.dossier import (
 )
 from sara.dossier.assessment_cli import main as assessment_main
 from sara.maps_backfill import backfill_maps_business_understanding
-from sara.migrations import apply_migrations
+from sara.migrations import MIGRATIONS, apply_migrations
 from sara.reviews import extract_retained_reviews
 from sara.storage import connect, connect_readonly, ingest_records
 from sara.understanding_vocabulary import DOSSIER_DOMAIN_SEED_V1, seed_business_understanding_vocabulary
 
 
-def _prepared(path: Path, *, reviews: bool = False):
+def _prepared(path: Path, *, reviews: bool = False, migrations=MIGRATIONS):
     conn = connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn, migrations=migrations) == tuple(
+        migration.version for migration in migrations
+    )
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs("
@@ -114,6 +116,44 @@ def test_assessment_seals_complete_policy_snapshot_and_is_conservative(tmp_path:
         (result.assessment_id,),
     ).fetchone()[0] == len(DOSSIER_DOMAIN_SEED_V1)
     assert list(conn.execute("PRAGMA foreign_key_check")) == []
+    conn.close()
+
+
+def test_v1_non_active_external_identifier_migrates_without_fabricated_chronology(
+    tmp_path: Path,
+) -> None:
+    conn = _prepared(
+        tmp_path / "legacy-non-active-identifier.sqlite",
+        migrations=MIGRATIONS[:1],
+    )
+    identifier_id = conn.execute(
+        "SELECT id FROM external_identifiers WHERE status='active' ORDER BY id LIMIT 1"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE external_identifiers SET status='retired' WHERE id=?",
+        (identifier_id,),
+    )
+    conn.commit()
+
+    assert apply_migrations(conn) == (2,)
+    row = conn.execute(
+        "SELECT status,status_changed_at FROM external_identifiers WHERE id=?",
+        (identifier_id,),
+    ).fetchone()
+    assert tuple(row) == ("retired", None)
+
+    result = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-28T10:00:00+00:00",
+    )
+    assert result.assessment_id
+    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 1
+    row = conn.execute(
+        "SELECT status,status_changed_at FROM external_identifiers WHERE id=?",
+        (identifier_id,),
+    ).fetchone()
+    assert tuple(row) == ("retired", None)
     conn.close()
 
 

@@ -362,12 +362,11 @@ def _chronology_inputs(
         add(location.get("merged_at"), f"location {location['id']} merged_at")
         for identifier in location["external_identifiers"]:
             identifier_id = identifier["id"]
+            # A NULL transition timestamp is a durable legacy/unknown chronology
+            # marker for rows that were already non-active before migration v2.
+            # The v2 trigger still requires every post-v2 status transition to
+            # provide a strictly advancing timestamp.
             status_changed_at = identifier.get("status_changed_at")
-            if identifier.get("status") != "active" and status_changed_at in (None, ""):
-                raise DossierAssessmentError(
-                    f"external identifier {identifier_id} has non-active status without a "
-                    "recorded transition timestamp"
-                )
             add(
                 identifier.get("created_at"),
                 f"external identifier {identifier_id} created_at",

@@ -168,7 +168,7 @@ def test_identifier_status_transition_participates_in_assessment_chronology(
     conn.close()
 
 
-def test_legacy_nonactive_identifier_without_transition_timestamp_fails_closed(
+def test_nonactive_identifier_without_transition_timestamp_is_unknown_legacy_chronology(
     tmp_path: Path,
 ) -> None:
     conn = _prepared(tmp_path / "identifier-status-legacy-null.sqlite")
@@ -181,14 +181,18 @@ def test_legacy_nonactive_identifier_without_transition_timestamp_fails_closed(
     )
     conn.commit()
 
-    with pytest.raises(DossierAssessmentError, match="without a recorded transition timestamp"):
-        persist_dossier_assessment(
-            conn,
-            business_id=1,
-            now=lambda: "2026-09-28T10:00:00+00:00",
-        )
-    assert conn.in_transaction is False
-    assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+    assessment = persist_dossier_assessment(
+        conn,
+        business_id=1,
+        now=lambda: "2026-09-28T10:00:00+00:00",
+    )
+    assert assessment.assessment_id
+    row = conn.execute(
+        "SELECT status,status_changed_at FROM external_identifiers "
+        "WHERE subject_id=? AND namespace='place_id'",
+        (location_id,),
+    ).fetchone()
+    assert tuple(row) == ("retired", None)
     conn.close()
 
 
