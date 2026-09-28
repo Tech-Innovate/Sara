@@ -1257,7 +1257,10 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
         NEW.status <> OLD.status
         AND (
             NEW.status_changed_at IS NULL
-            OR NEW.status_changed_at IS OLD.status_changed_at
+            OR (
+                OLD.status_changed_at IS NOT NULL
+                AND NEW.status_changed_at <= OLD.status_changed_at
+            )
         )
     ) OR (
         NEW.status = OLD.status
