@@ -52,6 +52,10 @@ EXPECTED_TABLES = {
 }
 
 
+def expected_migration_versions() -> tuple[int, ...]:
+    return tuple(migration.version for migration in MIGRATIONS)
+
+
 def core_conn(path: Path | None = None, *, row_factory: bool = True) -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:" if path is None else path)
     if row_factory:
@@ -105,14 +109,17 @@ def seed_predicate(conn: sqlite3.Connection, *, name: str = "business.name.tradi
 def test_apply_is_transactional_idempotent_and_row_factory_independent() -> None:
     conn = core_conn(row_factory=False)
     assert current_schema_version(conn) == 0
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == expected_migration_versions()
     assert apply_migrations(conn) == ()
-    assert current_schema_version(conn) == 1
+    assert current_schema_version(conn) == MIGRATIONS[-1].version
     assert EXPECTED_TABLES <= tables(conn)
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert list(conn.execute("PRAGMA foreign_key_check")) == []
-    row = conn.execute("SELECT version,name,checksum FROM schema_migrations").fetchone()
-    assert row == (1, MIGRATIONS[0].name, MIGRATIONS[0].checksum)
+    rows = list(conn.execute("SELECT version,name,checksum FROM schema_migrations ORDER BY version"))
+    assert rows == [
+        (migration.version, migration.name, migration.checksum)
+        for migration in MIGRATIONS
+    ]
 
 
 def test_checksum_unknown_version_and_malformed_registry_fail_closed() -> None:
@@ -125,11 +132,13 @@ def test_checksum_unknown_version_and_malformed_registry_fail_closed() -> None:
 
     conn = core_conn()
     apply_migrations(conn)
+    future_version = MIGRATIONS[-1].version + 1
     conn.execute(
-        "INSERT INTO schema_migrations VALUES (2,'future',?,'t0')", ("f" * 64,)
+        "INSERT INTO schema_migrations VALUES (?,'future',?,'t0')",
+        (future_version, "f" * 64),
     )
     conn.commit()
-    with pytest.raises(MigrationError, match="unknown schema migration version 2"):
+    with pytest.raises(MigrationError, match=f"unknown schema migration version {future_version}"):
         apply_migrations(conn)
 
     conn = core_conn()
@@ -198,7 +207,7 @@ def test_phase_one_neither_backfills_nor_changes_core_state() -> None:
 
 def test_actual_storage_schema_is_supported_and_partial_identity_predicates_fail_closed(tmp_path: Path) -> None:
     good = storage_connect(tmp_path / "good.sqlite")
-    assert apply_migrations(good) == (1,)
+    assert apply_migrations(good) == expected_migration_versions()
     assert good.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert list(good.execute("PRAGMA foreign_key_check")) == []
     good.close()
@@ -311,7 +320,11 @@ def test_acquisition_evidence_and_identifier_provenance_is_immutable() -> None:
     with pytest.raises(sqlite3.IntegrityError, match="terminal acquisition session lifecycle is immutable"):
         conn.execute("UPDATE acquisition_sessions SET status='running',finished_at=NULL WHERE id='acq'")
 
-    conn.execute("INSERT INTO external_identifiers VALUES ('xid','be_1','src','key','v','active','t0','t0','t0')")
+    conn.execute(
+        "INSERT INTO external_identifiers("
+        "id,subject_id,source_id,namespace,value,status,first_observed_at,last_observed_at,created_at,status_changed_at"
+        ") VALUES ('xid','be_1','src','key','v','active','t0','t0','t0',NULL)"
+    )
     with pytest.raises(sqlite3.IntegrityError, match="external identifier identity is immutable"):
         conn.execute("UPDATE external_identifiers SET value='other' WHERE id='xid'")
 
