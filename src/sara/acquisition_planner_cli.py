@@ -111,15 +111,22 @@ def main(argv: list[str] | None = None) -> int:
         # decisions from the last 7 days count, so an entity is not
         # permanently stopped by lifetime history.
         from datetime import datetime, timedelta, timezone as _tz
+        from sara.acquisition_planner import _entity_lineage
         decision_now = utc_now()
         window_floor = (
             datetime.fromisoformat(decision_now).replace(tzinfo=_tz.utc)
             - timedelta(days=7)
         ).isoformat()
+        # The ceiling is scoped to the logical entity: decisions persisted
+        # on merged predecessors count after identity convergence, the
+        # same reverse-lineage scope acquisition session history uses.
+        lineage = _entity_lineage(conn, entity_id)
+        lineage_marks = ",".join("?" for _ in lineage)
         decisions_taken = int(conn.execute(
-            "SELECT COUNT(*) FROM planner_decisions WHERE business_entity_id=? "
-            "AND action IS NOT NULL AND decided_at >= ?",
-            (entity_id, window_floor)).fetchone()[0])
+            f"SELECT COUNT(*) FROM planner_decisions "
+            f"WHERE business_entity_id IN ({lineage_marks}) "
+            f"AND action IS NOT NULL AND decided_at >= ?",
+            (*lineage, window_floor)).fetchone()[0])
         decision = plan_next_acquisition(
             conn, entity_id=entity_id, now=decision_now,
             decisions_taken=decisions_taken,
@@ -132,18 +139,22 @@ def main(argv: list[str] | None = None) -> int:
             # derived from the same sealed assessment and session history,
             # replay it instead.
             row = conn.execute(
-                "SELECT id,business_entity_id,decided_at,action,stop_reason,"
-                "reason_code,target_domain,policy_version,details_json "
-                "FROM planner_decisions WHERE business_entity_id=? "
-                "AND action IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
-                (entity_id,),
+                f"SELECT id,business_entity_id,decided_at,action,stop_reason,"
+                f"reason_code,target_domain,policy_version,details_json "
+                f"FROM planner_decisions "
+                f"WHERE business_entity_id IN ({lineage_marks}) "
+                f"AND action IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
+                tuple(lineage),
             ).fetchone()
             if row is not None:
                 stored = json.loads(row[8])
                 stored_inputs = stored.get("planner_inputs", {})
                 if (stored.get("assessment_id") == decision.details.get("assessment_id")
                         and stored_inputs.get("session_history")
-                        == decision.details["planner_inputs"]["session_history"]):
+                        == decision.details["planner_inputs"]["session_history"]
+                        and stored_inputs.get("max_decisions")
+                        == decision.details["planner_inputs"]["max_decisions"]
+                        and row[7] == decision.policy_version):
                     print(json.dumps({
                         "decision_id": row[0], "action": row[3],
                         "stop_reason": row[4], "reason_code": row[5],

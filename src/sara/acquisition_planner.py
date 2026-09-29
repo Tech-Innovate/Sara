@@ -62,6 +62,12 @@ STOP_STALE_IN_FLIGHT = "stale_in_flight_session"
 #: dead process: planning stops and demands recovery rather than
 #: blocking forever or silently scheduling over it (6 hours).
 IN_FLIGHT_HORIZON_SECONDS = 6 * 3600
+
+#: Permitted clock skew between the decision clock and a session row.
+#: A started_at further in the future than this allowance is invalid
+#: chronology (misconfigured clock or tampered row) and routes to the
+#: recovery-required stop instead of staying "fresh" (5 minutes).
+IN_FLIGHT_SKEW_SECONDS = 5 * 60
 STOP_UNSUPPORTED = "unsupported_deficiency"
 STOP_RETRIES = "retry_ceiling"
 STOP_COOLDOWN = "cooldown_active"
@@ -142,6 +148,10 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     Timestamps are compared as normalized UTC instants, never lexically.
     Only sessions inside the retry window count as partial retries; only
     blocked/failed sessions inside the cooldown horizon hold cooldown.
+    Terminal (complete/partial) freshness is judged on finished_at and
+    fails closed to stale when a finish timestamp is corrupt or missing;
+    future-dated in-flight rows are invalid chronology and demand
+    recovery rather than counting as fresh.
     """
     now_dt = _instant(now)
     retry_floor = datetime.fromtimestamp(
@@ -217,7 +227,12 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
             in_flight_orphaned += 1
             continue
         age = (now_dt - when).total_seconds()
-        if age <= IN_FLIGHT_HORIZON_SECONDS:
+        if age < -IN_FLIGHT_SKEW_SECONDS:
+            # started_at is materially in the future: invalid chronology,
+            # never "fresh" (which would deadlock until that date).
+            in_flight_corrupt += 1
+            in_flight_orphaned += 1
+        elif age <= IN_FLIGHT_HORIZON_SECONDS:
             in_flight_fresh += 1
         else:
             in_flight_orphaned += 1
@@ -234,20 +249,31 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
         tuple(lineage),
     ).fetchall()
     newest_terminal: tuple[datetime, str] | None = None
+    corrupt_terminal = 0
+    unprovable_terminal = False
     for started_at, finished_at in terminal_rows:
-        for candidate in (finished_at, started_at):
-            if candidate is None:
-                continue
-            try:
-                when = _instant(str(candidate))
-            except ValueError:
-                continue  # corrupt terminal timestamp: not a stale signal;
-                # the session is still counted fail-closed in the windows
-            if newest_terminal is None or when > newest_terminal[0]:
-                newest_terminal = (when, str(candidate))
-    latest_terminal = (
-        (newest_terminal[1],) if newest_terminal is not None else None
-    )
+        # Freshness is defined on terminal completion: finished_at. A
+        # corrupt or missing finish timestamp makes completion chronology
+        # unprovable and fails closed to stale; started_at is never a
+        # substitute for a complete/partial row's finish time.
+        try:
+            when = _instant(str(finished_at))
+        except (ValueError, TypeError):
+            corrupt_terminal += 1
+            unprovable_terminal = True
+            continue
+        if newest_terminal is None or when > newest_terminal[0]:
+            newest_terminal = (when, str(finished_at))
+    if unprovable_terminal:
+        # At least one terminal row's completion time cannot be proven:
+        # refuse to certify assessment currency.
+        latest_terminal = None
+        stale_unprovable = True
+    else:
+        latest_terminal = (
+            (newest_terminal[1],) if newest_terminal is not None else None
+        )
+        stale_unprovable = False
     return {
         "session_count": len(rows),
         "entity_lineage": lineage,
@@ -258,8 +284,8 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
         "in_flight_horizon_seconds": IN_FLIGHT_HORIZON_SECONDS,
         "latest_terminal_session_time":
             str(latest_terminal[0]) if latest_terminal else None,
-        "corrupt_terminal_timestamps": len(terminal_rows) - (
-            0 if latest_terminal is None else 1) if terminal_rows else 0,
+        "corrupt_terminal_timestamps": corrupt_terminal,
+        "terminal_chronology_unprovable": stale_unprovable,
         "blocked_failed_streak_total": streak,
         "blocked_failed_streak_in_cooldown_horizon": streak_recent,
         "partial_sessions_in_retry_window": partials_in_window,
@@ -349,6 +375,12 @@ def plan_next_acquisition(
                              "horizon_seconds": IN_FLIGHT_HORIZON_SECONDS},
                       assessment_id)
 
+    if history.get("terminal_chronology_unprovable"):
+        return decide(None, STOP_STALE,
+                      "assessment_currency_unprovable_corrupt_timestamp",
+                      None, {"corrupt_terminal_timestamps":
+                             history.get("corrupt_terminal_timestamps", 0)},
+                      assessment_id)
     latest_terminal_time = history.get("latest_terminal_session_time")
     if latest_terminal_time:
         latest_dt = _instant(latest_terminal_time)  # pre-parsed upstream

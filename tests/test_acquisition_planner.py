@@ -16,6 +16,8 @@ from sara.acquisition_planner import (
     STOP_NO_ASSESSMENT,
     STOP_POLICY,
     STOP_RETRIES,
+    STOP_STALE,
+    STOP_STALE_IN_FLIGHT,
     STOP_SUFFICIENT,
     STOP_UNSUPPORTED,
     plan_next_acquisition,
@@ -113,11 +115,14 @@ def acquire(conn, tmp_path, *, pages=MENU_SITE, page_limit=8):
 
 
 def _ensure_website_source(conn) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO sources(id,source_type,name,base_url,created_at,active) "
-        "VALUES ('src_official_web','official_website','Official website',NULL,"
-        "'2026-01-01T00:00:00+00:00',1)")
-    conn.commit()
+    exists = conn.execute(
+        "SELECT 1 FROM sources WHERE id='src_official_web'").fetchone()
+    if exists is None:
+        conn.execute(
+            "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
+            "VALUES ('src_official_web','official_website','Official website',NULL,"
+            "'2026-01-01T00:00:00+00:00',1)")
+        conn.commit()
 
 def test_no_assessment_stops_closed(tmp_path: Path) -> None:
     conn = prepared(tmp_path / "no-assessment.sqlite")
@@ -556,12 +561,13 @@ def test_reader_detected_integrity_stops_even_with_sealed_count_zero(tmp_path: P
     conn.close()
 
 
-def test_two_corrupt_partials_hit_retry_ceiling(tmp_path: Path) -> None:
-    """Corrupt-timestamp sessions count individually, status preserved."""
-    from sara.acquisition_planner import STOP_RETRIES
+def test_corrupt_sessions_count_individually(tmp_path: Path) -> None:
+    """Corrupt sessions keep per-session status: partials fail closed to
+    stale (V4-01 precedence), blocked rows hold cooldown individually."""
     conn = prepared(tmp_path / "corrupt-count.sqlite")
     entity = business_entity_id_for_maps_business(1)
     acquire(conn, tmp_path)
+    _ensure_website_source(conn)
     for i in range(2):
         conn.execute(
             "INSERT INTO acquisition_sessions("
@@ -569,16 +575,42 @@ def test_two_corrupt_partials_hit_retry_ceiling(tmp_path: Path) -> None:
             "config_json,config_hash,status,started_at,finished_at,error,"
             "legacy_run_id,evidence_count,observation_count"
             ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"acq_corrupt_{i}", entity, "src_official_web", "sara.website", "5",
+            (f"acq_corrupt_p{i}", entity, "src_official_web", "sara.website", "5",
              "{}", "x" * 64, "partial", "not-a-timestamp",
              "not-a-timestamp", None, None, 0, 0),
         )
     conn.commit()
     decision = plan_next_acquisition(conn, entity_id=entity,
                                      now="2026-09-26T12:30:00+00:00")
-    assert decision.stop_reason == STOP_RETRIES
-    assert decision.details["retries"] >= 2
-    conn.close()
+    # Corrupt-partial terminal rows make currency unprovable: the stale
+    # guard fires before the retry ceiling (fail-closed precedence).
+    assert decision.stop_reason == STOP_STALE
+    assert decision.reason_code == "assessment_currency_unprovable_corrupt_timestamp"
+    assert decision.details["corrupt_terminal_timestamps"] == 2
+
+    conn2 = prepared(tmp_path / "corrupt-blocked.sqlite")
+    entity2 = business_entity_id_for_maps_business(1)
+    acquire(conn2, tmp_path)
+    _ensure_website_source(conn2)
+    for i in range(3):
+        conn2.execute(
+            "INSERT INTO acquisition_sessions("
+            "id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at,finished_at,error,"
+            "legacy_run_id,evidence_count,observation_count"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"acq_corrupt_b{i}", entity2, "src_official_web", "sara.website", "5",
+             "{}", "x" * 64, "blocked", "not-a-timestamp",
+             "not-a-timestamp", "robots", None, 0, 0),
+        )
+    conn2.commit()
+    d2 = plan_next_acquisition(conn2, entity_id=entity2,
+                               now="2026-09-26T12:30:00+00:00")
+    # Blocked rows are not terminal-complete: no stale signal, and the
+    # three corrupt blocked sessions hold cooldown per-session.
+    assert d2.stop_reason == STOP_COOLDOWN
+    assert d2.details["streak"] >= 3
+    conn.close(); conn2.close()
 
 
 def test_stale_assessment_stops_when_acquisition_is_newer(tmp_path: Path) -> None:
@@ -756,11 +788,12 @@ def test_stale_check_mixed_offset_finished_at(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_corrupt_terminal_timestamps_do_not_block_or_stale(tmp_path: Path) -> None:
-    """Corrupt finished/started on terminal rows: no stale signal, fail-closed windows."""
+def test_corrupt_terminal_finish_fails_closed_to_stale(tmp_path: Path) -> None:
+    """V4-01: a complete row with corrupt finished_at makes currency unprovable."""
     conn = prepared(tmp_path / "corrupt-terminal.sqlite")
     entity = business_entity_id_for_maps_business(1)
     acquire(conn, tmp_path)  # refreshed assessment covers this session
+    _ensure_website_source(conn)
     conn.execute(
         "INSERT INTO acquisition_sessions("
         "id,target_subject_id,source_id,collector_name,collector_version,"
@@ -768,14 +801,29 @@ def test_corrupt_terminal_timestamps_do_not_block_or_stale(tmp_path: Path) -> No
         "legacy_run_id,evidence_count,observation_count"
         ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ("acq_corrupt_term", entity, "src_official_web", "sara.website", "5",
-         "{}", "x" * 64, "complete", "garbage", "garbage",
+         "{}", "x" * 64, "complete", "2026-09-26T10:00:00+00:00", "garbage",
          None, None, 0, 0))
     conn.commit()
     decision = plan_next_acquisition(conn, entity_id=entity,
                                      now="2026-09-26T12:30:00+00:00")
-    # corrupt terminal timestamps produce no stale signal; the decision
-    # proceeds on the current assessment (windows already fail closed).
-    assert decision.stop_reason != "stale_assessment"
+    # started_at 10:00 predates the assessment watermark, but completion
+    # chronology is unprovable: fail closed to stale, never accept.
+    assert decision.stop_reason == STOP_STALE
+    assert decision.reason_code == "assessment_currency_unprovable_corrupt_timestamp"
+    assert decision.details["corrupt_terminal_timestamps"] == 1
+    conn.close()
+
+
+def test_corrupt_terminal_count_counts_parse_failures(tmp_path: Path) -> None:
+    """Two valid terminal rows report zero corrupt; the count is exact."""
+    conn = prepared(tmp_path / "corrupt-count-exact.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    history = plan_next_acquisition(
+        conn, entity_id=entity, now="2026-09-26T12:30:00+00:00"
+    ).details["planner_inputs"]["session_history"]
+    assert history["corrupt_terminal_timestamps"] == 0
+    assert history["terminal_chronology_unprovable"] is False
     conn.close()
 
 
@@ -865,3 +913,89 @@ def test_cli_ceiling_retry_replays_action_decision(tmp_path: Path, capsys) -> No
     ).fetchone())
     assert counts == (1, 1)
     conn2.close()
+
+
+def test_future_dated_in_flight_routes_to_recovery(tmp_path: Path) -> None:
+    """V4-03: an in-flight row started in the future is recovery, not fresh."""
+    conn = prepared(tmp_path / "future-inflight.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    _ensure_website_source(conn)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_future", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "running", "2027-06-01T00:00:00+00:00",
+         None, None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_STALE_IN_FLIGHT
+    assert decision.details["orphaned"] == 1
+    conn.close()
+
+
+def test_ceiling_replay_requires_same_ceiling(tmp_path: Path, capsys) -> None:
+    """V4-02: a stricter max-decisions is NOT bypassed by replaying the old action."""
+    from sara.acquisition_planner_cli import main as planner_cli_main
+    conn = prepared(tmp_path / "ceiling-stricter.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    conn.close()
+    db = str(tmp_path / "ceiling-stricter.sqlite")
+    rc1 = planner_cli_main(["--db", db, "--business-id", "1",
+                            "--max-decisions", "2"])
+    assert rc1 == 0
+    first = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert first["action"] is not None
+    # Same sealed state but a stricter ceiling: the recomputed decision is
+    # policy_ceiling and the replay shortcut must NOT hand back the
+    # action persisted under the looser ceiling.
+    rc2 = planner_cli_main(["--db", db, "--business-id", "1",
+                            "--max-decisions", "1"])
+    assert rc2 == 0
+    second = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert second["action"] is None
+    assert second["stop_reason"] == "policy_ceiling"
+    assert second.get("replayed") is not True
+    assert second["decision_id"] != first["decision_id"]
+
+
+def test_ceiling_counts_merged_predecessor_decisions(tmp_path: Path, capsys) -> None:
+    """V4-04: actions persisted on a merged predecessor count after convergence."""
+    from sara.acquisition_planner_cli import main as planner_cli_main
+    conn = prepared(tmp_path / "ceiling-lineage.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
+        "merged_at,created_at,updated_at) "
+        "VALUES ('be_old2','business_entity','merged',?,"
+        "'2026-09-26T12:00:00+00:00','2026-09-25T00:00:00+00:00','2026-09-26T12:00:00+00:00')",
+        (entity,))
+    conn.execute(
+        "INSERT INTO business_entities(id,created_at,updated_at) VALUES "
+        "('be_old2','2026-09-25T00:00:00+00:00','2026-09-26T12:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO planner_decisions("
+        "id,business_entity_id,decided_at,action,stop_reason,reason_code,"
+        "target_domain,policy_version,details_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("plan_pred_1", "be_old2", "2026-09-26T12:20:00+00:00",
+         "acquire_official_website", None, "predecessor",
+         "offerings", "acquisition-planner-v4",
+         '{"planner_inputs":{"max_decisions":2}}', "2026-09-26T12:20:00+00:00"))
+    conn.commit()
+    conn.close()
+    db = str(tmp_path / "ceiling-lineage.sqlite")
+    # max_decisions=1: the predecessor's action is inside the 7-day window,
+    # so the canonical entity must already be at the ceiling.
+    rc = planner_cli_main(["--db", db, "--business-id", "1",
+                           "--max-decisions", "1"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["stop_reason"] == "policy_ceiling"
