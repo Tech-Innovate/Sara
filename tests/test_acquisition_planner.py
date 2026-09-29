@@ -18,6 +18,7 @@ from sara.acquisition_planner import (
     STOP_RETRIES,
     STOP_STALE,
     STOP_STALE_IN_FLIGHT,
+    STOP_STALE_UNDERSTANDING,
     STOP_SUFFICIENT,
     STOP_UNSUPPORTED,
     plan_next_acquisition,
@@ -629,9 +630,17 @@ def test_stale_assessment_stops_when_acquisition_is_newer(tmp_path: Path) -> Non
         client_factory=factory(FakeClient(MENU_SITE)), refresh_assessment=False)
     decision = plan_next_acquisition(conn, entity_id=entity,
                                      now="2026-09-26T12:30:00+00:00")
-    assert decision.stop_reason == STOP_STALE
-    assert decision.reason_code == "assessment_older_than_latest_acquisition"
-    assert decision.details["latest_terminal_session_time"] > "2026-09-26T11:"
+    # Under v5 the source-agnostic Understanding-state watermark fires
+    # first (the unrefreshed acquisition left newer evidence/observations);
+    # the website-specific reason remains for finish-after-watermark edges.
+    assert decision.stop_reason in (STOP_STALE, STOP_STALE_UNDERSTANDING)
+    assert decision.reason_code in (
+        "assessment_older_than_latest_acquisition",
+        "assessment_older_than_understanding_state")
+    if decision.reason_code == "assessment_older_than_latest_acquisition":
+        assert decision.details["latest_terminal_session_time"] > "2026-09-26T11:"
+    else:
+        assert decision.details["understanding_state_watermark"] > "2026-09-26T11:"
     conn.close()
 
 

@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-PLANNER_POLICY_VERSION = "acquisition-planner-v4"
+PLANNER_POLICY_VERSION = "acquisition-planner-v5"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -56,6 +56,7 @@ UNSUPPORTED_DOMAINS = frozenset({
 
 STOP_SUFFICIENT = "sufficient_state"
 STOP_STALE = "stale_assessment"
+STOP_STALE_UNDERSTANDING = "stale_understanding_state"
 STOP_IN_FLIGHT = "acquisition_in_progress"
 STOP_STALE_IN_FLIGHT = "stale_in_flight_session"
 #: A running/planned session older than this is an orphan from a
@@ -140,6 +141,66 @@ def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
         (entity_id,),
     ).fetchall()
     return [str(row[0]) for row in rows]
+
+
+def _understanding_state_watermark(
+    conn: sqlite3.Connection, lineage: list[str]
+) -> dict[str, Any]:
+    """Newest durable Business-Understanding state timestamp across the
+    entity lineage, over every table any collector or sync can mutate —
+    facts, observations, evidence, subjects, Maps links, and external
+    identifiers. Corrupt timestamps fail closed to unprovable.
+    """
+    marks = ",".join("?" for _ in lineage)
+    queries = {
+        "facts": (
+            f"SELECT created_at FROM facts WHERE subject_id IN ({marks}) "
+            f"UNION ALL SELECT valid_from FROM facts WHERE subject_id IN ({marks}) "
+            f"UNION ALL SELECT reconciled_at FROM facts WHERE subject_id IN ({marks}) "
+            f"AND reconciled_at IS NOT NULL",
+            tuple(lineage) * 3),
+        "observations": (
+            f"SELECT observed_at FROM observations WHERE subject_id IN ({marks})",
+            tuple(lineage)),
+        "evidence": (
+            f"SELECT e.retrieved_at FROM evidence_items e "
+            f"JOIN observations o ON o.evidence_id=e.id "
+            f"WHERE o.subject_id IN ({marks})",
+            tuple(lineage)),
+        "subjects": (
+            f"SELECT created_at FROM knowledge_subjects WHERE id IN ({marks}) "
+            f"UNION ALL SELECT updated_at FROM knowledge_subjects WHERE id IN ({marks}) "
+            f"UNION ALL SELECT merged_at FROM knowledge_subjects "
+            f"WHERE id IN ({marks}) AND merged_at IS NOT NULL",
+            tuple(lineage) * 3),
+        "maps_links": (
+            f"SELECT linked_at FROM maps_business_location_links m "
+            f"JOIN business_locations bl ON bl.id=m.location_id "
+            f"WHERE bl.business_entity_id IN ({marks})",
+            tuple(lineage)),
+        "identifiers": (
+            f"SELECT last_observed_at FROM external_identifiers "
+            f"WHERE subject_id IN ({marks})",
+            tuple(lineage)),
+    }
+    newest: datetime | None = None
+    corrupt = 0
+    for name, (sql, params) in queries.items():
+        for (value,) in conn.execute(sql, params):
+            if value is None:
+                continue
+            try:
+                when = _instant(str(value))
+            except ValueError:
+                corrupt += 1
+                continue
+            if newest is None or when > newest:
+                newest = when
+    return {
+        "watermark": newest.isoformat() if newest is not None else None,
+        "corrupt_state_timestamps": corrupt,
+        "unprovable": corrupt > 0 and newest is None,
+    }
 
 
 def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> dict[str, Any]:
@@ -316,6 +377,8 @@ def plan_next_acquisition(
     from .dossier.status import persisted_assessment
 
     history = _session_history(conn, entity_id, now=now)
+    state_watermark = _understanding_state_watermark(
+        conn, history["entity_lineage"])
     # decisions_taken is deliberately NOT sealed into the identity: the
     # counter includes previously persisted action decisions, so sealing
     # it would make every retry mint a new id and break replay. It stays
@@ -326,6 +389,7 @@ def plan_next_acquisition(
         "policy_version": PLANNER_POLICY_VERSION,
         "max_decisions": int(max_decisions),
         "session_history": history,
+        "understanding_state_watermark": state_watermark,
     }
 
     def decide(action, stop, reason, target, details, assessment_id):
@@ -342,6 +406,7 @@ def plan_next_acquisition(
                 "decisions_taken": int(decisions_taken),
                 "max_decisions": int(max_decisions),
                 "session_history": history,
+                "understanding_state_watermark": state_watermark,
             },
         })
         return PlannerDecision(
@@ -356,6 +421,20 @@ def plan_next_acquisition(
                       None, {}, "none")
 
     assessment_id = str(assessment["id"])
+    summary = assessment.get("summary") or {}
+
+    # Reader/sealed integrity is evaluated FIRST, immediately after
+    # assessment retrieval and before any acquisition-state or currency
+    # evaluation: an internally inconsistent assessment never yields an
+    # in-flight, stale, or sufficient decision.
+    reader_issues = list(assessment.get("integrity_issues") or [])
+    sealed_count = int(summary.get("integrity_issue_count") or 0)
+    if reader_issues or sealed_count:
+        return decide(None, STOP_INTEGRITY, "assessment_reports_integrity_issues",
+                      None, {"reader_integrity_codes":
+                             sorted({str(item.get("code")) for item in reader_issues}),
+                             "sealed_integrity_issue_count": sealed_count},
+                      assessment_id)
 
     if history["in_flight_sessions"] > 0:
         if history["in_flight_fresh"] > 0:
@@ -375,6 +454,35 @@ def plan_next_acquisition(
                              "horizon_seconds": IN_FLIGHT_HORIZON_SECONDS},
                       assessment_id)
 
+    # Source-agnostic currency: the assessment's facts watermark must
+    # cover the newest durable Understanding state across the lineage —
+    # facts, observations, evidence, subjects, Maps links, identifiers —
+    # regardless of which collector or sync produced it. A later Maps
+    # synchronization therefore forces a refresh before planning.
+    try:
+        as_of_dt = _instant(str(assessment["facts_as_of"]))
+    except ValueError:
+        return decide(None, STOP_STALE,
+                      "assessment_currency_unprovable_corrupt_timestamp",
+                      None, {"facts_as_of": str(assessment["facts_as_of"])},
+                      assessment_id)
+    if state_watermark["unprovable"]:
+        return decide(None, STOP_STALE,
+                      "understanding_state_chronology_unprovable",
+                      None, {"corrupt_state_timestamps":
+                             state_watermark["corrupt_state_timestamps"]},
+                      assessment_id)
+    if state_watermark["watermark"] is not None:
+        state_dt = _instant(state_watermark["watermark"])
+        if state_dt > as_of_dt:
+            return decide(None, STOP_STALE_UNDERSTANDING,
+                          "assessment_older_than_understanding_state",
+                          None, {"assessment_facts_as_of":
+                                 str(assessment["facts_as_of"]),
+                                 "understanding_state_watermark":
+                                 state_watermark["watermark"]},
+                          assessment_id)
+
     if history.get("terminal_chronology_unprovable"):
         return decide(None, STOP_STALE,
                       "assessment_currency_unprovable_corrupt_timestamp",
@@ -384,13 +492,6 @@ def plan_next_acquisition(
     latest_terminal_time = history.get("latest_terminal_session_time")
     if latest_terminal_time:
         latest_dt = _instant(latest_terminal_time)  # pre-parsed upstream
-        try:
-            as_of_dt = _instant(str(assessment["facts_as_of"]))
-        except ValueError:
-            return decide(None, STOP_STALE,
-                          "assessment_currency_unprovable_corrupt_timestamp",
-                          None, {"latest_terminal_session_time": latest_terminal_time},
-                          assessment_id)
         # The assessment must cover the newest terminal evidence-producing
         # acquisition by its finish time; a session that finished after
         # the assessment's facts watermark left unassessed evidence.
@@ -401,25 +502,9 @@ def plan_next_acquisition(
                                  str(assessment["facts_as_of"]),
                                  "latest_terminal_session_time": latest_terminal_time},
                           assessment_id)
-    summary = assessment.get("summary") or {}
     blocking = tuple(sorted(
         str(d) for d in summary.get("blocking_mandatory_domains", ())
     ))
-
-    # Reader-detected integrity issues are the authority: the reader
-    # recomputes chronology/consistency facts (facts_as_of vs computed_at,
-    # seal ordering, ready-flag coherence) against the persisted rows and
-    # catches internally inconsistent or directly populated historical
-    # assessments whose sealed summary count says zero. The sealed count
-    # remains a secondary signal only.
-    reader_issues = list(assessment.get("integrity_issues") or [])
-    sealed_count = int(summary.get("integrity_issue_count") or 0)
-    if reader_issues or sealed_count:
-        return decide(None, STOP_INTEGRITY, "assessment_reports_integrity_issues",
-                      None, {"reader_integrity_codes":
-                             sorted({str(item.get("code")) for item in reader_issues}),
-                             "sealed_integrity_issue_count": sealed_count},
-                      assessment_id)
 
     if assessment["analysis_ready"]:
         return decide(None, STOP_SUFFICIENT, "all_mandatory_domains_ready",
