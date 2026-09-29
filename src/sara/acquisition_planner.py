@@ -6,14 +6,14 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Invariants:
-- same dossier assessment + same planner policy/version -> same decision;
-- every decision cycle ends in exactly one allowlisted action or one
-  stop, never both and never neither;
-- the decision graph is acyclic by construction: each stop reason is
-  terminal and each action names the domain it intends to improve, so a
-  cycle would require a domain to regress, which reassessment alone
-  cannot cause without an intervening acquisition.
+Determinism contract: for the SAME entity, the SAME sealed assessment,
+the SAME session history snapshot, and the SAME planner inputs
+(retry-window start, cooldown horizon, decisions-taken counter, and the
+decision ceiling), the same policy version yields the same decision id
+and the same chosen action or stop. The session-history snapshot and the
+operational inputs are sealed INTO the decision id and persisted in the
+record, so two runs that differ in any of them are visibly different
+decisions rather than silently divergent ones.
 """
 
 from __future__ import annotations
@@ -22,9 +22,10 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
-PLANNER_POLICY_VERSION = "acquisition-planner-v1"
+PLANNER_POLICY_VERSION = "acquisition-planner-v2"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -56,6 +57,15 @@ STOP_RETRIES = "retry_ceiling"
 STOP_COOLDOWN = "cooldown_active"
 STOP_POLICY = "policy_ceiling"
 STOP_NO_ASSESSMENT = "no_persisted_assessment"
+STOP_INTEGRITY = "assessment_integrity"
+
+#: Default retry window: partial sessions older than this do not count
+#: toward the retry ceiling (7 days, in seconds).
+RETRY_WINDOW_SECONDS = 7 * 24 * 3600
+
+#: Default cooldown horizon: blocked/failed sessions older than this no
+#: longer hold the entity in cooldown (24 hours, in seconds).
+COOLDOWN_SECONDS = 24 * 3600
 
 _RETRY_CEILING = 2
 _COOLDOWN_SESSIONS = 3
@@ -78,41 +88,77 @@ class PlannerDecision:
             raise ValueError("a decision carries exactly one action or one stop reason")
 
 
-def _decision_hash(entity_id: str, assessment_id: str, action: str | None,
-                   stop_reason: str | None, reason_code: str, target_domain: str | None) -> str:
-    payload = json.dumps(
-        [entity_id, assessment_id, action, stop_reason, reason_code, target_domain,
-         PLANNER_POLICY_VERSION],
-        sort_keys=True, separators=(",", ":"),
+def _instant(value: str) -> datetime:
+    """Parse a persisted ISO timestamp to a UTC instant."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp {value!r} is not timezone-aware")
+    return parsed.astimezone(timezone.utc)
+
+
+def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> dict[str, Any]:
+    """Snapshot the website session facts the decision depends on.
+
+    Timestamps are compared as normalized UTC instants, never lexically.
+    Only sessions inside the retry window count as partial retries; only
+    blocked/failed sessions inside the cooldown horizon hold cooldown.
+    """
+    now_dt = _instant(now)
+    retry_floor = datetime.fromtimestamp(
+        now_dt.timestamp() - RETRY_WINDOW_SECONDS, tz=timezone.utc
     )
-    return "plan_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
-
-
-def _blocked_recently(conn: sqlite3.Connection, entity_id: str, *, now: str) -> int:
-    """Count the most recent consecutive blocked/failed website sessions."""
+    cooldown_floor = datetime.fromtimestamp(
+        now_dt.timestamp() - COOLDOWN_SECONDS, tz=timezone.utc
+    )
     rows = conn.execute(
-        "SELECT status FROM acquisition_sessions "
+        "SELECT status, started_at FROM acquisition_sessions "
         "WHERE target_subject_id=? AND collector_name='sara.website' "
         "ORDER BY started_at DESC",
         (entity_id,),
     ).fetchall()
     streak = 0
-    for row in rows:
-        if row[0] in ("blocked", "failed"):
+    for status, started_at in rows:
+        if status in ("blocked", "failed"):
             streak += 1
         else:
             break
-    return streak
+    streak_recent = 0
+    for status, started_at in rows:
+        if status not in ("blocked", "failed"):
+            break
+        try:
+            when = _instant(str(started_at))
+        except ValueError:
+            streak_recent = streak  # corrupt timestamp: fail closed to full streak
+            break
+        if when >= cooldown_floor:
+            streak_recent += 1
+        else:
+            break
+    partials_in_window = 0
+    for status, started_at in rows:
+        if status != "partial":
+            continue
+        try:
+            when = _instant(str(started_at))
+        except ValueError:
+            partials_in_window += 1  # corrupt timestamp: fail closed
+            continue
+        if when >= retry_floor:
+            partials_in_window += 1
+    return {
+        "session_count": len(rows),
+        "blocked_failed_streak_total": streak,
+        "blocked_failed_streak_in_cooldown_horizon": streak_recent,
+        "partial_sessions_in_retry_window": partials_in_window,
+        "retry_window_seconds": RETRY_WINDOW_SECONDS,
+        "cooldown_horizon_seconds": COOLDOWN_SECONDS,
+    }
 
 
-def _website_retry_count(conn: sqlite3.Connection, entity_id: str, *, since: str) -> int:
-    """Partial website sessions since the given timestamp."""
-    return int(conn.execute(
-        "SELECT COUNT(*) FROM acquisition_sessions "
-        "WHERE target_subject_id=? AND collector_name='sara.website' "
-        "AND status='partial' AND started_at > ?",
-        (entity_id, since),
-    ).fetchone()[0])
+def _decision_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "plan_" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:40]
 
 
 def plan_next_acquisition(
@@ -122,110 +168,104 @@ def plan_next_acquisition(
     now: str,
     decisions_taken: int = 0,
     max_decisions: int = 25,
-    since: str = "",
 ) -> PlannerDecision:
     """Decide the single next action for one entity from its persisted assessment.
 
-    ``now`` is the decision clock (ISO-8601, timezone-aware). ``since``
-    bounds the retry window; sessions started before it do not count
-    toward the retry ceiling.
+    ``now`` is the decision clock (ISO-8601, timezone-aware). The retry
+    window and cooldown horizon are fixed policy constants derived from
+    ``now``; every operational input is sealed into the decision id.
     """
     from .dossier.status import persisted_assessment
 
+    history = _session_history(conn, entity_id, now=now)
+    base_inputs = {
+        "entity_id": entity_id,
+        "policy_version": PLANNER_POLICY_VERSION,
+        "decisions_taken": int(decisions_taken),
+        "max_decisions": int(max_decisions),
+        "session_history": history,
+        "now": now,
+    }
+
+    def decide(action, stop, reason, target, details, assessment_id):
+        payload = dict(base_inputs)
+        payload.update({
+            "assessment_id": assessment_id,
+            "action": action, "stop_reason": stop,
+            "reason_code": reason, "target_domain": target,
+        })
+        merged = dict(details)
+        merged.update({
+            "decided_at": now, "assessment_id": assessment_id,
+            "entity_id": entity_id, "planner_inputs": {
+                "decisions_taken": int(decisions_taken),
+                "max_decisions": int(max_decisions),
+                "session_history": history,
+            },
+        })
+        return PlannerDecision(
+            action=action, stop_reason=stop, reason_code=reason,
+            target_domain=target, decision_id=_decision_hash(payload),
+            details=merged,
+        )
+
     assessment = persisted_assessment(conn, entity_id)
     if assessment is None:
-        decision = PlannerDecision(
-            action=None, stop_reason=STOP_NO_ASSESSMENT,
-            reason_code="no_sealed_assessment", target_domain=None,
-        )
-        return _finalize(decision, entity_id, now)
+        return decide(None, STOP_NO_ASSESSMENT, "no_sealed_assessment",
+                      None, {}, "none")
 
-    if assessment["analysis_ready"]:
-        decision = PlannerDecision(
-            action=None, stop_reason=STOP_SUFFICIENT,
-            reason_code="all_mandatory_domains_ready", target_domain=None,
-            details={"facts_as_of": assessment["facts_as_of"]},
-        )
-        return _finalize(decision, entity_id, now, assessment)
+    assessment_id = str(assessment["id"])
+    summary = assessment.get("summary") or {}
+    blocking = tuple(sorted(
+        str(d) for d in summary.get("blocking_mandatory_domains", ())
+    ))
+
+    if assessment["analysis_ready"] and not summary.get("integrity_issue_count"):
+        return decide(None, STOP_SUFFICIENT, "all_mandatory_domains_ready",
+                      None, {"facts_as_of": assessment["facts_as_of"]},
+                      assessment_id)
+    if assessment["analysis_ready"] and summary.get("integrity_issue_count"):
+        # An analysis_ready flag sealed before reader-detected integrity
+        # issues must not fail open into sufficient_state.
+        return decide(None, STOP_INTEGRITY, "assessment_reports_integrity_issues",
+                      None, {"integrity_issue_count":
+                             summary.get("integrity_issue_count")},
+                      assessment_id)
 
     if decisions_taken >= max_decisions:
-        decision = PlannerDecision(
-            action=None, stop_reason=STOP_POLICY,
-            reason_code="max_decisions_reached",
-            target_domain=None,
-            details={"max_decisions": max_decisions},
-        )
-        return _finalize(decision, entity_id, now, assessment)
+        return decide(None, STOP_POLICY, "max_decisions_reached", None,
+                      {"max_decisions": max_decisions}, assessment_id)
 
-    blocked_streak = _blocked_recently(conn, entity_id, now=now)
-    if blocked_streak >= _COOLDOWN_SESSIONS:
-        decision = PlannerDecision(
-            action=None, stop_reason=STOP_COOLDOWN,
-            reason_code="consecutive_blocked_or_failed_sessions",
-            target_domain=None,
-            details={"streak": blocked_streak, "ceiling": _COOLDOWN_SESSIONS},
-        )
-        return _finalize(decision, entity_id, now, assessment)
+    if history["blocked_failed_streak_in_cooldown_horizon"] >= _COOLDOWN_SESSIONS:
+        return decide(None, STOP_COOLDOWN,
+                      "consecutive_blocked_or_failed_sessions", None,
+                      {"streak": history["blocked_failed_streak_in_cooldown_horizon"],
+                       "ceiling": _COOLDOWN_SESSIONS,
+                       "horizon_seconds": COOLDOWN_SECONDS}, assessment_id)
 
-    retry_window = since or "0001-01-01T00:00:00+00:00"
-    retries = _website_retry_count(conn, entity_id, since=retry_window)
-    if retries >= _RETRY_CEILING:
-        decision = PlannerDecision(
-            action=None, stop_reason=STOP_RETRIES,
-            reason_code="partial_acquisition_retry_ceiling",
-            target_domain=None,
-            details={"retries": retries, "ceiling": _RETRY_CEILING},
-        )
-        return _finalize(decision, entity_id, now, assessment)
+    if history["partial_sessions_in_retry_window"] >= _RETRY_CEILING:
+        return decide(None, STOP_RETRIES, "partial_acquisition_retry_ceiling",
+                      None, {"retries": history["partial_sessions_in_retry_window"],
+                             "ceiling": _RETRY_CEILING,
+                             "window_seconds": RETRY_WINDOW_SECONDS}, assessment_id)
 
-    domains = {item["domain"]: item["state"] for item in assessment["domains"]}
-    blocking = [
-        d for d in assessment.get("blocking_mandatory_domains", ())
-        if domains.get(d) not in READY_STATES
-    ] or sorted(
-        d for d, state in domains.items() if state not in READY_STATES
-    )
+    domains = {str(item["domain"]): str(item["state"])
+               for item in assessment.get("domains", ())}
+    blocking_current = [d for d in blocking if domains.get(d) not in READY_STATES]
 
     action_spec = ACTIONS["acquire_official_website"]
-    improvable = [d for d in blocking if d in action_spec["improves_domains"]]
-    unsupported = [d for d in blocking if d in UNSUPPORTED_DOMAINS]
+    improvable = sorted(d for d in blocking_current
+                        if d in action_spec["improves_domains"])
+    unsupported = sorted(d for d in blocking_current
+                         if d in UNSUPPORTED_DOMAINS)
 
     if improvable:
-        target = sorted(improvable)[0]
-        decision = PlannerDecision(
-            action="acquire_official_website", stop_reason=None,
-            reason_code="deficient_domain_supported_by_collector",
-            target_domain=target,
-            details={"collector": action_spec["collector"],
-                     "blocking": sorted(blocking)},
-        )
-        return _finalize(decision, entity_id, now, assessment)
+        target = improvable[0]
+        return decide("acquire_official_website", None,
+                      "deficient_domain_supported_by_collector", target,
+                      {"collector": action_spec["collector"],
+                       "blocking": sorted(blocking_current)}, assessment_id)
 
-    decision = PlannerDecision(
-        action=None, stop_reason=STOP_UNSUPPORTED,
-        reason_code="no_allowlisted_action_for_deficiency",
-        target_domain=sorted(unsupported)[0] if unsupported else None,
-        details={"blocking": sorted(blocking)},
-    )
-    return _finalize(decision, entity_id, now, assessment)
-
-
-def _finalize(
-    decision: PlannerDecision,
-    entity_id: str,
-    now: str,
-    assessment: dict[str, Any] | None = None,
-) -> PlannerDecision:
-    assessment_id = (assessment or {}).get("id", "none")
-    digest = _decision_hash(
-        entity_id, assessment_id, decision.action, decision.stop_reason,
-        decision.reason_code, decision.target_domain,
-    )
-    details = dict(decision.details)
-    details["decided_at"] = now
-    details["assessment_id"] = assessment_id
-    return PlannerDecision(
-        action=decision.action, stop_reason=decision.stop_reason,
-        reason_code=decision.reason_code, target_domain=decision.target_domain,
-        decision_id=digest, details=details,
-    )
+    return decide(None, STOP_UNSUPPORTED, "no_allowlisted_action_for_deficiency",
+                  unsupported[0] if unsupported else None,
+                  {"blocking": sorted(blocking_current)}, assessment_id)
