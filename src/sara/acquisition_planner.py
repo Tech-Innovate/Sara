@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v4): for the SAME entity, the SAME sealed
+Determinism contract (v6): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, and the SAME decision
 ceiling, the same policy version yields the same decision id and the
 same chosen action or stop. The session-history snapshot (which embeds
@@ -28,7 +28,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-PLANNER_POLICY_VERSION = "acquisition-planner-v5"
+# v6: currentness became assessment-signature equality over the
+# resolved Entity+Location graph (v5 was Entity-only max-timestamp).
+PLANNER_POLICY_VERSION = "acquisition-planner-v6"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})

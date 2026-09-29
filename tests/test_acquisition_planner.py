@@ -1076,8 +1076,9 @@ def test_integrity_precedes_in_flight_and_stale(tmp_path: Path) -> None:
 
 
 def test_maps_side_state_change_forces_stale_then_resumes(tmp_path: Path) -> None:
-    """V6-02: Entity-side state change after assessment A -> signature stop;
-    sealed assessment B resumes deterministic planning."""
+    """V6-02: a Maps-style identifier refresh (via the Location subject the
+    dossier actually reads) after assessment A -> signature stop; sealed
+    assessment B resumes deterministic planning."""
     from sara.acquisition_planner import STOP_STALE_UNDERSTANDING
 
     conn = prepared(tmp_path / "maps-side.sqlite")
