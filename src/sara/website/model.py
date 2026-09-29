@@ -148,6 +148,11 @@ class WebsiteAcquisitionStats:
     not_observed_facts_created: int
     fetch_errors: tuple[str, ...]
     unresolved_predicates: tuple[str, ...]
+    crawl_frontier_exhausted: bool = False
+    absence_claimable: bool = False
+    assessment_id: str | None = None
+    assessment_already_assessed: bool | None = None
+    assessment_analysis_ready: bool | None = None
 
 
 def canonical_json(value: Any) -> str:
