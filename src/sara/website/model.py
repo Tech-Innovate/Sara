@@ -15,7 +15,10 @@ class WebsiteAcquisitionError(RuntimeError):
 
 OFFICIAL_WEB_SOURCE_ID = "src_official_web"
 COLLECTOR_NAME = "sara.website"
-COLLECTOR_VERSION = "4"
+# v5: frontier_exhausted now excludes depth-limit truncation;
+# legacy sessions recorded exhaustion under the older, looser
+# semantics and must not be trusted as depth-complete evidence.
+COLLECTOR_VERSION = "5"
 # v4: capability absence is claimable only on frontier-exhausted
 # complete business-wide crawls; budget truncation (page or depth)
 # leaves unobserved capabilities unknown instead of absent.
