@@ -305,3 +305,22 @@ def test_readonly_dossier_surfaces_latest_sealed_assessment_after_writer(tmp_pat
     assert persisted["id"] == written.assessment_id
     assert persisted["analysis_ready"] is False
     assert len(persisted["domains"]) == len(DOSSIER_DOMAIN_SEED_V1)
+
+
+def test_assessment_on_v1_only_schema_fails_closed(tmp_path: Path) -> None:
+    """A database migrated only through v1 refuses assessment cleanly."""
+    conn = _prepared(
+        tmp_path / "assessment-v1-only.sqlite",
+        migrations=MIGRATIONS[:1],
+    )
+    try:
+        with pytest.raises(DossierAssessmentError, match="schema v2"):
+            persist_dossier_assessment(
+                conn,
+                business_id=1,
+                now=lambda: "2026-09-28T10:00:00+00:00",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
+        assert not conn.in_transaction
+    finally:
+        conn.close()

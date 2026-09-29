@@ -1259,7 +1259,28 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
             NEW.status_changed_at IS NULL
             OR (
                 OLD.status_changed_at IS NOT NULL
-                AND NEW.status_changed_at <= OLD.status_changed_at
+                -- Compare instants, not strings: mixed UTC offsets would
+                -- otherwise sort wrongly. julianday() cannot parse offsets,
+                -- so the instant is local-time minus the ±HH:MM tail; a
+                -- missing or non-numeric tail counts as offset zero.
+                -- Comparison precision is one second.
+                AND julianday(
+                    substr(NEW.status_changed_at, 1, 19),
+                    printf('%+d seconds', (
+                        -(CAST(substr(NEW.status_changed_at, 21, 2) AS INTEGER) * 3600
+                          + CAST(substr(NEW.status_changed_at, 24, 2) AS INTEGER) * 60)
+                        * (CASE WHEN substr(NEW.status_changed_at, 20, 1) = '-'
+                                THEN -1 ELSE 1 END)
+                    ))
+                ) <= julianday(
+                    substr(OLD.status_changed_at, 1, 19),
+                    printf('%+d seconds', (
+                        -(CAST(substr(OLD.status_changed_at, 21, 2) AS INTEGER) * 3600
+                          + CAST(substr(OLD.status_changed_at, 24, 2) AS INTEGER) * 60)
+                        * (CASE WHEN substr(OLD.status_changed_at, 20, 1) = '-'
+                                THEN -1 ELSE 1 END)
+                    ))
+                )
             )
         )
     ) OR (

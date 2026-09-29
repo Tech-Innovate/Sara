@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from ..migrations import MIGRATIONS, current_schema_version
 from ..understanding_vocabulary import DOSSIER_DOMAIN_SEED_V1, DOSSIER_POLICY_VERSION
 from .assessment_policy import DERIVATION_VERSION, derive_domain_assessments
 from .core import DossierQueryError, parse_timestamp, resolve_subject, subject
@@ -43,6 +44,25 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _require_assessment_schema(conn: sqlite3.Connection) -> None:
+    """Fail closed unless the schema carries every migration the writer reads.
+
+    The assessment reads v2 columns (external_identifiers.status_changed_at);
+    on a database migrated only through v1 that query would leak a raw
+    storage error, so the version is checked before any dossier work.
+    An unrecognized future schema version also refuses, mirroring the
+    vocabulary seed contract.
+    """
+    version = current_schema_version(conn)
+    known = {migration.version for migration in MIGRATIONS}
+    if version not in known or version < 2:
+        raise DossierAssessmentError(
+            "dossier assessment requires Business Understanding schema v2 "
+            "(external identifier status chronology); this database is at "
+            f"schema version {version}"
+        )
 
 
 def _validated_timestamp(value: object, *, field: str) -> str:
@@ -752,6 +772,8 @@ def persist_dossier_assessment(
             "SQLite foreign-key enforcement must be enabled for dossier assessment"
         )
 
+    _require_assessment_schema(conn)
+
     try:
         conn.execute("BEGIN IMMEDIATE")
         computed_at = _validated_timestamp(now(), field="dossier assessment time")
@@ -861,6 +883,26 @@ def persist_dossier_assessment(
                 already_assessed=True,
             )
 
+        existing_clocks = [
+            parse_timestamp(
+                _validated_timestamp(
+                    row[0], field="existing dossier assessment computed_at"
+                ),
+                field="existing dossier assessment computed_at",
+            )
+            for row in conn.execute(
+                "SELECT computed_at FROM dossier_assessments WHERE business_entity_id=?",
+                (entity,),
+            )
+        ]
+        if existing_clocks and parse_timestamp(
+            computed_at, field="computed_at"
+        ) < max(existing_clocks):
+            raise DossierAssessmentError(
+                "dossier assessment clock precedes a previously persisted "
+                "assessment for this entity; refusing out-of-order assessment "
+                "chronology"
+            )
         conn.execute(
             "INSERT INTO dossier_assessments("
             "id,business_entity_id,policy_version,facts_as_of,analysis_ready,computed_at,summary_json"

@@ -111,3 +111,58 @@ def test_external_identifier_status_transition_timestamp_is_strictly_monotonic(
         assert tuple(row) == ("active", reactivated_at)
     finally:
         conn.close()
+
+
+def test_mixed_offset_earlier_instant_is_rejected(tmp_path: Path) -> None:
+    """A +03:00 timestamp whose instant is earlier must not pass as advancing."""
+    conn = storage_connect(tmp_path / "mixed-offset-earlier.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='2026-01-02T10:00:00+00:00' WHERE id='xid'"
+        )
+        conn.commit()
+        # 12:00+03:00 is 09:00Z, one hour EARLIER than the stored 10:00Z,
+        # although the string sorts after it.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='superseded', status_changed_at='2026-01-02T12:00:00+03:00' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert tuple(row) == ("retired", "2026-01-02T10:00:00+00:00")
+    finally:
+        conn.close()
+
+
+def test_mixed_offset_valid_later_instant_is_accepted(tmp_path: Path) -> None:
+    """A later instant expressed with a non-UTC offset must be accepted."""
+    conn = storage_connect(tmp_path / "mixed-offset-later.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='2026-01-02T12:00:00+03:00' WHERE id='xid'"
+        )
+        conn.commit()
+        # 12:00+03:00 is 09:00Z; 10:30+00:00 is 10:30Z, a genuinely later
+        # instant although the string sorts before the stored value.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='superseded', status_changed_at='2026-01-02T10:30:00+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert tuple(row) == ("superseded", "2026-01-02T10:30:00+00:00")
+    finally:
+        conn.close()

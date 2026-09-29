@@ -333,3 +333,37 @@ def test_existing_assessment_with_impossible_seal_chronology_fails_closed(tmp_pa
     assert conn.in_transaction is False
     assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 1
     conn.close()
+
+
+def test_regressed_assessment_clock_is_refused_not_persisted(tmp_path: Path) -> None:
+    """A second assessment whose clock precedes the persisted one fails closed."""
+    conn = _prepared(tmp_path / "out-of-order.sqlite")
+    try:
+        first = persist_dossier_assessment(
+            conn, business_id=1, now=lambda: "2026-09-28T10:00:00+00:00"
+        )
+        assert first.already_assessed is False
+
+        # Advance the input watermark legitimately: retire the identifier at
+        # 09:30, later than the first assessment's facts_as_of (10:00 on the
+        # 26th) but earlier than the regressed assessment clock below.
+        conn.execute(
+            "UPDATE external_identifiers SET status='retired', "
+            "status_changed_at='2026-09-27T09:30:00+00:00' WHERE status='active'"
+        )
+        conn.commit()
+
+        with pytest.raises(
+            DossierAssessmentError, match="out-of-order assessment chronology"
+        ):
+            persist_dossier_assessment(
+                conn, business_id=1, now=lambda: "2026-09-27T09:45:00+00:00"
+            )
+        rows = conn.execute(
+            "SELECT facts_as_of, computed_at FROM dossier_assessments"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][1] == first.computed_at
+        assert not conn.in_transaction
+    finally:
+        conn.close()
