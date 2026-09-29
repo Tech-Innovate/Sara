@@ -16,7 +16,10 @@ class WebsiteAcquisitionError(RuntimeError):
 OFFICIAL_WEB_SOURCE_ID = "src_official_web"
 COLLECTOR_NAME = "sara.website"
 COLLECTOR_VERSION = "4"
-RECONCILIATION_VERSION = "official-web-v3"
+# v4: capability absence is claimable only on frontier-exhausted
+# complete business-wide crawls; budget truncation (page or depth)
+# leaves unobserved capabilities unknown instead of absent.
+RECONCILIATION_VERSION = "official-web-v4"
 ID_NAMESPACE = "sara.business-understanding.official-web.v1"
 CAPABILITY_PREDICATES = (
     "capability.online_booking",
@@ -128,6 +131,7 @@ class CrawlResult:
     errors: tuple[str, ...]
     canonical_home_url: str | None
     frontier_exhausted: bool
+    depth_truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,7 @@ class WebsiteAcquisitionStats:
     fetch_errors: tuple[str, ...]
     unresolved_predicates: tuple[str, ...]
     crawl_frontier_exhausted: bool = False
+    crawl_depth_truncated: bool = False
     absence_claimable: bool = False
     assessment_id: str | None = None
     assessment_already_assessed: bool | None = None

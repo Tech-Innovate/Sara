@@ -22,7 +22,7 @@ OBSERVED = "2026-09-27T06:00:00+00:00"
 
 
 def test_unicode_ascii_url_equivalence_is_versioned() -> None:
-    assert RECONCILIATION_VERSION == "official-web-v3"
+    assert RECONCILIATION_VERSION == "official-web-v4"
     assert values_equivalent(
         "business.website.official", canonical_json(UNICODE_URL), canonical_json(ASCII_URL)
     )

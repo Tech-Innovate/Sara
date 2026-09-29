@@ -14,6 +14,8 @@ from ..storage import connect_existing
 from ..understanding_vocabulary import VocabularySeedError, seed_business_understanding_vocabulary
 from .crawl import crawl_official_site
 from ..dossier import persist_dossier_assessment
+from ..dossier.assessment import DossierAssessmentError
+from ..dossier.core import DossierQueryError
 from .http import SafeHttpClient, WebsiteBlockedError, WebsiteFetchError
 from .model import CrawlConfig, WebsiteAcquisitionError, WebsiteAcquisitionStats
 from .persistence import ingest_crawl_result
@@ -159,7 +161,7 @@ def collect_official_website(
     assessment_already_assessed: bool | None = None
     assessment_analysis_ready: bool | None = None
     if refresh_assessment:
-        assessment = persist_dossier_assessment(conn, entity_id=entity)
+        assessment = persist_dossier_assessment(conn, entity_id=entity, now=now)
         assessment_id = assessment.assessment_id
         assessment_already_assessed = assessment.already_assessed
         assessment_analysis_ready = assessment.analysis_ready
@@ -182,6 +184,7 @@ def collect_official_website(
         fetch_errors=result.errors,
         unresolved_predicates=tuple(persisted["unresolved_predicates"]),
         crawl_frontier_exhausted=bool(persisted["crawl_frontier_exhausted"]),
+        crawl_depth_truncated=bool(persisted.get("crawl_depth_truncated", False)),
         absence_claimable=bool(persisted["absence_claimable"]),
         assessment_id=assessment_id,
         assessment_already_assessed=assessment_already_assessed,
@@ -310,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
         WebsiteAcquisitionError,
         WebsiteBlockedError,
         WebsiteFetchError,
+        DossierAssessmentError,
+        DossierQueryError,
         sqlite3.Error,
         ValueError,
     ) as exc:

@@ -16,7 +16,7 @@ from sara.website.http import HttpResponse, WebsiteBlockedError, WebsiteFetchErr
 
 class Clock:
     def __init__(self) -> None:
-        self.current = datetime.fromisoformat("2026-09-26T06:00:00+00:00")
+        self.current = datetime.fromisoformat("2026-09-26T12:00:00+00:00")
 
     def __call__(self) -> str:
         value = self.current.isoformat()
@@ -75,7 +75,9 @@ def prepared(path: Path) -> connect:
         ),
     )
     conn.commit()
-    with patch("sara.maps_backfill._utc_now", return_value="2026-09-26T10:00:00+00:00"):
+    with patch("sara.storage.utc_now", return_value="2026-09-26T09:59:00+00:00"), patch(
+        "sara.maps_backfill._utc_now", return_value="2026-09-26T10:00:00+00:00"
+    ):
         ingest_records(
             conn,
             "r1",
@@ -88,7 +90,8 @@ def prepared(path: Path) -> connect:
             }],
             finalize_run=("complete", 0, None),
         )
-    backfill_maps_business_understanding(conn)
+    with patch("sara.maps_backfill._utc_now", return_value="2026-09-26T10:00:00+00:00"):
+        backfill_maps_business_understanding(conn)
     return conn
 
 
@@ -268,3 +271,132 @@ def test_blocked_acquisition_never_reaches_assessment(tmp_path: Path) -> None:
         )
     assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 0
     conn.close()
+
+
+
+DEPTH_PAGES = {
+    "https://seed.example/": """
+        <link rel="canonical" href="https://seed.example/">
+        <a href="/about">About</a>
+    """,
+    "https://seed.example/about": """
+        <a href="/booking">Booking</a>
+    """,
+    "https://seed.example/booking": "<h1>Booking</h1>",
+}
+
+
+def test_depth_truncated_crawl_leaves_absence_unknown(tmp_path: Path) -> None:
+    """Stopping at the depth budget must not claim absence for deeper surfaces."""
+    conn = prepared(tmp_path / "depth-truncated.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "ev",
+        business_id=1,
+        config=CrawlConfig(page_limit=8, depth_limit=1),
+        now=Clock(),
+        client_factory=factory(FakeClient(DEPTH_PAGES)),
+    )
+    assert stats.status == "complete"
+    # home (depth 0) and about (depth 1) fetched; /booking deliberately
+    # unvisited, so the frontier was cut by the depth budget.
+    assert stats.pages_fetched == 2
+    assert stats.crawl_frontier_exhausted is False
+    assert stats.crawl_depth_truncated is True
+    assert stats.absence_claimable is False
+    assert stats.not_observed_facts_created == 0
+    assert absence_facts(conn, entity) == []
+    conn.close()
+
+
+def test_depth_sufficient_crawl_exhausts_and_claims_absence(tmp_path: Path) -> None:
+    """The same site with sufficient depth genuinely exhausts the frontier."""
+    conn = prepared(tmp_path / "depth-ok.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "ev",
+        business_id=1,
+        config=CrawlConfig(page_limit=8, depth_limit=2),
+        now=Clock(),
+        client_factory=factory(FakeClient(DEPTH_PAGES)),
+    )
+    assert stats.status == "complete"
+    assert stats.pages_fetched == 3
+    assert stats.crawl_frontier_exhausted is True
+    assert stats.crawl_depth_truncated is False
+    assert stats.absence_claimable is True
+    assert stats.not_observed_facts_created >= 1
+    assert absence_facts(conn, entity)
+    conn.close()
+
+
+def test_assessment_uses_the_injected_clock(tmp_path: Path) -> None:
+    """A deterministic future clock must flow into the assessment, not wall time."""
+    conn = prepared(tmp_path / "future-clock.sqlite")
+
+    class FutureClock:
+        def __init__(self) -> None:
+            from datetime import datetime, timedelta, timezone
+
+            self.current = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+        def __call__(self) -> str:
+            value = self.current.isoformat()
+            self.current += timedelta(seconds=1)
+            return value
+
+    stats = collect_official_website(
+        conn,
+        evidence_root=tmp_path / "ev",
+        business_id=1,
+        config=CrawlConfig(page_limit=8),
+        now=FutureClock(),
+        client_factory=factory(FakeClient(PAGES)),
+        refresh_assessment=True,
+    )
+    assert stats.assessment_id is not None
+    computed_at = conn.execute(
+        "SELECT computed_at FROM dossier_assessments WHERE id=?",
+        (stats.assessment_id,),
+    ).fetchone()[0]
+    # With the old wall-clock assessment, 2030 evidence timestamps would
+    # have made the watermark exceed the computed time and failed closed.
+    assert computed_at.startswith("2030-01-01")
+    conn.close()
+
+
+def test_cli_reports_assessment_failure_as_controlled_error(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A post-commit assessment failure exits 2 with a message, not a traceback."""
+    import sara.website.surface as surface_module
+    from sara.dossier.assessment import DossierAssessmentError
+    from sara.website.surface import main
+
+    conn = prepared(tmp_path / "cli-failure.sqlite")
+    db_path = str(tmp_path / "cli-failure.sqlite")
+    conn.close()
+
+    real_collect = surface_module.collect_official_website
+
+    class FailingStats:
+        assessment_id = None
+
+    def collect_with_failing_assessment(*_args, **kwargs):
+        # Simulate: acquisition commits, then the assessment refresh raises.
+        raise DossierAssessmentError("dossier assessment failed: boom")
+
+    monkeypatch.setattr(
+        surface_module, "collect_official_website", collect_with_failing_assessment
+    )
+    rc = main([
+        "--db", db_path,
+        "--evidence-dir", str(tmp_path / "ev"),
+        "--business-id", "1",
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "dossier assessment failed: boom" in err
+    assert "Traceback" not in err

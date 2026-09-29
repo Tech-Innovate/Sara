@@ -529,6 +529,7 @@ def ingest_crawl_result(
     return {
         "status": status,
         "crawl_frontier_exhausted": result.frontier_exhausted,
+        "crawl_depth_truncated": result.depth_truncated,
         "absence_claimable": absence_claimable,
         "evidence_items_created": evidence_created,
         "observations_created": observations_created,
