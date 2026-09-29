@@ -26,7 +26,7 @@ def _sha256(value: str) -> str:
 
 def _prepared(path: Path, *, with_review: bool = False):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2, 3)
+    assert apply_migrations(conn) == (1, 2, 3, 4)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs("

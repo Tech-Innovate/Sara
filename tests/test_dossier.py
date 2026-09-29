@@ -20,7 +20,7 @@ from sara.understanding_vocabulary import (
 
 def _prepared(path: Path):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2, 3)
+    assert apply_migrations(conn) == (1, 2, 3, 4)
     seed_business_understanding_vocabulary(conn)
     return conn
 

@@ -6,14 +6,17 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract: for the SAME entity, the SAME sealed assessment,
-the SAME session history snapshot, and the SAME planner inputs
-(retry-window start, cooldown horizon, decisions-taken counter, and the
-decision ceiling), the same policy version yields the same decision id
-and the same chosen action or stop. The session-history snapshot and the
-operational inputs are sealed INTO the decision id and persisted in the
-record, so two runs that differ in any of them are visibly different
-decisions rather than silently divergent ones.
+Determinism contract (v4): for the SAME entity, the SAME sealed
+assessment, the SAME session-history snapshot, and the SAME decision
+ceiling, the same policy version yields the same decision id and the
+same chosen action or stop. The session-history snapshot (which embeds
+the window/horizon counts and lineage) and max_decisions are sealed into
+the id; the raw decision clock is deliberately NOT sealed — its effects
+enter only through the snapshot counts — and decisions_taken is
+deliberately NOT sealed because the counter includes previously
+persisted action decisions, so sealing it would make every retry mint a
+new id. A lost-output retry therefore reaches the duplicate-key replay
+path. Different sealed inputs produce visibly different decisions.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-PLANNER_POLICY_VERSION = "acquisition-planner-v3"
+PLANNER_POLICY_VERSION = "acquisition-planner-v4"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -54,6 +57,11 @@ UNSUPPORTED_DOMAINS = frozenset({
 STOP_SUFFICIENT = "sufficient_state"
 STOP_STALE = "stale_assessment"
 STOP_IN_FLIGHT = "acquisition_in_progress"
+STOP_STALE_IN_FLIGHT = "stale_in_flight_session"
+#: A running/planned session older than this is an orphan from a
+#: dead process: planning stops and demands recovery rather than
+#: blocking forever or silently scheduling over it (6 hours).
+IN_FLIGHT_HORIZON_SECONDS = 6 * 3600
 STOP_UNSUPPORTED = "unsupported_deficiency"
 STOP_RETRIES = "retry_ceiling"
 STOP_COOLDOWN = "cooldown_active"
@@ -91,11 +99,20 @@ class PlannerDecision:
 
 
 def _instant(value: str) -> datetime:
-    """Parse a persisted ISO timestamp to a UTC instant."""
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        raise ValueError(f"timestamp {value!r} is not timezone-aware")
-    return parsed.astimezone(timezone.utc)
+    """Parse a persisted ISO timestamp to a UTC instant.
+
+    Every failure mode — naive values, malformed text, and offsets whose
+    UTC normalization leaves Python's datetime range — raises ValueError
+    so callers fail closed uniformly.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError(f"timestamp {value!r} is not timezone-aware")
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise ValueError(f"timestamp {value!r} normalizes outside the "
+                         f"supported datetime range") from exc
 
 
 def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
@@ -182,26 +199,67 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
             continue
         if when >= retry_floor:
             partials_in_window += 1
-    in_flight = int(conn.execute(
-        f"SELECT COUNT(*) FROM acquisition_sessions "
+    in_flight_rows = conn.execute(
+        f"SELECT started_at FROM acquisition_sessions "
         f"WHERE target_subject_id IN ({lineage_marks}) "
         f"AND collector_name='sara.website' AND status IN ('planned','running')",
         tuple(lineage),
-    ).fetchone()[0])
-    latest_terminal = conn.execute(
+    ).fetchall()
+    in_flight = len(in_flight_rows)
+    in_flight_orphaned = 0
+    in_flight_fresh = 0
+    in_flight_corrupt = 0
+    for (started_at,) in in_flight_rows:
+        try:
+            when = _instant(str(started_at))
+        except ValueError:
+            in_flight_corrupt += 1  # age unknowable: treat as orphan
+            in_flight_orphaned += 1
+            continue
+        age = (now_dt - when).total_seconds()
+        if age <= IN_FLIGHT_HORIZON_SECONDS:
+            in_flight_fresh += 1
+        else:
+            in_flight_orphaned += 1
+    # S-01: choose the terminal evidence-producing session by parsed UTC
+    # chronology over finished_at (the watermark includes acquisition
+    # finish times), never by lexical TEXT ordering and never started_at
+    # alone — a session that started before an assessment but finished
+    # after it leaves unassessed evidence behind.
+    terminal_rows = conn.execute(
         f"SELECT started_at, finished_at FROM acquisition_sessions "
         f"WHERE target_subject_id IN ({lineage_marks}) "
         f"AND collector_name='sara.website' "
-        f"AND status IN ('complete','partial') "
-        f"ORDER BY started_at DESC LIMIT 1",
+        f"AND status IN ('complete','partial')",
         tuple(lineage),
-    ).fetchone()
+    ).fetchall()
+    newest_terminal: tuple[datetime, str] | None = None
+    for started_at, finished_at in terminal_rows:
+        for candidate in (finished_at, started_at):
+            if candidate is None:
+                continue
+            try:
+                when = _instant(str(candidate))
+            except ValueError:
+                continue  # corrupt terminal timestamp: not a stale signal;
+                # the session is still counted fail-closed in the windows
+            if newest_terminal is None or when > newest_terminal[0]:
+                newest_terminal = (when, str(candidate))
+    latest_terminal = (
+        (newest_terminal[1],) if newest_terminal is not None else None
+    )
     return {
         "session_count": len(rows),
         "entity_lineage": lineage,
         "in_flight_sessions": in_flight,
-        "latest_terminal_session_started_at":
+        "in_flight_fresh": in_flight_fresh,
+        "in_flight_orphaned": in_flight_orphaned,
+        "in_flight_corrupt": in_flight_corrupt,
+        "in_flight_horizon_seconds": IN_FLIGHT_HORIZON_SECONDS,
+        "latest_terminal_session_time":
             str(latest_terminal[0]) if latest_terminal else None,
+        "corrupt_terminal_timestamps": len(terminal_rows) - (
+            0 if latest_terminal is None else 1) if terminal_rows else 0,
         "blocked_failed_streak_total": streak,
         "blocked_failed_streak_in_cooldown_horizon": streak_recent,
         "partial_sessions_in_retry_window": partials_in_window,
@@ -274,35 +332,43 @@ def plan_next_acquisition(
     assessment_id = str(assessment["id"])
 
     if history["in_flight_sessions"] > 0:
-        return decide(None, STOP_IN_FLIGHT, "acquisition_session_active",
-                      None, {"in_flight": history["in_flight_sessions"]},
+        if history["in_flight_fresh"] > 0:
+            return decide(None, STOP_IN_FLIGHT, "acquisition_session_active",
+                          None, {"in_flight": history["in_flight_sessions"],
+                                 "fresh": history["in_flight_fresh"],
+                                 "orphaned": history["in_flight_orphaned"]},
+                          assessment_id)
+        # Every in-flight session is older than the horizon (or of
+        # unknowable age): a dead process left it behind. Planning stops
+        # and demands recovery; it neither blocks forever nor schedules
+        # over the orphan.
+        return decide(None, STOP_STALE_IN_FLIGHT, "orphaned_acquisition_session",
+                      None, {"in_flight": history["in_flight_sessions"],
+                             "orphaned": history["in_flight_orphaned"],
+                             "corrupt": history.get("in_flight_corrupt", 0),
+                             "horizon_seconds": IN_FLIGHT_HORIZON_SECONDS},
                       assessment_id)
 
-    latest_started = history.get("latest_terminal_session_started_at")
-    if latest_started:
+    latest_terminal_time = history.get("latest_terminal_session_time")
+    if latest_terminal_time:
+        latest_dt = _instant(latest_terminal_time)  # pre-parsed upstream
         try:
-            latest_dt = _instant(latest_started)
+            as_of_dt = _instant(str(assessment["facts_as_of"]))
         except ValueError:
-            latest_dt = None  # corrupt timestamp: no stale signal; the
-            # session is already counted fail-closed in the history counts
-        if latest_dt is not None:
-            try:
-                as_of_dt = _instant(str(assessment["facts_as_of"]))
-            except ValueError:
-                return decide(None, STOP_STALE,
-                              "assessment_currency_unprovable_corrupt_timestamp",
-                              None, {"latest_session_started_at": latest_started},
-                              assessment_id)
-            # The assessment must cover the latest evidence-producing
-            # acquisition; a complete/partial session that started after
-            # the assessment's facts watermark is unassessed state.
-            if latest_dt > as_of_dt:
-                return decide(None, STOP_STALE,
-                              "assessment_older_than_latest_acquisition",
-                              None, {"assessment_facts_as_of":
-                                     str(assessment["facts_as_of"]),
-                                     "latest_session_started_at": latest_started},
-                              assessment_id)
+            return decide(None, STOP_STALE,
+                          "assessment_currency_unprovable_corrupt_timestamp",
+                          None, {"latest_terminal_session_time": latest_terminal_time},
+                          assessment_id)
+        # The assessment must cover the newest terminal evidence-producing
+        # acquisition by its finish time; a session that finished after
+        # the assessment's facts watermark left unassessed evidence.
+        if latest_dt > as_of_dt:
+            return decide(None, STOP_STALE,
+                          "assessment_older_than_latest_acquisition",
+                          None, {"assessment_facts_as_of":
+                                 str(assessment["facts_as_of"]),
+                                 "latest_terminal_session_time": latest_terminal_time},
+                          assessment_id)
     summary = assessment.get("summary") or {}
     blocking = tuple(sorted(
         str(d) for d in summary.get("blocking_mandatory_domains", ())

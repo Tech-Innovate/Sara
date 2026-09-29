@@ -74,7 +74,7 @@ MENU_SITE = {
 
 def prepared(path: Path, *, website: str = "https://seed.example"):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2, 3)
+    assert apply_migrations(conn) == (1, 2, 3, 4)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
@@ -110,6 +110,14 @@ def acquire(conn, tmp_path, *, pages=MENU_SITE, page_limit=8):
         client_factory=factory(FakeClient(pages)), refresh_assessment=True,
     )
 
+
+
+def _ensure_website_source(conn) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO sources(id,source_type,name,base_url,created_at,active) "
+        "VALUES ('src_official_web','official_website','Official website',NULL,"
+        "'2026-01-01T00:00:00+00:00',1)")
+    conn.commit()
 
 def test_no_assessment_stops_closed(tmp_path: Path) -> None:
     conn = prepared(tmp_path / "no-assessment.sqlite")
@@ -347,7 +355,7 @@ def test_cli_persists_decision_and_replay_is_idempotent(tmp_path: Path, capsys) 
         "SELECT COUNT(*) FROM planner_decisions WHERE id=?", (decision_id,)
     ).fetchone()[0]
     assert rows == 1  # deterministic replay inserted once
-    assert current_schema_version(conn2) == 3
+    assert current_schema_version(conn2) == 4
     fk = conn2.execute("PRAGMA foreign_key_check").fetchall()
     assert fk == []
     conn2.close()
@@ -591,7 +599,7 @@ def test_stale_assessment_stops_when_acquisition_is_newer(tmp_path: Path) -> Non
                                      now="2026-09-26T12:30:00+00:00")
     assert decision.stop_reason == STOP_STALE
     assert decision.reason_code == "assessment_older_than_latest_acquisition"
-    assert decision.details["latest_session_started_at"] > "2026-09-26T11:"
+    assert decision.details["latest_terminal_session_time"] > "2026-09-26T11:"
     conn.close()
 
 
@@ -688,4 +696,172 @@ def test_cli_retry_after_lost_output_replays_not_duplicates(tmp_path: Path, caps
     rows = conn2.execute(
         "SELECT COUNT(*), COUNT(DISTINCT id) FROM planner_decisions").fetchone()
     assert rows[0] == rows[1] == 1
+    conn2.close()
+
+
+def test_stale_check_uses_finish_time_not_start(tmp_path: Path) -> None:
+    """A session that started before the assessment but finished after it is stale."""
+    from sara.acquisition_planner import STOP_STALE
+    conn = prepared(tmp_path / "finish-race.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    # Assessment seals at 10:05-equivalent: after maps (10:00), before the
+    # acquisition's finish. The acquisition session started earlier than
+    # the assessment but finished later — the old started_at check would
+    # accept the assessment; finished_at must reject it.
+    persist_dossier_assessment(conn, entity_id=entity,
+                               now=lambda: "2026-09-26T10:05:00+00:00")
+    _ensure_website_source(conn)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_finish_race", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "complete",
+         "2026-09-26T10:00:00+00:00", "2026-09-26T10:10:00+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_STALE
+    assert decision.details["latest_terminal_session_time"] == "2026-09-26T10:10:00+00:00"
+    conn.close()
+
+
+def test_stale_check_mixed_offset_finished_at(tmp_path: Path) -> None:
+    """finished_at with a +03:00 offset is ordered by instant, not lexically."""
+    from sara.acquisition_planner import STOP_STALE
+    conn = prepared(tmp_path / "finish-offset.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    persist_dossier_assessment(conn, entity_id=entity,
+                               now=lambda: "2026-09-26T10:05:00+00:00")
+    _ensure_website_source(conn)
+    # 12:00+03:00 is 09:00Z — EARLIER than the assessment watermark, so a
+    # lexical comparison (12:... > 10:...) would wrongly call it stale.
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_offset", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "complete",
+         "2026-09-26T08:00:00+03:00", "2026-09-26T12:00:00+03:00",
+         None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason != STOP_STALE
+    conn.close()
+
+
+def test_corrupt_terminal_timestamps_do_not_block_or_stale(tmp_path: Path) -> None:
+    """Corrupt finished/started on terminal rows: no stale signal, fail-closed windows."""
+    conn = prepared(tmp_path / "corrupt-terminal.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)  # refreshed assessment covers this session
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_corrupt_term", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "complete", "garbage", "garbage",
+         None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    # corrupt terminal timestamps produce no stale signal; the decision
+    # proceeds on the current assessment (windows already fail closed).
+    assert decision.stop_reason != "stale_assessment"
+    conn.close()
+
+
+def test_orphaned_running_session_demands_recovery(tmp_path: Path) -> None:
+    """A running session older than the horizon stops stale_in_flight."""
+    from sara.acquisition_planner import STOP_STALE_IN_FLIGHT
+    conn = prepared(tmp_path / "orphan.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_orphan", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "running",
+         "2026-09-26T02:00:00+00:00", None, None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_STALE_IN_FLIGHT
+    assert decision.action is None
+    assert decision.details["orphaned"] == 1
+    conn.close()
+
+
+def test_extreme_offset_instant_fails_closed_as_value_error(tmp_path: Path) -> None:
+    """C-01: a parseable offset that overflows normalization is ValueError."""
+    from sara.acquisition_planner import _instant
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        _instant("0001-01-01T00:00:00+23:59")
+
+
+def test_planner_decisions_are_append_only(tmp_path: Path) -> None:
+    """C-02: UPDATE and DELETE on planner_decisions abort."""
+    conn = prepared(tmp_path / "append-only.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    d = plan_next_acquisition(conn, entity_id=entity,
+                              now="2026-09-26T12:00:00+00:00")
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO planner_decisions("
+        "id,business_entity_id,decided_at,action,stop_reason,reason_code,"
+        "target_domain,policy_version,details_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (d.decision_id, entity, d.details["decided_at"], d.action,
+         d.stop_reason, d.reason_code, d.target_domain, d.policy_version,
+         "{}", "2026-09-26T12:00:00+00:00"))
+    conn.commit()
+    import sqlite3 as _sqlite3
+    with pytest.raises(_sqlite3.IntegrityError,
+                       match="append-only"):
+        conn.execute("UPDATE planner_decisions SET reason_code='tampered'")
+    conn.rollback()
+    with pytest.raises(_sqlite3.IntegrityError,
+                       match="append-only"):
+        conn.execute("DELETE FROM planner_decisions WHERE id=?", (d.decision_id,))
+    conn.rollback()
+    conn.close()
+
+
+def test_cli_ceiling_retry_replays_action_decision(tmp_path: Path, capsys) -> None:
+    """S-02: a lost-output retry at the ceiling replays the persisted action."""
+    from sara.acquisition_planner_cli import main as planner_cli_main
+    conn = prepared(tmp_path / "ceiling-replay.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)  # sealed assessment + session history
+    conn.close()
+    db = str(tmp_path / "ceiling-replay.sqlite")
+    rc1 = planner_cli_main(["--db", db, "--business-id", "1",
+                            "--max-decisions", "1"])
+    assert rc1 == 0
+    first = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert first["action"] is not None  # an action decision, 0 < 1 ceiling
+    rc2 = planner_cli_main(["--db", db, "--business-id", "1",
+                            "--max-decisions", "1"])
+    assert rc2 == 0
+    second = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert second.get("replayed") is True
+    assert second["decision_id"] == first["decision_id"]
+    assert second["action"] == first["action"]
+    conn2 = connect(Path(db))
+    counts = tuple(conn2.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT id) FROM planner_decisions"
+    ).fetchone())
+    assert counts == (1, 1)
     conn2.close()

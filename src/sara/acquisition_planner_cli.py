@@ -125,6 +125,33 @@ def main(argv: list[str] | None = None) -> int:
             decisions_taken=decisions_taken,
             max_decisions=args.max_decisions,
         )
+        if decision.stop_reason == "policy_ceiling":
+            # S-02: the persisted action decision raised the counter, so a
+            # lost-output retry would otherwise see the ceiling and mint a
+            # different stop. When the latest persisted action decision was
+            # derived from the same sealed assessment and session history,
+            # replay it instead.
+            row = conn.execute(
+                "SELECT id,business_entity_id,decided_at,action,stop_reason,"
+                "reason_code,target_domain,policy_version,details_json "
+                "FROM planner_decisions WHERE business_entity_id=? "
+                "AND action IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
+                (entity_id,),
+            ).fetchone()
+            if row is not None:
+                stored = json.loads(row[8])
+                stored_inputs = stored.get("planner_inputs", {})
+                if (stored.get("assessment_id") == decision.details.get("assessment_id")
+                        and stored_inputs.get("session_history")
+                        == decision.details["planner_inputs"]["session_history"]):
+                    print(json.dumps({
+                        "decision_id": row[0], "action": row[3],
+                        "stop_reason": row[4], "reason_code": row[5],
+                        "target_domain": row[6], "policy_version": row[7],
+                        "details": stored, "replayed": True,
+                        "entity_resolution": resolution,
+                    }, ensure_ascii=False, sort_keys=True))
+                    return 0
         replayed = _persist(conn, decision, entity_id=entity_id)
         if replayed is not None:
             payload = {
