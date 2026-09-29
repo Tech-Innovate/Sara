@@ -53,7 +53,12 @@ def parse_timestamp(value: object, *, field: str) -> datetime:
         raise DossierQueryError(f"{field} has invalid ISO-8601 timestamp {value!r}") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise DossierQueryError(f"{field} must be timezone-aware")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        raise DossierQueryError(
+            f"{field} normalizes outside the supported datetime range: {value!r}"
+        ) from exc
 
 
 def evaluation_time(value: str | None) -> datetime:

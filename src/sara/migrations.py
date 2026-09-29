@@ -1290,6 +1290,16 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
     )
     AND substr(NEW.status_changed_at, 1, 4) <> '0000'
     AND substr(NEW.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(NEW.status_changed_at, 1, 19))
+    -- Offset-normalized UTC seconds must stay inside Python's
+    -- datetime range (0001-01-01T00:00:00Z .. 9999-12-31T23:59:59Z),
+    -- so a locally valid datetime near an edge cannot normalize
+    -- outside it and later overflow astimezone conversions.
+    AND ((
+    CAST(strftime('%s', substr(NEW.status_changed_at, 1, 19)) AS INTEGER)
+    - (CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) * 3600
+       + CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) * 60)
+      * (CASE WHEN substr(NEW.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+) BETWEEN -62135596800 AND 253402300799)
 )
             OR (
                 OLD.status_changed_at IS NOT NULL
@@ -1327,6 +1337,16 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
     )
     AND substr(OLD.status_changed_at, 1, 4) <> '0000'
     AND substr(OLD.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(OLD.status_changed_at, 1, 19))
+    -- Offset-normalized UTC seconds must stay inside Python's
+    -- datetime range (0001-01-01T00:00:00Z .. 9999-12-31T23:59:59Z),
+    -- so a locally valid datetime near an edge cannot normalize
+    -- outside it and later overflow astimezone conversions.
+    AND ((
+    CAST(strftime('%s', substr(OLD.status_changed_at, 1, 19)) AS INTEGER)
+    - (CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) * 3600
+       + CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) * 60)
+      * (CASE WHEN substr(OLD.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+) BETWEEN -62135596800 AND 253402300799)
 )
                     OR (
     CAST(strftime('%s', substr(NEW.status_changed_at, 1, 19)) AS INTEGER)

@@ -467,3 +467,22 @@ def test_unsynchronized_maps_business_is_rejected_without_side_effects(tmp_path:
     check = connect_existing(db)
     assert _snapshot(check) == before
     check.close()
+
+
+def test_parse_timestamp_converts_range_overflow_into_query_error() -> None:
+    """Values that parse locally but overflow astimezone fail as DossierQueryError."""
+    from sara.dossier.core import DossierQueryError, parse_timestamp
+
+    for value in (
+        "0001-01-01T00:00:00+23:59",  # normalizes below 0001-01-01T00:00:00Z
+        "9999-12-31T23:59:59-23:59",  # normalizes past 9999-12-31T23:59:59Z
+    ):
+        with pytest.raises(DossierQueryError, match="supported datetime range"):
+            parse_timestamp(value, field="probe")
+    # The exact boundaries still parse.
+    assert str(parse_timestamp("0001-01-01T00:00:00+00:00", field="probe")) == (
+        "0001-01-01 00:00:00+00:00"
+    )
+    assert str(parse_timestamp("9999-12-31T23:59:59+00:00", field="probe")) == (
+        "9999-12-31 23:59:59+00:00"
+    )

@@ -466,3 +466,68 @@ def test_year_zero_is_rejected(tmp_path: Path) -> None:
         assert tuple(row) == ("active", None)
     finally:
         conn.close()
+
+
+def test_utc_normalization_range_edges_are_enforced(tmp_path: Path) -> None:
+    """Locally valid datetimes whose UTC instant leaves Python's range are refused."""
+    conn = storage_connect(tmp_path / "utc-range.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        # 0001-01-01T00:00:00+23:59 normalizes to 0000-12-31T00:01:00Z.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='retired', status_changed_at='0001-01-01T00:00:00+23:59' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+        # 9999-12-31T23:59:59-23:59 normalizes to year 10000.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='retired', status_changed_at='9999-12-31T23:59:59-23:59' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+        # The exact range boundaries themselves remain acceptable.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='0001-01-01T00:00:00+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert tuple(row) == ("retired", "0001-01-01T00:00:00+00:00")
+    finally:
+        conn.close()
+
+
+def test_utc_range_upper_boundary_is_accepted_and_overflow_refused(tmp_path: Path) -> None:
+    """The maximum supported instant is accepted; one normalized second past is not."""
+    conn = storage_connect(tmp_path / "utc-upper.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        # 9999-12-31T23:59:59+00:00 is the last representable whole second.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='9999-12-31T23:59:59+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        # 0001-01-02T00:00:00+23:59 normalizes to 0001-01-01T00:00:01Z, still in
+        # range, so it is a valid earlier instant only in direction terms; use a
+        # clearly out-of-range one instead: 0001-01-01T00:00:00+00:01 is
+        # 0000-12-31T23:59:00Z, below the floor.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='superseded', status_changed_at='0001-01-01T00:00:00+00:01' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+    finally:
+        conn.close()
