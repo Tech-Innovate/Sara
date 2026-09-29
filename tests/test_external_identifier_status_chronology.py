@@ -369,3 +369,100 @@ def test_hour_twenty_four_is_rejected(tmp_path: Path) -> None:
         assert tuple(row) == ("active", None)
     finally:
         conn.close()
+
+
+def test_variable_length_fractions_order_correctly(tmp_path: Path) -> None:
+    """Fractions of differing digit lengths order by their true microsecond value."""
+    conn = storage_connect(tmp_path / "variable-fraction.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        # .000002 is 2us; .1 is 100000us, so this is a forward transition.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='2026-01-02T10:00:00.000002+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='superseded', status_changed_at='2026-01-02T10:00:00.1+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert row[1] == "2026-01-02T10:00:00.1+00:00"
+
+        # .1 (100000us) back to .000002 (2us) is backward and must be refused.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='active', status_changed_at='2026-01-02T10:00:00.000002+00:00' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+        # .1 (100000us) forward to .12 (120000us) must be accepted.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='active', status_changed_at='2026-01-02T10:00:00.12+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_impossible_calendar_dates_are_rejected(tmp_path: Path) -> None:
+    """SQLite normalizes Feb 30; the trigger must not accept the normalized value."""
+    conn = storage_connect(tmp_path / "calendar.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        for bad in (
+            "2026-02-30T10:00:00+00:00",  # February 30
+            "2027-02-29T10:00:00+00:00",  # non-leap February 29
+            "2026-04-31T10:00:00+00:00",  # April 31
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "UPDATE external_identifiers "
+                    "SET status='retired', status_changed_at=? WHERE id='xid'",
+                    (bad,),
+                )
+            conn.rollback()
+        # A real leap day is accepted.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='2024-02-29T10:00:00+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert row[0] == "retired"
+    finally:
+        conn.close()
+
+
+def test_year_zero_is_rejected(tmp_path: Path) -> None:
+    """Python datetime rejects year 0000; the trigger must agree."""
+    conn = storage_connect(tmp_path / "year-zero.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='retired', status_changed_at='0000-01-02T10:00:00+00:00' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert tuple(row) == ("active", None)
+    finally:
+        conn.close()

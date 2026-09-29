@@ -1288,7 +1288,8 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
             AND NOT substr(NEW.status_changed_at, 21, length(NEW.status_changed_at) - 26) GLOB '*[^0-9]*'
         )
     )
-    AND strftime('%s', substr(NEW.status_changed_at, 1, 19)) IS NOT NULL
+    AND substr(NEW.status_changed_at, 1, 4) <> '0000'
+    AND substr(NEW.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(NEW.status_changed_at, 1, 19))
 )
             OR (
                 OLD.status_changed_at IS NOT NULL
@@ -1324,7 +1325,8 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
             AND NOT substr(OLD.status_changed_at, 21, length(OLD.status_changed_at) - 26) GLOB '*[^0-9]*'
         )
     )
-    AND strftime('%s', substr(OLD.status_changed_at, 1, 19)) IS NOT NULL
+    AND substr(OLD.status_changed_at, 1, 4) <> '0000'
+    AND substr(OLD.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(OLD.status_changed_at, 1, 19))
 )
                     OR (
     CAST(strftime('%s', substr(NEW.status_changed_at, 1, 19)) AS INTEGER)
@@ -1349,11 +1351,11 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
       * (CASE WHEN substr(OLD.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
 ) AND (
     CASE WHEN length(NEW.status_changed_at) > 25
-         THEN CAST(printf('%06d', CAST(substr(NEW.status_changed_at, 21, length(NEW.status_changed_at) - 26) AS INTEGER)) AS INTEGER)
+         THEN CAST(substr(substr(NEW.status_changed_at, 21, length(NEW.status_changed_at) - 26) || '000000', 1, 6) AS INTEGER)
          ELSE 0 END
 ) <= (
     CASE WHEN length(OLD.status_changed_at) > 25
-         THEN CAST(printf('%06d', CAST(substr(OLD.status_changed_at, 21, length(OLD.status_changed_at) - 26) AS INTEGER)) AS INTEGER)
+         THEN CAST(substr(substr(OLD.status_changed_at, 21, length(OLD.status_changed_at) - 26) || '000000', 1, 6) AS INTEGER)
          ELSE 0 END
 ))
                 )
