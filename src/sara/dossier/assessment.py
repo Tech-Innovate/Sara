@@ -897,11 +897,11 @@ def persist_dossier_assessment(
         ]
         if existing_clocks and parse_timestamp(
             computed_at, field="computed_at"
-        ) < max(existing_clocks):
+        ) <= max(existing_clocks):
             raise DossierAssessmentError(
-                "dossier assessment clock precedes a previously persisted "
-                "assessment for this entity; refusing out-of-order assessment "
-                "chronology"
+                "a new dossier assessment snapshot must be computed strictly "
+                "after every previously persisted assessment for this entity; "
+                "refusing non-advancing assessment chronology"
             )
         conn.execute(
             "INSERT INTO dossier_assessments("

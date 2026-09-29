@@ -25,7 +25,15 @@ def persisted_assessment(conn: sqlite3.Connection, entity_id: str) -> dict[str, 
     if not candidates:
         return None
 
-    computed_at, _identifier, result = max(candidates, key=lambda item: (item[0], item[1]))
+    max_computed = max(item[0] for item in candidates)
+    latest = [item for item in candidates if item[0] == max_computed]
+    if len(latest) > 1:
+        raise DossierQueryError(
+            "multiple persisted dossier assessments share the maximum "
+            f"computed_at for entity {entity_id!r}; refusing an ambiguous "
+            "latest assessment"
+        )
+    computed_at, _identifier, result = latest[0]
     result["analysis_ready"] = bool(result["analysis_ready"])
     result["summary"] = json_value(
         result.pop("summary_json"), field=f"dossier {result['id']} summary_json"

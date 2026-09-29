@@ -1257,29 +1257,46 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
         NEW.status <> OLD.status
         AND (
             NEW.status_changed_at IS NULL
+            OR NOT (
+    length(NEW.status_changed_at) >= 25
+    AND substr(NEW.status_changed_at, -6, 1) IN ('+', '-')
+    AND substr(NEW.status_changed_at, -3, 1) = ':'
+    AND substr(NEW.status_changed_at, -5, 2) = printf('%02d', CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER))
+    AND substr(NEW.status_changed_at, -2, 2) = printf('%02d', CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER))
+    AND CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) < 24
+    AND CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) < 60
+    AND julianday(substr(NEW.status_changed_at, 1, length(NEW.status_changed_at) - 6)) IS NOT NULL
+    AND substr(NEW.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(NEW.status_changed_at, 1, 19))
+)
             OR (
                 OLD.status_changed_at IS NOT NULL
-                -- Compare instants, not strings: mixed UTC offsets would
-                -- otherwise sort wrongly. julianday() cannot parse offsets,
-                -- so the instant is local-time minus the ±HH:MM tail; a
-                -- missing or non-numeric tail counts as offset zero.
-                -- Comparison precision is one second.
-                AND julianday(
-                    substr(NEW.status_changed_at, 1, 19),
-                    printf('%+d seconds', (
-                        -(CAST(substr(NEW.status_changed_at, 21, 2) AS INTEGER) * 3600
-                          + CAST(substr(NEW.status_changed_at, 24, 2) AS INTEGER) * 60)
-                        * (CASE WHEN substr(NEW.status_changed_at, 20, 1) = '-'
-                                THEN -1 ELSE 1 END)
-                    ))
-                ) <= julianday(
-                    substr(OLD.status_changed_at, 1, 19),
-                    printf('%+d seconds', (
-                        -(CAST(substr(OLD.status_changed_at, 21, 2) AS INTEGER) * 3600
-                          + CAST(substr(OLD.status_changed_at, 24, 2) AS INTEGER) * 60)
-                        * (CASE WHEN substr(OLD.status_changed_at, 20, 1) = '-'
-                                THEN -1 ELSE 1 END)
-                    ))
+                AND (
+                    NOT (
+    length(OLD.status_changed_at) >= 25
+    AND substr(OLD.status_changed_at, -6, 1) IN ('+', '-')
+    AND substr(OLD.status_changed_at, -3, 1) = ':'
+    AND substr(OLD.status_changed_at, -5, 2) = printf('%02d', CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER))
+    AND substr(OLD.status_changed_at, -2, 2) = printf('%02d', CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER))
+    AND CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) < 24
+    AND CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) < 60
+    AND julianday(substr(OLD.status_changed_at, 1, length(OLD.status_changed_at) - 6)) IS NOT NULL
+    AND substr(OLD.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(OLD.status_changed_at, 1, 19))
+)
+                    OR julianday(
+    substr(NEW.status_changed_at, 1, length(NEW.status_changed_at) - 6),
+    printf('%+d seconds', (
+        -(CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) * 3600
+          + CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) * 60)
+        * (CASE WHEN substr(NEW.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+    ))
+) <= julianday(
+    substr(OLD.status_changed_at, 1, length(OLD.status_changed_at) - 6),
+    printf('%+d seconds', (
+        -(CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) * 3600
+          + CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) * 60)
+        * (CASE WHEN substr(OLD.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+    ))
+)
                 )
             )
         )

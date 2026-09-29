@@ -188,6 +188,7 @@ def test_build_business_dossier_surfaces_independent_integrity_findings(monkeypa
     }
 
     monkeypatch.setattr(surface, "verify_schema", lambda _conn: None)
+    monkeypatch.setattr(surface, "current_schema_version", lambda _conn: 2)
     monkeypatch.setattr(
         surface,
         "evaluation_time",

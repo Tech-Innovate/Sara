@@ -267,7 +267,7 @@ def test_assessment_identity_changes_when_fact_support_graph_changes(tmp_path: P
     second = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-28T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:05:00+00:00",
     )
     second_states = {item["domain"]: item["state"] for item in second.domains}
     assert second.assessment_id != first.assessment_id
@@ -299,7 +299,7 @@ def test_assessment_identity_changes_when_fact_support_graph_changes(tmp_path: P
     third = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-28T10:00:00+00:00",
+        now=lambda: "2026-09-28T10:10:00+00:00",
     )
     third_states = {item["domain"]: item["state"] for item in third.domains}
     assert third.assessment_id != second.assessment_id
@@ -354,7 +354,7 @@ def test_regressed_assessment_clock_is_refused_not_persisted(tmp_path: Path) -> 
         conn.commit()
 
         with pytest.raises(
-            DossierAssessmentError, match="out-of-order assessment chronology"
+            DossierAssessmentError, match="non-advancing assessment chronology"
         ):
             persist_dossier_assessment(
                 conn, business_id=1, now=lambda: "2026-09-27T09:45:00+00:00"
@@ -365,5 +365,82 @@ def test_regressed_assessment_clock_is_refused_not_persisted(tmp_path: Path) -> 
         assert len(rows) == 1
         assert rows[0][1] == first.computed_at
         assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
+def test_equal_clock_changed_input_is_refused_not_persisted(tmp_path: Path) -> None:
+    """A changed logical input at exactly the persisted clock must not snapshot."""
+    conn = _prepared(tmp_path / "equal-clock.sqlite")
+    try:
+        first = persist_dossier_assessment(
+            conn, business_id=1, now=lambda: "2026-09-28T10:00:00+00:00"
+        )
+        assert first.already_assessed is False
+
+        conn.execute(
+            "UPDATE external_identifiers SET status='retired', "
+            "status_changed_at='2026-09-27T09:30:00+00:00' WHERE status='active'"
+        )
+        conn.commit()
+
+        with pytest.raises(
+            DossierAssessmentError, match="non-advancing assessment chronology"
+        ):
+            persist_dossier_assessment(
+                conn, business_id=1, now=lambda: "2026-09-28T10:00:00+00:00"
+            )
+        assert conn.execute("SELECT COUNT(*) FROM dossier_assessments").fetchone()[0] == 1
+        assert not conn.in_transaction
+    finally:
+        conn.close()
+
+
+def test_reader_rejects_tied_maximum_computed_at(tmp_path: Path) -> None:
+    """Two persisted assessments tied at the maximum clock refuse ambiguity."""
+    from sara.dossier.assessment_cli import main as assessment_main  # noqa: F401
+    from sara.dossier.status import persisted_assessment
+    from sara.dossier.core import DossierQueryError
+
+    conn = _prepared(tmp_path / "tied-max.sqlite")
+    try:
+        first = persist_dossier_assessment(
+            conn, business_id=1, now=lambda: "2026-09-28T10:00:00+00:00"
+        )
+        entity = first.business_entity_id
+        # Forge a pre-existing tie at the maximum clock (INSERT path is not
+        # ordering-guarded by legacy rows).
+        parent = conn.execute(
+            "SELECT policy_version, facts_as_of, analysis_ready, summary_json "
+            "FROM dossier_assessments WHERE id=?",
+            (first.assessment_id,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO dossier_assessments("
+            "id,business_entity_id,policy_version,facts_as_of,analysis_ready,"
+            "computed_at,summary_json) VALUES (?,?,?,?,?,?,?)",
+            (
+                "da_forged_tie",
+                entity,
+                parent[0],
+                parent[1],
+                parent[2],
+                "2026-09-28T10:00:00+00:00",
+                parent[3],
+            ),
+        )
+        conn.execute(
+            "INSERT INTO dossier_domain_assessments("
+            "assessment_id,domain,state,reason_json,fact_count,fresh_fact_count"
+            ") VALUES ('da_forged_tie','identity','insufficient','{}',0,0)"
+        )
+        conn.execute(
+            "INSERT INTO dossier_assessment_seals(assessment_id,sealed_at) "
+            "VALUES ('da_forged_tie','2026-09-28T10:00:00+00:00')"
+        )
+        conn.commit()
+
+        with pytest.raises(DossierQueryError, match="ambiguous"):
+            persisted_assessment(conn, entity)
     finally:
         conn.close()

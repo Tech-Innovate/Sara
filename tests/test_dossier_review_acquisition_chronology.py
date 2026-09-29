@@ -160,7 +160,7 @@ def test_review_acquisition_lifecycle_changes_deterministic_input_signature(
     second = persist_dossier_assessment(
         conn,
         business_id=1,
-        now=lambda: "2026-09-30T10:00:00+00:00",
+        now=lambda: "2026-09-30T10:05:00+00:00",
     )
     assert second.facts_as_of == first.facts_as_of
     assert second.assessment_id != first.assessment_id

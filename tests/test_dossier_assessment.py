@@ -324,3 +324,20 @@ def test_assessment_on_v1_only_schema_fails_closed(tmp_path: Path) -> None:
         assert not conn.in_transaction
     finally:
         conn.close()
+
+
+def test_dossier_reader_on_v1_only_schema_fails_closed(tmp_path: Path) -> None:
+    """The read-only dossier surface refuses a v1-only database cleanly."""
+    from sara.dossier import build_business_dossier
+    from sara.dossier.core import DossierQueryError
+
+    conn = _prepared(
+        tmp_path / "reader-v1-only.sqlite",
+        migrations=MIGRATIONS[:1],
+    )
+    try:
+        with pytest.raises(DossierQueryError, match="schema v2"):
+            build_business_dossier(conn, business_id=1)
+        assert not conn.in_transaction
+    finally:
+        conn.close()

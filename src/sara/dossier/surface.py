@@ -9,6 +9,7 @@ from typing import Any
 
 from ..storage import connect_readonly
 from ..understanding_vocabulary import DOSSIER_POLICY_VERSION
+from ..migrations import MIGRATIONS, current_schema_version
 from .core import (
     DossierQueryError,
     current_facts,
@@ -48,6 +49,14 @@ def build_business_dossier(
         raise DossierQueryError("entity_id must not be blank")
 
     verify_schema(conn)
+    schema_version = current_schema_version(conn)
+    known_versions = {migration.version for migration in MIGRATIONS}
+    if schema_version not in known_versions or schema_version < 2:
+        raise DossierQueryError(
+            "dossier reads require Business Understanding schema v2 "
+            "(external identifier status chronology); this database is at "
+            f"schema version {schema_version}"
+        )
     evaluation = evaluation_time(evaluated_at)
     canonical_entity_id, selection = resolve_selection(
         conn,
