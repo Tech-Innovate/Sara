@@ -10,7 +10,7 @@ from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 
 def test_evidence_only_review_predicate_is_not_reported_as_a_missing_fact(tmp_path: Path) -> None:
     conn = storage_connect(tmp_path / "dossier-review-compat.sqlite")
-    assert apply_migrations(conn) == (1, 2)
+    assert apply_migrations(conn) == (1, 2, 3)
     seed_business_understanding_vocabulary(conn)
 
     unknowns = controlled_unknowns(

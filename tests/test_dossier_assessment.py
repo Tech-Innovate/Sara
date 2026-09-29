@@ -136,7 +136,7 @@ def test_v1_non_active_external_identifier_migrates_without_fabricated_chronolog
     )
     conn.commit()
 
-    assert apply_migrations(conn) == (2,)
+    assert apply_migrations(conn) == (2, 3)
     row = conn.execute(
         "SELECT status,status_changed_at FROM external_identifiers WHERE id=?",
         (identifier_id,),

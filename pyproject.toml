@@ -21,6 +21,7 @@ sara-dossier = "sara.dossier:main"
 sara-dossier-assess = "sara.dossier.assessment_cli:main"
 sara-website = "sara.website:main"
 sara-website-validate = "sara.website_validation_cli:main"
+sara-plan-acquire = "sara.acquisition_planner_cli:main"
 sara-reviews = "sara.reviews:main"
 
 [tool.setuptools.packages.find]

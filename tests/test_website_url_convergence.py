@@ -33,7 +33,7 @@ OBSERVED = "2026-09-26T11:00:00+00:00"
 
 def _setup(path: Path):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2)
+    assert apply_migrations(conn) == (1, 2, 3)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO knowledge_subjects(id,kind,created_at,updated_at) VALUES ('be','business_entity',?,?)",
@@ -275,7 +275,7 @@ class _RedirectingHomeClient:
 
 def _collector_db(path: Path):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2)
+    assert apply_migrations(conn) == (1, 2, 3)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
