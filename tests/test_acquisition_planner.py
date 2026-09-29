@@ -159,7 +159,12 @@ def test_analysis_ready_stops_sufficient_for_real(tmp_path: Path) -> None:
         result = persist_dossier_assessment(
             conn, entity_id=entity, now=lambda: "2026-09-26T13:00:00+00:00")
     assert result.analysis_ready is True
-    decision = plan_next_acquisition(conn, entity_id=entity, now="2026-09-26T13:30:00+00:00")
+    # The fingerprint recomputes the input signature over current state:
+    # keep the forced-sufficient derivation active during planning so the
+    # recomputed signature matches the sealed one.
+    with mock_patch.object(assessment_module, "derive_domain_assessments", all_ready):
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T13:00:05+00:00")
     assert decision.action is None
     assert decision.stop_reason == STOP_SUFFICIENT
     conn.close()
@@ -636,11 +641,7 @@ def test_stale_assessment_stops_when_acquisition_is_newer(tmp_path: Path) -> Non
     assert decision.stop_reason in (STOP_STALE, STOP_STALE_UNDERSTANDING)
     assert decision.reason_code in (
         "assessment_older_than_latest_acquisition",
-        "assessment_older_than_understanding_state")
-    if decision.reason_code == "assessment_older_than_latest_acquisition":
-        assert decision.details["latest_terminal_session_time"] > "2026-09-26T11:"
-    else:
-        assert decision.details["understanding_state_watermark"] > "2026-09-26T11:"
+        "understanding_state_signature_diverged")
     conn.close()
 
 
@@ -1008,3 +1009,177 @@ def test_ceiling_counts_merged_predecessor_decisions(tmp_path: Path, capsys) -> 
     assert rc == 0
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["stop_reason"] == "policy_ceiling"
+
+
+def test_two_valid_terminal_rows_report_zero_corrupt(tmp_path: Path) -> None:
+    """Two genuinely valid terminal rows report zero corrupt; count exact."""
+    conn = prepared(tmp_path / "two-terminal.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)  # terminal row #1
+    _ensure_website_source(conn)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_valid_second", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "complete",
+         "2026-09-26T12:20:00+00:00", "2026-09-26T12:20:30+00:00",
+         None, None, 0, 0))  # terminal row #2, valid
+    conn.commit()
+    decision = plan_next_acquisition(
+        conn, entity_id=entity, now="2026-09-26T12:30:00+00:00")
+    history = decision.details["planner_inputs"]["session_history"]
+    assert history["corrupt_terminal_timestamps"] == 0
+    assert history["terminal_chronology_unprovable"] is False
+    conn.close()
+
+
+def test_integrity_precedes_in_flight_and_stale(tmp_path: Path) -> None:
+    """V5-01: reader integrity + active session + diverged state -> integrity wins."""
+    from unittest.mock import patch as mock_patch
+    import sara.dossier.status as status_module
+    from sara.dossier.status import persisted_assessment as real_read
+    from sara.acquisition_planner import STOP_INTEGRITY
+
+    conn = prepared(tmp_path / "precedence.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    _ensure_website_source(conn)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_running_pre", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "running", "2026-09-26T12:29:00+00:00",
+         None, None, None, 0, 0))
+    conn.commit()
+
+    def read_with_issues(conn_, entity_id_):
+        base = dict(real_read(conn_, entity_id_))
+        if base is not None:
+            base["integrity_issues"] = [
+                {"code": "facts_as_of_after_computed_at"}]
+        return base
+
+    with mock_patch.object(status_module, "persisted_assessment", read_with_issues):
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_INTEGRITY
+    assert decision.action is None
+    assert decision.details["planner_inputs"]["session_history"][
+        "in_flight_sessions"] == 1
+    conn.close()
+
+
+def test_maps_side_state_change_forces_stale_then_resumes(tmp_path: Path) -> None:
+    """V6-02: Entity-side state change after assessment A -> signature stop;
+    sealed assessment B resumes deterministic planning."""
+    from sara.acquisition_planner import STOP_STALE_UNDERSTANDING
+
+    conn = prepared(tmp_path / "maps-side.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    before = plan_next_acquisition(conn, entity_id=entity,
+                                   now="2026-09-26T12:30:00+00:00")
+    assert before.action is not None
+
+    # Maps-sync-style Entity-side change WITHOUT assessment refresh: a new
+    # observation/fact stamped later than the sealed watermark.
+    location = conn.execute(
+        "SELECT bl.id FROM business_locations bl "
+        "JOIN knowledge_subjects ks ON ks.id=bl.id "
+        "WHERE bl.business_entity_id=? AND ks.record_state='active' "
+        "ORDER BY bl.id LIMIT 1", (entity,)).fetchone()
+    conn.execute(
+        "UPDATE external_identifiers SET last_observed_at='2026-09-26T14:00:00+00:00' "
+        "WHERE subject_id=? AND rowid=(SELECT MIN(rowid) FROM external_identifiers "
+        "WHERE subject_id=?)", (location[0], location[0]))
+    conn.commit()
+
+    stale = plan_next_acquisition(conn, entity_id=entity,
+                                  now="2026-09-26T14:30:00+00:00")
+    assert stale.action is None
+    assert stale.stop_reason == STOP_STALE_UNDERSTANDING
+    assert stale.reason_code == "understanding_state_signature_diverged"
+    assert (stale.details["sealed_input_signature_sha256"]
+            != stale.details["current_input_signature_sha256"])
+
+    persist_dossier_assessment(conn, entity_id=entity,
+                               now=lambda: "2026-09-26T15:00:00+00:00")
+    resumed = plan_next_acquisition(conn, entity_id=entity,
+                                    now="2026-09-26T15:30:00+00:00")
+    assert resumed.stop_reason != STOP_STALE_UNDERSTANDING
+    conn.close()
+
+
+def test_location_side_maps_change_forces_stale(tmp_path: Path) -> None:
+    """V6-01: a Location-scoped Maps mutation is NOT invisible to currency."""
+    from sara.acquisition_planner import STOP_STALE_UNDERSTANDING
+
+    conn = prepared(tmp_path / "location-side.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    before = plan_next_acquisition(conn, entity_id=entity,
+                                   now="2026-09-26T12:30:00+00:00")
+    assert before.action is not None
+
+    # Maps stores Location-scoped state (identifiers target the Location).
+    location = conn.execute(
+        "SELECT bl.id FROM business_locations bl "
+        "JOIN knowledge_subjects ks ON ks.id=bl.id "
+        "WHERE bl.business_entity_id=? AND ks.record_state='active' "
+        "ORDER BY bl.id LIMIT 1", (entity,)).fetchone()
+    assert location is not None
+    conn.execute(
+        "INSERT INTO external_identifiers("
+        "id,subject_id,source_id,namespace,value,status,first_observed_at,"
+        "last_observed_at,created_at"
+        ") VALUES ('xid_loc_later', ?, 'src_google_maps', 'google_cid', "
+        "'999888777', 'active', '2026-09-26T14:00:00+00:00', "
+        "'2026-09-26T14:00:00+00:00', '2026-09-26T14:00:00+00:00')",
+        (location[0],))
+    conn.commit()
+
+    stale = plan_next_acquisition(conn, entity_id=entity,
+                                  now="2026-09-26T14:30:00+00:00")
+    assert stale.action is None
+    assert stale.stop_reason == STOP_STALE_UNDERSTANDING
+    assert stale.reason_code == "understanding_state_signature_diverged"
+
+    persist_dossier_assessment(conn, entity_id=entity,
+                               now=lambda: "2026-09-26T15:00:00+00:00")
+    resumed = plan_next_acquisition(conn, entity_id=entity,
+                                    now="2026-09-26T15:30:00+00:00")
+    assert resumed.stop_reason != STOP_STALE_UNDERSTANDING
+    conn.close()
+
+
+def test_corrupt_state_timestamp_fails_closed_not_ignored(tmp_path: Path) -> None:
+    """V6-02: one corrupt relevant timestamp among many valid ones still stops."""
+    from sara.acquisition_planner import STOP_STALE
+
+    conn = prepared(tmp_path / "corrupt-state.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)  # many valid timestamps exist
+    # Corrupt a Maps-link timestamp that feeds the chronology inputs;
+    # identifier timestamps are trigger-guarded immutable.
+    conn.execute(
+        "UPDATE maps_business_location_links SET linked_at='garbage' "
+        "WHERE location_id=(SELECT MIN(location_id) FROM maps_business_location_links)")
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    # The contract: a corrupt relevant timestamp NEVER permits an action.
+    # It fails closed to a stale-family stop — either the explicit
+    # unprovable reason or signature divergence, both of which demand a
+    # fresh assessment before planning resumes.
+    assert decision.action is None
+    assert decision.stop_reason in (STOP_STALE, STOP_STALE_UNDERSTANDING)
+    assert decision.reason_code in (
+        "understanding_state_chronology_unprovable",
+        "understanding_state_signature_diverged")
+    conn.close()

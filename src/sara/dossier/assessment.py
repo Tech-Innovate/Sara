@@ -578,6 +578,41 @@ def _location_signature(location: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def understanding_state_fingerprint(
+    conn: sqlite3.Connection,
+    *,
+    entity_id: str,
+    evaluated_at: str,
+) -> dict[str, Any]:
+    """Compute the assessment input signature over CURRENT Understanding state.
+
+    This is the same signature that participates in deterministic
+    assessment identity (``input_signature_sha256`` in the sealed
+    summary), recomputed over the live dossier for the full resolved
+    Entity+Location subject graph. A persisted assessment whose sealed
+    signature differs from this value no longer represents current state,
+    regardless of which collector or sync changed it. Corrupt state
+    timestamps surface as ``unprovable`` rather than being ignored.
+    """
+    try:
+        dossier = build_business_dossier(
+            conn, entity_id=entity_id, evaluated_at=evaluated_at)
+        location_owner_resolution = _location_owner_resolution_state(conn, dossier)
+        structural_subject_state = _structural_subject_state(conn, dossier)
+        provenance_record_state = _provenance_record_state(conn, dossier)
+        domains = derive_domain_assessments(dossier)
+        signature = _input_signature(
+            dossier, domains, location_owner_resolution,
+            structural_subject_state, provenance_record_state,
+        )
+        return {
+            "unprovable": False,
+            "input_signature_sha256": _sha256(_canonical_json(signature)),
+        }
+    except DossierQueryError as exc:
+        return {"unprovable": True, "error": str(exc)}
+
+
 def _input_signature(
     dossier: dict[str, Any],
     domains: list[dict[str, Any]],

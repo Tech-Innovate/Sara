@@ -143,66 +143,6 @@ def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
-def _understanding_state_watermark(
-    conn: sqlite3.Connection, lineage: list[str]
-) -> dict[str, Any]:
-    """Newest durable Business-Understanding state timestamp across the
-    entity lineage, over every table any collector or sync can mutate —
-    facts, observations, evidence, subjects, Maps links, and external
-    identifiers. Corrupt timestamps fail closed to unprovable.
-    """
-    marks = ",".join("?" for _ in lineage)
-    queries = {
-        "facts": (
-            f"SELECT created_at FROM facts WHERE subject_id IN ({marks}) "
-            f"UNION ALL SELECT valid_from FROM facts WHERE subject_id IN ({marks}) "
-            f"UNION ALL SELECT reconciled_at FROM facts WHERE subject_id IN ({marks}) "
-            f"AND reconciled_at IS NOT NULL",
-            tuple(lineage) * 3),
-        "observations": (
-            f"SELECT observed_at FROM observations WHERE subject_id IN ({marks})",
-            tuple(lineage)),
-        "evidence": (
-            f"SELECT e.retrieved_at FROM evidence_items e "
-            f"JOIN observations o ON o.evidence_id=e.id "
-            f"WHERE o.subject_id IN ({marks})",
-            tuple(lineage)),
-        "subjects": (
-            f"SELECT created_at FROM knowledge_subjects WHERE id IN ({marks}) "
-            f"UNION ALL SELECT updated_at FROM knowledge_subjects WHERE id IN ({marks}) "
-            f"UNION ALL SELECT merged_at FROM knowledge_subjects "
-            f"WHERE id IN ({marks}) AND merged_at IS NOT NULL",
-            tuple(lineage) * 3),
-        "maps_links": (
-            f"SELECT linked_at FROM maps_business_location_links m "
-            f"JOIN business_locations bl ON bl.id=m.location_id "
-            f"WHERE bl.business_entity_id IN ({marks})",
-            tuple(lineage)),
-        "identifiers": (
-            f"SELECT last_observed_at FROM external_identifiers "
-            f"WHERE subject_id IN ({marks})",
-            tuple(lineage)),
-    }
-    newest: datetime | None = None
-    corrupt = 0
-    for name, (sql, params) in queries.items():
-        for (value,) in conn.execute(sql, params):
-            if value is None:
-                continue
-            try:
-                when = _instant(str(value))
-            except ValueError:
-                corrupt += 1
-                continue
-            if newest is None or when > newest:
-                newest = when
-    return {
-        "watermark": newest.isoformat() if newest is not None else None,
-        "corrupt_state_timestamps": corrupt,
-        "unprovable": corrupt > 0 and newest is None,
-    }
-
-
 def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> dict[str, Any]:
     """Snapshot the website session facts the decision depends on.
 
@@ -372,13 +312,20 @@ def plan_next_acquisition(
 
     ``now`` is the decision clock (ISO-8601, timezone-aware). The retry
     window and cooldown horizon are fixed policy constants derived from
-    ``now``; every operational input is sealed into the decision id.
+    ``now``. The decision id seals the entity, assessment, session-history
+    snapshot, understanding-state fingerprint, decision ceiling, outputs,
+    and policy version; the raw clock and decisions_taken are
+    deliberately excluded (see the module docstring).
     """
     from .dossier.status import persisted_assessment
 
     history = _session_history(conn, entity_id, now=now)
-    state_watermark = _understanding_state_watermark(
-        conn, history["entity_lineage"])
+    # Source-agnostic currency via the assessment identity contract: the
+    # fingerprint is the same input signature the assessment sealed, so
+    # equality proves the assessment still represents current state.
+    from .dossier.assessment import understanding_state_fingerprint
+    state_fingerprint = understanding_state_fingerprint(
+        conn, entity_id=entity_id, evaluated_at=now)
     # decisions_taken is deliberately NOT sealed into the identity: the
     # counter includes previously persisted action decisions, so sealing
     # it would make every retry mint a new id and break replay. It stays
@@ -389,7 +336,7 @@ def plan_next_acquisition(
         "policy_version": PLANNER_POLICY_VERSION,
         "max_decisions": int(max_decisions),
         "session_history": history,
-        "understanding_state_watermark": state_watermark,
+        "understanding_state_fingerprint": state_fingerprint,
     }
 
     def decide(action, stop, reason, target, details, assessment_id):
@@ -406,7 +353,7 @@ def plan_next_acquisition(
                 "decisions_taken": int(decisions_taken),
                 "max_decisions": int(max_decisions),
                 "session_history": history,
-                "understanding_state_watermark": state_watermark,
+                "understanding_state_fingerprint": state_fingerprint,
             },
         })
         return PlannerDecision(
@@ -466,22 +413,29 @@ def plan_next_acquisition(
                       "assessment_currency_unprovable_corrupt_timestamp",
                       None, {"facts_as_of": str(assessment["facts_as_of"])},
                       assessment_id)
-    if state_watermark["unprovable"]:
+    if state_fingerprint.get("unprovable"):
+        # A corrupt relevant state timestamp makes current state
+        # unprovable: fail closed rather than ignoring it.
         return decide(None, STOP_STALE,
                       "understanding_state_chronology_unprovable",
-                      None, {"corrupt_state_timestamps":
-                             state_watermark["corrupt_state_timestamps"]},
+                      None, {"fingerprint_error":
+                             state_fingerprint.get("error")},
                       assessment_id)
-    if state_watermark["watermark"] is not None:
-        state_dt = _instant(state_watermark["watermark"])
-        if state_dt > as_of_dt:
-            return decide(None, STOP_STALE_UNDERSTANDING,
-                          "assessment_older_than_understanding_state",
-                          None, {"assessment_facts_as_of":
-                                 str(assessment["facts_as_of"]),
-                                 "understanding_state_watermark":
-                                 state_watermark["watermark"]},
-                          assessment_id)
+    sealed_signature = str(summary.get("input_signature_sha256") or "")
+    current_signature = str(
+        state_fingerprint.get("input_signature_sha256") or "")
+    if sealed_signature != current_signature:
+        # The sealed input signature is the assessment identity contract:
+        # any divergence — Maps-side facts, Location mutations, identifier
+        # changes, freshness transitions, support-graph changes — means
+        # the persisted assessment no longer represents current state.
+        return decide(None, STOP_STALE_UNDERSTANDING,
+                      "understanding_state_signature_diverged",
+                      None, {"assessment_facts_as_of":
+                             str(assessment["facts_as_of"]),
+                             "sealed_input_signature_sha256": sealed_signature,
+                             "current_input_signature_sha256": current_signature},
+                      assessment_id)
 
     if history.get("terminal_chronology_unprovable"):
         return decide(None, STOP_STALE,
