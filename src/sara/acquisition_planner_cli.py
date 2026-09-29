@@ -96,11 +96,32 @@ def main(argv: list[str] | None = None) -> int:
             canonical_key=args.canonical_key,
             entity_id=args.entity_id,
         )
+        state_row = conn.execute(
+            "SELECT record_state FROM knowledge_subjects WHERE id=?",
+            (entity_id,),
+        ).fetchone()
+        if state_row is None or state_row[0] != "active":
+            print(
+                f"canonical entity {entity_id!r} is not active "
+                f"(record_state={state_row[0] if state_row else 'missing'})",
+                file=sys.stderr,
+            )
+            return 2
+        # The policy ceiling is scoped to the retry window: only action
+        # decisions from the last 7 days count, so an entity is not
+        # permanently stopped by lifetime history.
+        from datetime import datetime, timedelta, timezone as _tz
+        decision_now = utc_now()
+        window_floor = (
+            datetime.fromisoformat(decision_now).replace(tzinfo=_tz.utc)
+            - timedelta(days=7)
+        ).isoformat()
         decisions_taken = int(conn.execute(
             "SELECT COUNT(*) FROM planner_decisions WHERE business_entity_id=? "
-            "AND action IS NOT NULL", (entity_id,)).fetchone()[0])
+            "AND action IS NOT NULL AND decided_at >= ?",
+            (entity_id, window_floor)).fetchone()[0])
         decision = plan_next_acquisition(
-            conn, entity_id=entity_id, now=utc_now(),
+            conn, entity_id=entity_id, now=decision_now,
             decisions_taken=decisions_taken,
             max_decisions=args.max_decisions,
         )

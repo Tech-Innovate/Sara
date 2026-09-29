@@ -222,12 +222,12 @@ def test_same_assessment_same_decision(tmp_path: Path) -> None:
     d2 = plan_next_acquisition(conn, entity_id=entity, now="2026-09-26T12:30:00+00:00")
     assert d1.decision_id == d2.decision_id
     assert (d1.action, d1.reason_code, d1.target_domain) == (d2.action, d2.reason_code, d2.target_domain)
-    # The decision clock is a sealed input: a later clock is a visibly
-    # different decision (its cooldown/retry windows moved), never a silent
-    # divergence.
-    d3 = plan_next_acquisition(conn, entity_id=entity, now="2026-09-27T09:00:00+00:00")
-    assert d3.decision_id != d1.decision_id
-    assert (d1.action, d1.reason_code, d1.target_domain) == (d3.action, d3.reason_code, d3.target_domain)
+    # The raw clock left the identity in planner-v3: a later clock with an
+    # unchanged session-history snapshot replays the same id, which is what
+    # makes a lost-output CLI retry idempotent. The clock still shapes the
+    # decision through the window/horizon counts sealed in the snapshot.
+    d3 = plan_next_acquisition(conn, entity_id=entity, now="2026-09-26T18:00:00+00:00")
+    assert d3.decision_id == d1.decision_id
     conn.close()
 
 
@@ -439,10 +439,14 @@ def test_decision_id_seals_operational_inputs(tmp_path: Path) -> None:
     d3 = plan_next_acquisition(conn, entity_id=entity,
                                now="2026-09-26T12:30:00+00:00",
                                decisions_taken=0, max_decisions=10)
-    assert d1.decision_id != d2.decision_id
+    # decisions_taken deliberately does NOT change the identity (the
+    # counter includes prior persisted actions, so sealing it would make
+    # every retry mint a new id); max_decisions does.
+    assert d1.decision_id == d2.decision_id
     assert d1.decision_id != d3.decision_id
-    # The inputs are visible in the persisted snapshot.
+    # Both inputs remain visible in the persisted snapshot.
     assert d1.details["planner_inputs"]["decisions_taken"] == 0
+    assert d2.details["planner_inputs"]["decisions_taken"] == 1
     assert d3.details["planner_inputs"]["max_decisions"] == 10
     conn.close()
 
@@ -542,3 +546,146 @@ def test_reader_detected_integrity_stops_even_with_sealed_count_zero(tmp_path: P
     assert "facts_as_of_after_computed_at" in decision.details["reader_integrity_codes"]
     assert decision.details["sealed_integrity_issue_count"] == 0
     conn.close()
+
+
+def test_two_corrupt_partials_hit_retry_ceiling(tmp_path: Path) -> None:
+    """Corrupt-timestamp sessions count individually, status preserved."""
+    from sara.acquisition_planner import STOP_RETRIES
+    conn = prepared(tmp_path / "corrupt-count.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    for i in range(2):
+        conn.execute(
+            "INSERT INTO acquisition_sessions("
+            "id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at,finished_at,error,"
+            "legacy_run_id,evidence_count,observation_count"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"acq_corrupt_{i}", entity, "src_official_web", "sara.website", "5",
+             "{}", "x" * 64, "partial", "not-a-timestamp",
+             "not-a-timestamp", None, None, 0, 0),
+        )
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_RETRIES
+    assert decision.details["retries"] >= 2
+    conn.close()
+
+
+def test_stale_assessment_stops_when_acquisition_is_newer(tmp_path: Path) -> None:
+    """A terminal session newer than the assessment's watermark stops stale."""
+    from sara.acquisition_planner import STOP_STALE
+    conn = prepared(tmp_path / "stale.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    # Assessment first (facts_as_of = maps watermark 10:00), then an
+    # unrefreshed complete acquisition at 12:00 (collector default off):
+    # the planner must refuse to decide from the stale assessment.
+    persist_dossier_assessment(conn, entity_id=entity,
+                               now=lambda: "2026-09-26T11:00:00+00:00")
+    collect_official_website(
+        conn, evidence_root=tmp_path / "ev", business_id=1,
+        config=CrawlConfig(page_limit=8), now=Clock(),
+        client_factory=factory(FakeClient(MENU_SITE)), refresh_assessment=False)
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_STALE
+    assert decision.reason_code == "assessment_older_than_latest_acquisition"
+    assert decision.details["latest_session_started_at"] > "2026-09-26T11:"
+    conn.close()
+
+
+def test_in_flight_session_stops_duplication(tmp_path: Path) -> None:
+    """A running website session blocks scheduling another acquisition."""
+    from sara.acquisition_planner import STOP_IN_FLIGHT
+    conn = prepared(tmp_path / "inflight.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_inflight", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "running", "2026-09-26T12:31:00+00:00",
+         None, None, None, 0, 0),
+    )
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:32:00+00:00")
+    assert decision.stop_reason == STOP_IN_FLIGHT
+    assert decision.action is None
+    conn.close()
+
+
+def test_merged_predecessor_history_survives(tmp_path: Path) -> None:
+    """Blocked history on a merged predecessor holds cooldown for the canonical."""
+    conn = prepared(tmp_path / "lineage.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
+        "merged_at,created_at,updated_at) "
+        "VALUES ('be_old','business_entity','merged',?,"
+        "'2026-09-26T12:00:00+00:00','2026-09-25T00:00:00+00:00','2026-09-26T12:00:00+00:00')",
+        (entity,))
+    for i in range(3):
+        conn.execute(
+            "INSERT INTO acquisition_sessions("
+            "id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at,finished_at,error,"
+            "legacy_run_id,evidence_count,observation_count"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"acq_old_{i}", "be_old", "src_official_web", "sara.website", "5",
+             "{}", "x" * 64, "blocked",
+             f"2026-09-26T12:1{i}:00+00:00", f"2026-09-26T12:1{i}:05+00:00",
+             "robots policy disallows", None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == STOP_COOLDOWN
+    assert decision.details["streak"] >= 3
+    assert "be_old" in decision.details["planner_inputs"]["session_history"]["entity_lineage"]
+    conn.close()
+
+
+def test_cli_rejects_retired_entity(tmp_path: Path, capsys) -> None:
+    """--entity-id resolving to a terminal retired subject is a controlled error."""
+    from sara.acquisition_planner_cli import main as planner_cli_main
+    conn = prepared(tmp_path / "retired.sqlite")
+    db = str(tmp_path / "retired.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    conn.execute(
+        "UPDATE knowledge_subjects SET record_state='retired' WHERE id=?", (entity,))
+    conn.commit()
+    conn.close()
+    rc = planner_cli_main(["--db", db, "--entity-id", entity])
+    assert rc == 2
+    assert "not active" in capsys.readouterr().err
+    conn2 = connect(Path(db))
+    assert conn2.execute("SELECT COUNT(*) FROM planner_decisions").fetchone()[0] == 0
+    conn2.close()
+
+
+def test_cli_retry_after_lost_output_replays_not_duplicates(tmp_path: Path, capsys) -> None:
+    """Re-invoking without an intervening persisted decision replays the id."""
+    from sara.acquisition_planner_cli import main as planner_cli_main
+    conn = prepared(tmp_path / "retry-cli.sqlite")
+    db = str(tmp_path / "retry-cli.sqlite")
+    conn.close()
+    rc1 = planner_cli_main(["--db", db, "--business-id", "1"])
+    assert rc1 == 0
+    first = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    rc2 = planner_cli_main(["--db", db, "--business-id", "1"])
+    assert rc2 == 0
+    second = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    # second invocation replays the persisted record (replayed) or mints
+    # the identical decision via the derived clock; either way the row
+    # count for that entity stays 1 when no acquisition intervened.
+    conn2 = connect(Path(db))
+    rows = conn2.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT id) FROM planner_decisions").fetchone()
+    assert rows[0] == rows[1] == 1
+    conn2.close()

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-PLANNER_POLICY_VERSION = "acquisition-planner-v2"
+PLANNER_POLICY_VERSION = "acquisition-planner-v3"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -52,6 +52,8 @@ UNSUPPORTED_DOMAINS = frozenset({
 })
 
 STOP_SUFFICIENT = "sufficient_state"
+STOP_STALE = "stale_assessment"
+STOP_IN_FLIGHT = "acquisition_in_progress"
 STOP_UNSUPPORTED = "unsupported_deficiency"
 STOP_RETRIES = "retry_ceiling"
 STOP_COOLDOWN = "cooldown_active"
@@ -96,6 +98,27 @@ def _instant(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
+    """Every business_entity subject that redirects into entity_id.
+
+    Sessions are immutable and keep the target subject they were run
+    against, so after identity convergence the canonical entity must see
+    its merged predecessors' history; otherwise retry/cooldown state
+    silently disappears.
+    """
+    rows = conn.execute(
+        "WITH RECURSIVE lineage(id) AS ("
+        "SELECT ? "
+        "UNION "
+        "SELECT ks.id FROM knowledge_subjects ks "
+        "JOIN lineage l ON ks.merged_into_subject_id=l.id "
+        "WHERE ks.kind='business_entity' AND ks.record_state='merged'"
+        ") SELECT id FROM lineage ORDER BY id",
+        (entity_id,),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> dict[str, Any]:
     """Snapshot the website session facts the decision depends on.
 
@@ -110,10 +133,13 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     cooldown_floor = datetime.fromtimestamp(
         now_dt.timestamp() - COOLDOWN_SECONDS, tz=timezone.utc
     )
+    lineage = _entity_lineage(conn, entity_id)
+    lineage_marks = ",".join("?" for _ in lineage)
     rows = conn.execute(
-        "SELECT status, started_at FROM acquisition_sessions "
-        "WHERE target_subject_id=? AND collector_name='sara.website'",
-        (entity_id,),
+        f"SELECT status, started_at, target_subject_id FROM acquisition_sessions "
+        f"WHERE target_subject_id IN ({lineage_marks}) "
+        f"AND collector_name='sara.website'",
+        tuple(lineage),
     ).fetchall()
     # started_at is plain TEXT: lexical SQL ordering is wrong across
     # differing UTC offsets. Parse every timestamp first, sort by the
@@ -121,25 +147,28 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     # consecutive streak and window counts. An unparseable timestamp
     # fails closed by keeping that session pinned at the newest edge.
     parsed: list[tuple[datetime, str, str]] = []
-    corrupt_newest = False
-    for status, started_at in rows:
+    corrupt: list[str] = []  # statuses of sessions with unparseable timestamps
+    for status, started_at, _target in rows:
         try:
             when = _instant(str(started_at))
         except ValueError:
-            corrupt_newest = True  # corrupt timestamp: fail closed
+            corrupt.append(str(status))  # fail closed, count preserved
             continue
         parsed.append((when, status, str(started_at)))
     parsed.sort(key=lambda item: item[0], reverse=True)
+    # Every corrupt-timestamp session is pinned at the newest edge with
+    # its own status: two corrupt partials hit the retry ceiling, three
+    # corrupt blocked/failed sessions hold cooldown.
+    corrupt_failures = sum(1 for s in corrupt if s in ("blocked", "failed"))
+    corrupt_partials = sum(1 for s in corrupt if s == "partial")
 
-    streak = 0
+    streak = corrupt_failures
     for _when, status, _raw in parsed:
         if status in ("blocked", "failed"):
             streak += 1
         else:
             break
-    if corrupt_newest:
-        streak += 1  # unknown-timestamp session treated as newest failure
-    streak_recent = 0
+    streak_recent = corrupt_failures
     for when, status, _raw in parsed:
         if status not in ("blocked", "failed"):
             break
@@ -147,18 +176,32 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
             streak_recent += 1
         else:
             break
-    if corrupt_newest and (not parsed or parsed[0][1] in ("blocked", "failed")):
-        streak_recent += 1
-    partials_in_window = 0
+    partials_in_window = corrupt_partials
     for when, status, _raw in parsed:
         if status != "partial":
             continue
         if when >= retry_floor:
             partials_in_window += 1
-    if corrupt_newest:
-        partials_in_window += 1
+    in_flight = int(conn.execute(
+        f"SELECT COUNT(*) FROM acquisition_sessions "
+        f"WHERE target_subject_id IN ({lineage_marks}) "
+        f"AND collector_name='sara.website' AND status IN ('planned','running')",
+        tuple(lineage),
+    ).fetchone()[0])
+    latest_terminal = conn.execute(
+        f"SELECT started_at, finished_at FROM acquisition_sessions "
+        f"WHERE target_subject_id IN ({lineage_marks}) "
+        f"AND collector_name='sara.website' "
+        f"AND status IN ('complete','partial') "
+        f"ORDER BY started_at DESC LIMIT 1",
+        tuple(lineage),
+    ).fetchone()
     return {
         "session_count": len(rows),
+        "entity_lineage": lineage,
+        "in_flight_sessions": in_flight,
+        "latest_terminal_session_started_at":
+            str(latest_terminal[0]) if latest_terminal else None,
         "blocked_failed_streak_total": streak,
         "blocked_failed_streak_in_cooldown_horizon": streak_recent,
         "partial_sessions_in_retry_window": partials_in_window,
@@ -189,13 +232,16 @@ def plan_next_acquisition(
     from .dossier.status import persisted_assessment
 
     history = _session_history(conn, entity_id, now=now)
+    # decisions_taken is deliberately NOT sealed into the identity: the
+    # counter includes previously persisted action decisions, so sealing
+    # it would make every retry mint a new id and break replay. It stays
+    # in the persisted details snapshot for observability, and the
+    # ceiling still enforces it at decision time.
     base_inputs = {
         "entity_id": entity_id,
         "policy_version": PLANNER_POLICY_VERSION,
-        "decisions_taken": int(decisions_taken),
         "max_decisions": int(max_decisions),
         "session_history": history,
-        "now": now,
     }
 
     def decide(action, stop, reason, target, details, assessment_id):
@@ -226,6 +272,37 @@ def plan_next_acquisition(
                       None, {}, "none")
 
     assessment_id = str(assessment["id"])
+
+    if history["in_flight_sessions"] > 0:
+        return decide(None, STOP_IN_FLIGHT, "acquisition_session_active",
+                      None, {"in_flight": history["in_flight_sessions"]},
+                      assessment_id)
+
+    latest_started = history.get("latest_terminal_session_started_at")
+    if latest_started:
+        try:
+            latest_dt = _instant(latest_started)
+        except ValueError:
+            latest_dt = None  # corrupt timestamp: no stale signal; the
+            # session is already counted fail-closed in the history counts
+        if latest_dt is not None:
+            try:
+                as_of_dt = _instant(str(assessment["facts_as_of"]))
+            except ValueError:
+                return decide(None, STOP_STALE,
+                              "assessment_currency_unprovable_corrupt_timestamp",
+                              None, {"latest_session_started_at": latest_started},
+                              assessment_id)
+            # The assessment must cover the latest evidence-producing
+            # acquisition; a complete/partial session that started after
+            # the assessment's facts watermark is unassessed state.
+            if latest_dt > as_of_dt:
+                return decide(None, STOP_STALE,
+                              "assessment_older_than_latest_acquisition",
+                              None, {"assessment_facts_as_of":
+                                     str(assessment["facts_as_of"]),
+                                     "latest_session_started_at": latest_started},
+                              assessment_id)
     summary = assessment.get("summary") or {}
     blocking = tuple(sorted(
         str(d) for d in summary.get("blocking_mandatory_domains", ())
