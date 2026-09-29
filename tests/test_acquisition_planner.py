@@ -462,3 +462,83 @@ def test_blocking_set_read_from_sealed_summary(tmp_path: Path) -> None:
         assert decision.stop_reason == STOP_UNSUPPORTED
         assert decision.target_domain in decision.details["blocking"]
     conn.close()
+
+
+def test_mixed_offset_session_ordering_does_not_falsely_cool_down(tmp_path: Path) -> None:
+    """Lexical and UTC order disagree; the streak follows UTC order."""
+    conn = prepared(tmp_path / "mixed-offset.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    # A blocked session at 12:00+03:00 (= 09:00Z, EARLIER instant) whose
+    # string sorts AFTER the newer complete session at 10:00+00:00
+    # (= 10:00Z). Lexical DESC ordering would place the blocked session
+    # "newest" and count it as a streak; instant ordering correctly puts
+    # the complete session newest, so the streak is zero.
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_mixed_offset_probe", entity, "src_official_web", "sara.website", "5",
+         "{}", "x" * 64, "blocked", "2026-09-26T12:00:00+03:00",
+         "2026-09-26T12:00:05+03:00", "robots policy disallows", None, 0, 0),
+    )
+    conn.commit()
+    # The acquire() session completed at ~12:00+00:00 (Clock start), i.e.
+    # 10:00Z-scale later than the probe's 09:00Z.
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason != STOP_COOLDOWN
+    assert decision.details["planner_inputs"]["session_history"][
+        "blocked_failed_streak_total"] == 0
+    conn.close()
+
+
+def test_reader_detected_integrity_stops_even_with_sealed_count_zero(tmp_path: Path) -> None:
+    """analysis_ready + sealed count 0 + reader integrity issues -> stop."""
+    from unittest.mock import patch as mock_patch
+    from sara.dossier import assessment as assessment_module
+    from sara.dossier.assessment_policy import derive_domain_assessments
+    import sara.dossier.status as status_module
+    from sara.dossier.status import persisted_assessment as real_read
+
+    conn = prepared(tmp_path / "reader-integrity.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+
+    def all_ready(dossier):
+        return tuple(
+            {"domain": item["domain"], "state": "sufficient",
+             "reason": {"derivation_version": "test", "rule": "forced"},
+             "fact_count": item.get("fact_count", 0),
+             "fresh_fact_count": item.get("fresh_fact_count", 0),
+             "unresolved_count": item.get("unresolved_count", 0)}
+            for item in derive_domain_assessments(dossier)
+        )
+
+    with mock_patch.object(assessment_module, "derive_domain_assessments", all_ready):
+        result = persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T13:00:00+00:00")
+    assert result.analysis_ready is True
+
+    def read_with_reader_issues(conn_, entity_id_):
+        base = dict(real_read(conn_, entity_id_))
+        if base is not None:
+            base["integrity_issues"] = [
+                {"code": "facts_as_of_after_computed_at"}]
+            # sealed summary count stays ZERO: the sealed snapshot was
+            # written when the rows were consistent; the reader detects
+            # the inconsistency now.
+            base["summary"] = dict(base["summary"])
+            base["summary"]["integrity_issue_count"] = 0
+        return base
+
+    with mock_patch.object(status_module, "persisted_assessment", read_with_reader_issues):
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T13:30:00+00:00")
+    assert decision.stop_reason == STOP_INTEGRITY
+    assert decision.action is None
+    assert "facts_as_of_after_computed_at" in decision.details["reader_integrity_codes"]
+    assert decision.details["sealed_integrity_issue_count"] == 0
+    conn.close()

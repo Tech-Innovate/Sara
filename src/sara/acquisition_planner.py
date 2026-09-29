@@ -112,40 +112,51 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     )
     rows = conn.execute(
         "SELECT status, started_at FROM acquisition_sessions "
-        "WHERE target_subject_id=? AND collector_name='sara.website' "
-        "ORDER BY started_at DESC",
+        "WHERE target_subject_id=? AND collector_name='sara.website'",
         (entity_id,),
     ).fetchall()
-    streak = 0
+    # started_at is plain TEXT: lexical SQL ordering is wrong across
+    # differing UTC offsets. Parse every timestamp first, sort by the
+    # normalized instant (newest first), and only then derive the
+    # consecutive streak and window counts. An unparseable timestamp
+    # fails closed by keeping that session pinned at the newest edge.
+    parsed: list[tuple[datetime, str, str]] = []
+    corrupt_newest = False
     for status, started_at in rows:
+        try:
+            when = _instant(str(started_at))
+        except ValueError:
+            corrupt_newest = True  # corrupt timestamp: fail closed
+            continue
+        parsed.append((when, status, str(started_at)))
+    parsed.sort(key=lambda item: item[0], reverse=True)
+
+    streak = 0
+    for _when, status, _raw in parsed:
         if status in ("blocked", "failed"):
             streak += 1
         else:
             break
+    if corrupt_newest:
+        streak += 1  # unknown-timestamp session treated as newest failure
     streak_recent = 0
-    for status, started_at in rows:
+    for when, status, _raw in parsed:
         if status not in ("blocked", "failed"):
-            break
-        try:
-            when = _instant(str(started_at))
-        except ValueError:
-            streak_recent = streak  # corrupt timestamp: fail closed to full streak
             break
         if when >= cooldown_floor:
             streak_recent += 1
         else:
             break
+    if corrupt_newest and (not parsed or parsed[0][1] in ("blocked", "failed")):
+        streak_recent += 1
     partials_in_window = 0
-    for status, started_at in rows:
+    for when, status, _raw in parsed:
         if status != "partial":
-            continue
-        try:
-            when = _instant(str(started_at))
-        except ValueError:
-            partials_in_window += 1  # corrupt timestamp: fail closed
             continue
         if when >= retry_floor:
             partials_in_window += 1
+    if corrupt_newest:
+        partials_in_window += 1
     return {
         "session_count": len(rows),
         "blocked_failed_streak_total": streak,
@@ -220,16 +231,24 @@ def plan_next_acquisition(
         str(d) for d in summary.get("blocking_mandatory_domains", ())
     ))
 
-    if assessment["analysis_ready"] and not summary.get("integrity_issue_count"):
+    # Reader-detected integrity issues are the authority: the reader
+    # recomputes chronology/consistency facts (facts_as_of vs computed_at,
+    # seal ordering, ready-flag coherence) against the persisted rows and
+    # catches internally inconsistent or directly populated historical
+    # assessments whose sealed summary count says zero. The sealed count
+    # remains a secondary signal only.
+    reader_issues = list(assessment.get("integrity_issues") or [])
+    sealed_count = int(summary.get("integrity_issue_count") or 0)
+    if reader_issues or sealed_count:
+        return decide(None, STOP_INTEGRITY, "assessment_reports_integrity_issues",
+                      None, {"reader_integrity_codes":
+                             sorted({str(item.get("code")) for item in reader_issues}),
+                             "sealed_integrity_issue_count": sealed_count},
+                      assessment_id)
+
+    if assessment["analysis_ready"]:
         return decide(None, STOP_SUFFICIENT, "all_mandatory_domains_ready",
                       None, {"facts_as_of": assessment["facts_as_of"]},
-                      assessment_id)
-    if assessment["analysis_ready"] and summary.get("integrity_issue_count"):
-        # An analysis_ready flag sealed before reader-detected integrity
-        # issues must not fail open into sufficient_state.
-        return decide(None, STOP_INTEGRITY, "assessment_reports_integrity_issues",
-                      None, {"integrity_issue_count":
-                             summary.get("integrity_issue_count")},
                       assessment_id)
 
     if decisions_taken >= max_decisions:
