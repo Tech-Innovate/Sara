@@ -465,7 +465,14 @@ def ingest_crawl_result(
             facts_replaced += replaced
             supports_created += links
 
-        if status == "complete" and scope_eligible:
+        # Absence contract: not_observed is claimable only when the crawl
+        # actually inspected the site's discoverable same-site surface. A
+        # crawl that stopped because it hit its page budget
+        # (frontier_exhausted is False) leaves whole page surfaces
+        # uninspected, so unobserved capabilities remain unknown and are
+        # reported in unresolved_predicates instead of absence facts.
+        absence_claimable = status == "complete" and scope_eligible and result.frontier_exhausted
+        if absence_claimable:
             for predicate in CAPABILITY_PREDICATES:
                 if predicate in observed_predicates:
                     continue
@@ -521,6 +528,9 @@ def ingest_crawl_result(
     unresolved = tuple(dict.fromkeys(unresolved_candidates))
     return {
         "status": status,
+        "crawl_frontier_exhausted": result.frontier_exhausted,
+        "crawl_depth_truncated": result.depth_truncated,
+        "absence_claimable": absence_claimable,
         "evidence_items_created": evidence_created,
         "observations_created": observations_created,
         "channels_created": channels_created,

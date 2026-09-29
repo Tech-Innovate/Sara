@@ -55,8 +55,8 @@ def test_acquisition_session_freezes_transport_configuration_and_collector_versi
         (session_id,),
     ).fetchone()
     frozen = json.loads(row[1])
-    assert COLLECTOR_VERSION == "4"
-    assert row[0] == "4"
+    assert COLLECTOR_VERSION == "5"
+    assert row[0] == "5"
     assert frozen["request_interval_seconds"] == 1.5
     assert frozen["max_policy_delay_seconds"] == 25.0
     assert frozen["retry_attempt_limit"] == 5

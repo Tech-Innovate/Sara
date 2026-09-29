@@ -156,6 +156,7 @@ def crawl_official_site(
     captured_final_urls: set[str] = set()
     captures: list[PageCapture] = []
     errors: list[str] = []
+    depth_truncated = False
 
     while queue and len(captures) < config.page_limit:
         _negative_priority, depth, raw_url = heapq.heappop(queue)
@@ -212,6 +213,14 @@ def crawl_official_site(
         )
 
         if depth >= config.depth_limit:
+            # Same-site links one level deeper are deliberately left
+            # unvisited, so an empty queue afterwards is a budget stop,
+            # not a fully inspected frontier.
+            if any(
+                same_site(link.url, start_url) and link.url not in seen
+                for link in parsed.links
+            ):
+                depth_truncated = True
             continue
         for link in parsed.links:
             if same_site(link.url, start_url) and link.url not in seen:
@@ -222,5 +231,6 @@ def crawl_official_site(
         captures=tuple(captures),
         errors=tuple(errors),
         canonical_home_url=canonical_home,
-        frontier_exhausted=not queue,
+        frontier_exhausted=not queue and not depth_truncated,
+        depth_truncated=depth_truncated,
     )
