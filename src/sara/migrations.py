@@ -1261,12 +1261,34 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
     length(NEW.status_changed_at) >= 25
     AND substr(NEW.status_changed_at, -6, 1) IN ('+', '-')
     AND substr(NEW.status_changed_at, -3, 1) = ':'
-    AND substr(NEW.status_changed_at, -5, 2) = printf('%02d', CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER))
-    AND substr(NEW.status_changed_at, -2, 2) = printf('%02d', CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER))
+    AND substr(NEW.status_changed_at, -5, 2) GLOB '[0-9][0-9]'
+    AND substr(NEW.status_changed_at, -2, 2) GLOB '[0-9][0-9]'
     AND CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) < 24
     AND CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) < 60
-    AND julianday(substr(NEW.status_changed_at, 1, length(NEW.status_changed_at) - 6)) IS NOT NULL
-    AND substr(NEW.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(NEW.status_changed_at, 1, 19))
+    AND substr(NEW.status_changed_at, 1, 4) GLOB '[0-9][0-9][0-9][0-9]'
+    AND substr(NEW.status_changed_at, 5, 1) = '-' AND substr(NEW.status_changed_at, 8, 1) = '-'
+    AND substr(NEW.status_changed_at, 6, 2) GLOB '[0-9][0-9]'
+    AND substr(NEW.status_changed_at, 9, 2) GLOB '[0-9][0-9]'
+    AND CAST(substr(NEW.status_changed_at, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+    AND CAST(substr(NEW.status_changed_at, 9, 2) AS INTEGER) BETWEEN 1 AND 31
+    AND substr(NEW.status_changed_at, 11, 1) = 'T'
+    AND substr(NEW.status_changed_at, 12, 2) GLOB '[0-9][0-9]'
+    AND substr(NEW.status_changed_at, 15, 2) GLOB '[0-9][0-9]'
+    AND substr(NEW.status_changed_at, 18, 2) GLOB '[0-9][0-9]'
+    AND CAST(substr(NEW.status_changed_at, 12, 2) AS INTEGER) < 24
+    AND CAST(substr(NEW.status_changed_at, 15, 2) AS INTEGER) < 60
+    AND CAST(substr(NEW.status_changed_at, 18, 2) AS INTEGER) < 60
+    AND substr(NEW.status_changed_at, 14, 1) = ':' AND substr(NEW.status_changed_at, 17, 1) = ':'
+    AND (
+        length(NEW.status_changed_at) = 25
+        OR (
+            substr(NEW.status_changed_at, 20, 1) = '.'
+            AND length(NEW.status_changed_at) - 26 BETWEEN 1 AND 6
+            AND substr(NEW.status_changed_at, 21, length(NEW.status_changed_at) - 26) GLOB '[0-9]*'
+            AND NOT substr(NEW.status_changed_at, 21, length(NEW.status_changed_at) - 26) GLOB '*[^0-9]*'
+        )
+    )
+    AND strftime('%s', substr(NEW.status_changed_at, 1, 19)) IS NOT NULL
 )
             OR (
                 OLD.status_changed_at IS NOT NULL
@@ -1275,28 +1297,65 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
     length(OLD.status_changed_at) >= 25
     AND substr(OLD.status_changed_at, -6, 1) IN ('+', '-')
     AND substr(OLD.status_changed_at, -3, 1) = ':'
-    AND substr(OLD.status_changed_at, -5, 2) = printf('%02d', CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER))
-    AND substr(OLD.status_changed_at, -2, 2) = printf('%02d', CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER))
+    AND substr(OLD.status_changed_at, -5, 2) GLOB '[0-9][0-9]'
+    AND substr(OLD.status_changed_at, -2, 2) GLOB '[0-9][0-9]'
     AND CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) < 24
     AND CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) < 60
-    AND julianday(substr(OLD.status_changed_at, 1, length(OLD.status_changed_at) - 6)) IS NOT NULL
-    AND substr(OLD.status_changed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(OLD.status_changed_at, 1, 19))
+    AND substr(OLD.status_changed_at, 1, 4) GLOB '[0-9][0-9][0-9][0-9]'
+    AND substr(OLD.status_changed_at, 5, 1) = '-' AND substr(OLD.status_changed_at, 8, 1) = '-'
+    AND substr(OLD.status_changed_at, 6, 2) GLOB '[0-9][0-9]'
+    AND substr(OLD.status_changed_at, 9, 2) GLOB '[0-9][0-9]'
+    AND CAST(substr(OLD.status_changed_at, 6, 2) AS INTEGER) BETWEEN 1 AND 12
+    AND CAST(substr(OLD.status_changed_at, 9, 2) AS INTEGER) BETWEEN 1 AND 31
+    AND substr(OLD.status_changed_at, 11, 1) = 'T'
+    AND substr(OLD.status_changed_at, 12, 2) GLOB '[0-9][0-9]'
+    AND substr(OLD.status_changed_at, 15, 2) GLOB '[0-9][0-9]'
+    AND substr(OLD.status_changed_at, 18, 2) GLOB '[0-9][0-9]'
+    AND CAST(substr(OLD.status_changed_at, 12, 2) AS INTEGER) < 24
+    AND CAST(substr(OLD.status_changed_at, 15, 2) AS INTEGER) < 60
+    AND CAST(substr(OLD.status_changed_at, 18, 2) AS INTEGER) < 60
+    AND substr(OLD.status_changed_at, 14, 1) = ':' AND substr(OLD.status_changed_at, 17, 1) = ':'
+    AND (
+        length(OLD.status_changed_at) = 25
+        OR (
+            substr(OLD.status_changed_at, 20, 1) = '.'
+            AND length(OLD.status_changed_at) - 26 BETWEEN 1 AND 6
+            AND substr(OLD.status_changed_at, 21, length(OLD.status_changed_at) - 26) GLOB '[0-9]*'
+            AND NOT substr(OLD.status_changed_at, 21, length(OLD.status_changed_at) - 26) GLOB '*[^0-9]*'
+        )
+    )
+    AND strftime('%s', substr(OLD.status_changed_at, 1, 19)) IS NOT NULL
 )
-                    OR julianday(
-    substr(NEW.status_changed_at, 1, length(NEW.status_changed_at) - 6),
-    printf('%+d seconds', (
-        -(CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) * 3600
-          + CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) * 60)
-        * (CASE WHEN substr(NEW.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
-    ))
-) <= julianday(
-    substr(OLD.status_changed_at, 1, length(OLD.status_changed_at) - 6),
-    printf('%+d seconds', (
-        -(CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) * 3600
-          + CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) * 60)
-        * (CASE WHEN substr(OLD.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
-    ))
+                    OR (
+    CAST(strftime('%s', substr(NEW.status_changed_at, 1, 19)) AS INTEGER)
+    - (CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) * 3600
+       + CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) * 60)
+      * (CASE WHEN substr(NEW.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+) < (
+    CAST(strftime('%s', substr(OLD.status_changed_at, 1, 19)) AS INTEGER)
+    - (CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) * 3600
+       + CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) * 60)
+      * (CASE WHEN substr(OLD.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
 )
+                    OR ((
+    CAST(strftime('%s', substr(NEW.status_changed_at, 1, 19)) AS INTEGER)
+    - (CAST(substr(NEW.status_changed_at, -5, 2) AS INTEGER) * 3600
+       + CAST(substr(NEW.status_changed_at, -2, 2) AS INTEGER) * 60)
+      * (CASE WHEN substr(NEW.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+) = (
+    CAST(strftime('%s', substr(OLD.status_changed_at, 1, 19)) AS INTEGER)
+    - (CAST(substr(OLD.status_changed_at, -5, 2) AS INTEGER) * 3600
+       + CAST(substr(OLD.status_changed_at, -2, 2) AS INTEGER) * 60)
+      * (CASE WHEN substr(OLD.status_changed_at, -6, 1) = '-' THEN -1 ELSE 1 END)
+) AND (
+    CASE WHEN length(NEW.status_changed_at) > 25
+         THEN CAST(printf('%06d', CAST(substr(NEW.status_changed_at, 21, length(NEW.status_changed_at) - 26) AS INTEGER)) AS INTEGER)
+         ELSE 0 END
+) <= (
+    CASE WHEN length(OLD.status_changed_at) > 25
+         THEN CAST(printf('%06d', CAST(substr(OLD.status_changed_at, 21, length(OLD.status_changed_at) - 26) AS INTEGER)) AS INTEGER)
+         ELSE 0 END
+))
                 )
             )
         )

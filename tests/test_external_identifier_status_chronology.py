@@ -279,3 +279,93 @@ def test_invalid_stored_timestamp_fails_closed_on_transition(tmp_path: Path) -> 
         conn.rollback()
     finally:
         conn.close()
+
+
+def test_one_microsecond_advance_is_accepted(tmp_path: Path) -> None:
+    """A genuine 1us forward transition must not collapse to equality."""
+    conn = storage_connect(tmp_path / "one-microsecond.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='2026-01-02T10:00:00.000001+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='superseded', status_changed_at='2026-01-02T10:00:00.000002+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert row[1] == "2026-01-02T10:00:00.000002+00:00"
+        # The same microsecond again is not an advance.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='active', status_changed_at='2026-01-02T10:00:00.000002+00:00' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_mixed_offset_microsecond_ordering(tmp_path: Path) -> None:
+    """Microsecond ordering holds across differing UTC offsets."""
+    conn = storage_connect(tmp_path / "mixed-microsecond.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='retired', status_changed_at='2026-01-02T10:00:00.000005+00:00' "
+            "WHERE id='xid'"
+        )
+        conn.commit()
+        # 12:00:00.000003+03:00 is 09:00:00.000003Z: earlier by two microseconds.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='superseded', "
+                "status_changed_at='2026-01-02T12:00:00.000003+03:00' WHERE id='xid'"
+            )
+        conn.rollback()
+        # 07:00:00.000007-03:00 is 10:00:00.000007Z: later by two microseconds.
+        conn.execute(
+            "UPDATE external_identifiers "
+            "SET status='superseded', "
+            "status_changed_at='2026-01-02T07:00:00.000007-03:00' WHERE id='xid'"
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert row[1] == "2026-01-02T07:00:00.000007-03:00"
+    finally:
+        conn.close()
+
+
+def test_hour_twenty_four_is_rejected(tmp_path: Path) -> None:
+    """Hour 24 parses in SQLite date functions but not in Sara's boundary."""
+    conn = storage_connect(tmp_path / "hour-24.sqlite")
+    try:
+        apply_migrations(conn)
+        _seed_external_identifier(conn)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE external_identifiers "
+                "SET status='retired', status_changed_at='2026-01-02T24:00:00+00:00' "
+                "WHERE id='xid'"
+            )
+        conn.rollback()
+        row = conn.execute(
+            "SELECT status, status_changed_at FROM external_identifiers WHERE id='xid'"
+        ).fetchone()
+        assert tuple(row) == ("active", None)
+    finally:
+        conn.close()
