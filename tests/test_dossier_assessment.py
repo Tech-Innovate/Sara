@@ -73,7 +73,8 @@ def _prepared(path: Path, *, reviews: bool = False, migrations=MIGRATIONS):
                 "ProfilePicture": "https://profiles.example/sensitive.jpg",
             }
         ]
-    ingest_records(conn, "r1", [record], finalize_run=("complete", 0, None))
+    with patch("sara.storage.utc_now", return_value="2026-09-26T09:59:00+00:00"):
+        ingest_records(conn, "r1", [record], finalize_run=("complete", 0, None))
     with patch("sara.maps_backfill._utc_now", return_value="2026-09-26T10:00:00+00:00"):
         backfill_maps_business_understanding(conn)
     return conn

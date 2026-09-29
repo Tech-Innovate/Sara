@@ -1,0 +1,8 @@
+[console_scripts]
+sara = sara.cli:main
+sara-dossier = sara.dossier:main
+sara-dossier-assess = sara.dossier.assessment_cli:main
+sara-maps-sync = sara.maps_sync:main
+sara-reviews = sara.reviews:main
+sara-website = sara.website:main
+sara-website-validate = sara.website_validation_cli:main

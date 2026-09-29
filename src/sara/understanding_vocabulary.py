@@ -295,19 +295,33 @@ def _predicate_values(seed: PredicateSeed) -> tuple[object, ...]:
     )
 
 
-def _require_exact_phase_one_history(conn: sqlite3.Connection) -> None:
-    if current_schema_version(conn) != 1:
+def _require_compatible_schema_history(conn: sqlite3.Connection) -> None:
+    """Fail closed unless the schema is migrated through a complete prefix
+    of this build's migrations with exact recorded identity.
+
+    The vocabulary is compatible with any complete prefix (v1 alone, or
+    v1 then v2); an unmigrated database (version 0), an unrecognized
+    future version, or any applied migration whose recorded name/checksum
+    does not match this build refuses seeding.
+    """
+    applied = current_schema_version(conn)
+    known_versions = {migration.version for migration in MIGRATIONS}
+    if applied not in known_versions:
         raise VocabularySeedError(
-            "vocabulary seed v3 requires Business Understanding schema version 1 exactly"
+            "vocabulary seed v3 does not recognize Business Understanding "
+            f"schema version {applied}"
         )
-    expected = MIGRATIONS[0]
-    row = conn.execute(
-        "SELECT name, checksum FROM schema_migrations WHERE version = 1"
-    ).fetchone()
-    if row is None or tuple(row) != (expected.name, expected.checksum):
-        raise VocabularySeedError(
-            "Business Understanding migration v1 history does not match this Sara build"
-        )
+    for migration in MIGRATIONS:
+        if migration.version > applied:
+            break
+        row = conn.execute(
+            "SELECT name, checksum FROM schema_migrations WHERE version = ?",
+            (migration.version,),
+        ).fetchone()
+        if row is None or tuple(row) != (migration.name, migration.checksum):
+            raise VocabularySeedError(
+                "Business Understanding migration history does not match this Sara build"
+            )
 
 
 def _read_predicate(conn: sqlite3.Connection, seed: PredicateSeed) -> tuple[object, ...] | None:
@@ -326,7 +340,7 @@ def _verify_predicates(
     *,
     required: bool,
 ) -> None:
-    _require_exact_phase_one_history(conn)
+    _require_compatible_schema_history(conn)
     for seed in seeds:
         actual = _read_predicate(conn, seed)
         if actual is None:
@@ -377,7 +391,7 @@ def seed_business_understanding_vocabulary(
         raise VocabularySeedError(
             "vocabulary seeding requires a connection with no active transaction"
         )
-    _require_exact_phase_one_history(conn)
+    _require_compatible_schema_history(conn)
 
     conn.execute("PRAGMA foreign_keys = ON")
     if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:

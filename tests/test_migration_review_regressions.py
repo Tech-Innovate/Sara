@@ -11,7 +11,7 @@ from sara.storage import SCHEMA, connect
 
 def _migrated(tmp_path: Path) -> sqlite3.Connection:
     conn = connect(tmp_path / "sara.sqlite")
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     return conn
 
 

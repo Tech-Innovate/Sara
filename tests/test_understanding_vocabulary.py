@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sara.migrations import apply_migrations, current_schema_version
+from sara.migrations import apply_migrations, current_schema_version, MIGRATIONS
 from sara.storage import connect as storage_connect
 from sara.understanding_vocabulary import (
     DOSSIER_DOMAIN_SEED_V1,
@@ -95,7 +95,7 @@ EXPECTED_MANDATORY_DOMAINS = (
 
 def migrated_conn(path: Path) -> sqlite3.Connection:
     conn = storage_connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn, migrations=MIGRATIONS[:1]) == (1,)
     assert current_schema_version(conn) == 1
     return conn
 
@@ -185,7 +185,7 @@ def test_review_predicate_is_additive_to_existing_business_understanding_v2(tmp_
 
 def test_seed_requires_exact_phase_one_history_and_no_outer_transaction(tmp_path: Path) -> None:
     conn = storage_connect(tmp_path / "unmigrated.sqlite")
-    with pytest.raises(VocabularySeedError, match="schema version 1 exactly"):
+    with pytest.raises(VocabularySeedError, match="does not recognize"):
         seed_business_understanding_vocabulary(conn)
 
     apply_migrations(conn)
@@ -208,11 +208,11 @@ def test_seed_requires_exact_phase_one_history_and_no_outer_transaction(tmp_path
     future = migrated_conn(tmp_path / "future.sqlite")
     future.execute(
         "INSERT INTO schema_migrations(version, name, checksum, applied_at) "
-        "VALUES (2, 'future_schema', ?, 't2')",
+        "VALUES (3, 'future_schema', ?, 't3')",
         ("f" * 64,),
     )
     future.commit()
-    with pytest.raises(VocabularySeedError, match="schema version 1 exactly"):
+    with pytest.raises(VocabularySeedError, match="does not recognize"):
         seed_business_understanding_vocabulary(future)
     future.close()
 

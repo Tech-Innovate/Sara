@@ -24,7 +24,7 @@ from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 
 def prepared_conn(path: Path):
     conn = storage_connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     seed_business_understanding_vocabulary(conn)
     return conn
 

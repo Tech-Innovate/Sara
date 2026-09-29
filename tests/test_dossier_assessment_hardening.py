@@ -90,6 +90,11 @@ def test_customer_voice_survives_cross_owner_location_convergence(tmp_path: Path
         ],
         finalize_run=("complete", 0, None),
     )
+    conn.execute(
+        "UPDATE runs SET finished_at = '2026-09-26T09:59:00+00:00' "
+        "WHERE id = 'r1' AND finished_at > '2026-09-26T09:59:00+00:00'"
+    )
+    conn.commit()
     _backfill(conn)
     business_a, business_b = [
         int(row[0]) for row in conn.execute("SELECT id FROM businesses ORDER BY id")
@@ -151,6 +156,11 @@ def test_location_redirect_timestamp_participates_in_assessment_chronology(
         ],
         finalize_run=("complete", 0, None),
     )
+    conn.execute(
+        "UPDATE runs SET finished_at = '2026-09-26T09:59:00+00:00' "
+        "WHERE id = 'r1' AND finished_at > '2026-09-26T09:59:00+00:00'"
+    )
+    conn.commit()
     _backfill(conn)
     business_a, business_b = [
         int(row[0]) for row in conn.execute("SELECT id FROM businesses ORDER BY id")
@@ -200,6 +210,11 @@ def test_owner_entity_redirect_timestamp_participates_in_assessment_chronology(
         ],
         finalize_run=("complete", 0, None),
     )
+    conn.execute(
+        "UPDATE runs SET finished_at = '2026-09-26T09:59:00+00:00' "
+        "WHERE id = 'r1' AND finished_at > '2026-09-26T09:59:00+00:00'"
+    )
+    conn.commit()
     _backfill(conn)
     business_a, business_b = [
         int(row[0]) for row in conn.execute("SELECT id FROM businesses ORDER BY id")
@@ -249,6 +264,11 @@ def test_external_identifier_observation_timestamp_participates_in_assessment_ch
         [_record("a", latitude=21.55, with_review=False)],
         finalize_run=("complete", 0, None),
     )
+    conn.execute(
+        "UPDATE runs SET finished_at = '2026-09-26T09:59:00+00:00' "
+        "WHERE id = 'r1' AND finished_at > '2026-09-26T09:59:00+00:00'"
+    )
+    conn.commit()
     _backfill(conn)
     business_id = int(conn.execute("SELECT id FROM businesses").fetchone()[0])
     location_id = location_id_for_maps_business(business_id)
@@ -280,6 +300,11 @@ def test_unattempted_capability_domain_is_not_started_not_insufficient(tmp_path:
         [_record("a", latitude=21.55, with_review=False)],
         finalize_run=("complete", 0, None),
     )
+    conn.execute(
+        "UPDATE runs SET finished_at = '2026-09-26T09:59:00+00:00' "
+        "WHERE id = 'r1' AND finished_at > '2026-09-26T09:59:00+00:00'"
+    )
+    conn.commit()
     _backfill(conn)
 
     result = persist_dossier_assessment(

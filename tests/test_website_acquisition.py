@@ -59,7 +59,7 @@ def factory(client: FakeClient):
 
 def prepared(path: Path, *, website: str = "https://seed.example"):
     conn = connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
@@ -460,7 +460,7 @@ def test_ingestion_failure_leaves_raw_artifact_but_no_registered_evidence(tmp_pa
 
 def test_unsynchronized_business_fails_before_network(tmp_path: Path) -> None:
     conn = connect(tmp_path / "unsynchronized.sqlite")
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     seed_business_understanding_vocabulary(conn)
     called = False
 
