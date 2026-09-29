@@ -35,7 +35,7 @@ def test_unicode_ascii_url_equivalence_is_versioned() -> None:
 
 def _prepared(path: Path):
     conn = connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO knowledge_subjects(id,kind,created_at,updated_at) "

@@ -9,6 +9,7 @@ from typing import Any
 
 from ..storage import connect_readonly
 from ..understanding_vocabulary import DOSSIER_POLICY_VERSION
+from ..migrations import MIGRATIONS, current_schema_version
 from .core import (
     DossierQueryError,
     current_facts,
@@ -19,6 +20,7 @@ from .core import (
     resolve_selection,
     verify_schema,
 )
+from .customer_voice import customer_review_observations
 from .identity import enrich_location_aliases
 from .integrity import (
     additional_assessment_integrity,
@@ -47,6 +49,14 @@ def build_business_dossier(
         raise DossierQueryError("entity_id must not be blank")
 
     verify_schema(conn)
+    schema_version = current_schema_version(conn)
+    known_versions = {migration.version for migration in MIGRATIONS}
+    if schema_version not in known_versions or schema_version < 2:
+        raise DossierQueryError(
+            "dossier reads require Business Understanding schema v2 "
+            "(external identifier status chronology); this database is at "
+            f"schema version {schema_version}"
+        )
     evaluation = evaluation_time(evaluated_at)
     canonical_entity_id, selection = resolve_selection(
         conn,
@@ -64,8 +74,16 @@ def build_business_dossier(
     )
     facts = current_facts(conn, canonical_entity_id, current_location_ids, evaluation)
     evidence, integrity_issues = attach_provenance(conn, facts)
+    customer_voice, customer_voice_issues = customer_review_observations(
+        conn,
+        current_location_ids,
+    )
     integrity_issues = sort_integrity_issues(
-        [*integrity_issues, *additional_fact_integrity(facts)]
+        [
+            *integrity_issues,
+            *additional_fact_integrity(facts),
+            *customer_voice_issues,
+        ]
     )
     unknowns = controlled_unknowns(conn, canonical_entity_id, current_location_ids, facts)
     persisted = persisted_assessment(conn, canonical_entity_id)
@@ -81,6 +99,7 @@ def build_business_dossier(
         "schema": "sara-business-dossier-v1",
         "fact_scope": "current_only",
         "evidence_scope": "current_fact_provenance",
+        "customer_voice_scope": "review_observations_from_selected_location_lineage_resolving_current",
         "unknown_scope": "controlled_active_fact_predicates_on_current_subjects",
         "evaluated_at": evaluation.isoformat(),
         "selection": selection,
@@ -89,19 +108,29 @@ def build_business_dossier(
         "locations": location_rows,
         "facts": facts,
         "evidence": evidence,
+        "customer_voice": {
+            "review_count": len(customer_voice),
+            "reviews": customer_voice,
+        },
         "unknowns": unknowns,
         "integrity_issues": integrity_issues,
         "dossier_status": {
             "active_policy_version": DOSSIER_POLICY_VERSION,
             "persisted_current_policy": persisted,
             "persisted_assessment_semantics": (
-                "immutable_snapshot_only; phase5 does not claim it is current after later fact changes"
+                "immutable_snapshot_only; an assessment is not silently recomputed after later state changes"
             ),
             "read_only_preview": {
-                "derivation_version": "phase5-readonly-v1",
+                "derivation_version": "phase5-readonly-v2",
                 "analysis_ready": False,
                 "promotion_policy": "never_promote_from_preview",
-                "domains": preview_domains(facts, unknowns, integrity_issues),
+                "domains": preview_domains(
+                    facts,
+                    unknowns,
+                    integrity_issues,
+                    customer_voice,
+                    evaluation,
+                ),
             },
         },
     }

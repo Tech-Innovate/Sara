@@ -20,7 +20,7 @@ from sara.understanding_vocabulary import (
 
 def _prepared(path: Path):
     conn = connect(path)
-    assert apply_migrations(conn) == (1,)
+    assert apply_migrations(conn) == (1, 2)
     seed_business_understanding_vocabulary(conn)
     return conn
 
@@ -214,11 +214,26 @@ def test_unknown_not_observed_and_confirmed_false_remain_distinct(tmp_path: Path
     db = tmp_path / "semantics.sqlite"
     conn = _phase5_fixture(db)
     entity_id = business_entity_id_for_maps_business(1)
-    session_id = conn.execute(
-        "SELECT id FROM acquisition_sessions WHERE legacy_run_id='r1'"
-    ).fetchone()[0]
     evidence_id = conn.execute("SELECT id FROM evidence_items LIMIT 1").fetchone()[0]
     stamp = "2026-09-25T10:00:00+00:00"
+    session_id = "acq_test_subject_matched_absence"
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,'complete',?,?,NULL,NULL,0,0)",
+        (
+            session_id,
+            entity_id,
+            "src_google_maps",
+            "test.subject_matched_absence",
+            "1",
+            "{}",
+            "0" * 64,
+            stamp,
+            stamp,
+        ),
+    )
 
     conn.execute(
         "INSERT INTO facts(id,subject_id,predicate,fact_slot,status,valid_from,last_verified_at,"
@@ -452,3 +467,22 @@ def test_unsynchronized_maps_business_is_rejected_without_side_effects(tmp_path:
     check = connect_existing(db)
     assert _snapshot(check) == before
     check.close()
+
+
+def test_parse_timestamp_converts_range_overflow_into_query_error() -> None:
+    """Values that parse locally but overflow astimezone fail as DossierQueryError."""
+    from sara.dossier.core import DossierQueryError, parse_timestamp
+
+    for value in (
+        "0001-01-01T00:00:00+23:59",  # normalizes below 0001-01-01T00:00:00Z
+        "9999-12-31T23:59:59-23:59",  # normalizes past 9999-12-31T23:59:59Z
+    ):
+        with pytest.raises(DossierQueryError, match="supported datetime range"):
+            parse_timestamp(value, field="probe")
+    # The exact boundaries still parse.
+    assert str(parse_timestamp("0001-01-01T00:00:00+00:00", field="probe")) == (
+        "0001-01-01 00:00:00+00:00"
+    )
+    assert str(parse_timestamp("9999-12-31T23:59:59+00:00", field="probe")) == (
+        "9999-12-31 23:59:59+00:00"
+    )

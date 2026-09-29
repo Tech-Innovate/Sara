@@ -30,6 +30,10 @@ def _support_matches_fact(fact: dict[str, Any], support: dict[str, Any]) -> bool
     return fact_key is not None and fact_key == observation_key
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(str(row[1]) == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
 def attach_provenance(
     conn: sqlite3.Connection, facts: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -59,8 +63,9 @@ def attach_provenance(
         "o.confidence,e.id AS evidence_id,e.source_id,e.source_locator,e.source_role,"
         "e.status AS evidence_status,e.retrieved_at,e.published_at,e.language,e.media_type,"
         "e.content_sha256,e.artifact_ref,a.id AS acquisition_session_id,a.collector_name,"
-        "a.collector_version,a.status AS acquisition_status,s.source_type,s.name AS source_name,"
-        "s.base_url,s.active AS source_active "
+        "a.collector_version,a.status AS acquisition_status,"
+        "a.started_at AS acquisition_started_at,a.finished_at AS acquisition_finished_at,"
+        "s.source_type,s.name AS source_name,s.base_url,s.active AS source_active "
         "FROM fact_observation_support fos "
         "JOIN observations o ON o.id=fos.observation_id "
         "JOIN evidence_items e ON e.id=o.evidence_id "
@@ -94,6 +99,12 @@ def attach_provenance(
             "evidence_id": item["evidence_id"],
             "source_id": item["source_id"],
             "evidence_status": item["evidence_status"],
+            "acquisition_session_id": item["acquisition_session_id"],
+            "collector_name": item["collector_name"],
+            "collector_version": item["collector_version"],
+            "acquisition_status": item["acquisition_status"],
+            "acquisition_started_at": item["acquisition_started_at"],
+            "acquisition_finished_at": item["acquisition_finished_at"],
         }
         fact_by_id[fact_id]["observation_support"].append(support)
         evidence_id = str(item["evidence_id"])
@@ -119,6 +130,8 @@ def attach_provenance(
                 "collector_name": item["collector_name"],
                 "collector_version": item["collector_version"],
                 "acquisition_status": item["acquisition_status"],
+                "acquisition_started_at": item["acquisition_started_at"],
+                "acquisition_finished_at": item["acquisition_finished_at"],
                 "observations": [],
             },
         )
@@ -148,10 +161,17 @@ def attach_provenance(
             tuple(fact_ids),
         )
     }
+    has_target_subject_id = _table_has_column(
+        conn, "acquisition_sessions", "target_subject_id"
+    )
+    target_subject_expression = (
+        "a.target_subject_id" if has_target_subject_id else "NULL AS target_subject_id"
+    )
     cursor = conn.execute(
         "SELECT fas.fact_id,fas.support_role,a.id AS acquisition_session_id,a.source_id,"
-        "a.collector_name,a.collector_version,a.status,a.started_at,a.finished_at,a.legacy_run_id,"
-        "s.source_type,s.name AS source_name FROM fact_acquisition_support fas "
+        f"a.collector_name,a.collector_version,{target_subject_expression},a.status,a.started_at,"
+        "a.finished_at,a.legacy_run_id,s.source_type,s.name AS source_name "
+        "FROM fact_acquisition_support fas "
         "JOIN acquisition_sessions a ON a.id=fas.acquisition_session_id "
         "JOIN sources s ON s.id=a.source_id "
         f"WHERE fas.fact_id IN ({placeholders}) ORDER BY fas.fact_id,fas.support_role,a.id",
@@ -161,6 +181,8 @@ def attach_provenance(
     for row in cursor.fetchall():
         item = row_dict(cursor, row)
         fact_id = str(item.pop("fact_id"))
+        if not has_target_subject_id:
+            item.pop("target_subject_id", None)
         joined_acquisition_counts[fact_id] = joined_acquisition_counts.get(fact_id, 0) + 1
         fact_by_id[fact_id]["acquisition_support"].append(item)
 

@@ -18,6 +18,7 @@ dev = ["pytest>=8"]
 sara = "sara.cli:main"
 sara-maps-sync = "sara.maps_sync:main"
 sara-dossier = "sara.dossier:main"
+sara-dossier-assess = "sara.dossier.assessment_cli:main"
 sara-website = "sara.website:main"
 sara-website-validate = "sara.website_validation_cli:main"
 sara-reviews = "sara.reviews:main"

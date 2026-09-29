@@ -23,16 +23,46 @@ def additional_fact_integrity(facts: list[dict[str, Any]]) -> list[dict[str, Any
                     }
                 )
 
-        if fact["status"] == "not_observed" and not any(
-            support["support_role"] == "supports_absence"
-            for support in fact["acquisition_support"]
-        ):
-            issues.append(
-                {
-                    "code": "not_observed_without_absence_support",
-                    "fact_id": fact["id"],
-                }
-            )
+        if fact["status"] == "not_observed":
+            absence_support = [
+                support
+                for support in fact["acquisition_support"]
+                if support["support_role"] == "supports_absence"
+            ]
+            if not absence_support:
+                issues.append(
+                    {
+                        "code": "not_observed_without_absence_support",
+                        "fact_id": fact["id"],
+                    }
+                )
+            for support in absence_support:
+                acquisition_session_id = support.get("acquisition_session_id")
+                if "status" in support and support.get("status") != "complete":
+                    issues.append(
+                        {
+                            "code": "not_observed_absence_support_not_complete",
+                            "fact_id": fact["id"],
+                            "acquisition_session_id": acquisition_session_id,
+                            "acquisition_status": support.get("status"),
+                        }
+                    )
+                fact_subject_id = fact.get("subject_id")
+                target_subject_id = support.get("target_subject_id")
+                if (
+                    "target_subject_id" in support
+                    and fact_subject_id is not None
+                    and target_subject_id != fact_subject_id
+                ):
+                    issues.append(
+                        {
+                            "code": "not_observed_absence_support_subject_mismatch",
+                            "fact_id": fact["id"],
+                            "acquisition_session_id": acquisition_session_id,
+                            "fact_subject_id": fact_subject_id,
+                            "target_subject_id": target_subject_id,
+                        }
+                    )
     return issues
 
 
@@ -63,5 +93,6 @@ def sort_integrity_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
             str(item.get("fact_id", "")),
             str(item.get("domain", "")),
             str(item.get("observation_id", "")),
+            str(item.get("acquisition_session_id", "")),
         ),
     )
