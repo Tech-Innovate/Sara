@@ -49,15 +49,24 @@ def _persist(conn: sqlite3.Connection, decision, *, entity_id: str) -> dict | No
         return None
     except sqlite3.IntegrityError as exc:
         conn.rollback()
+        # Classify by SQLite's extended constraint code, not the
+        # human-readable message: PRIMARYKEY (2067) with the row already
+        # present is a deterministic replay; every other constraint
+        # (FOREIGN KEY, CHECK, NOT NULL, ...) propagates as a real error.
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None)
+        is_primary_key_violation = (
+            name == "SQLITE_CONSTRAINT_PRIMARYKEY"
+            or code == 1555  # SQLITE_CONSTRAINT_PRIMARYKEY (short form)
+            or code == 2067  # SQLITE_CONSTRAINT_PRIMARYKEY (extended)
+        )
         row = conn.execute(
             "SELECT id,business_entity_id,decided_at,action,stop_reason,reason_code,"
             "target_domain,policy_version,details_json FROM planner_decisions "
             "WHERE id=?", (decision.decision_id,),
         ).fetchone()
-        if row is None:
+        if row is None or not is_primary_key_violation:
             raise  # not a duplicate replay: surface the real constraint failure
-        if str(exc) != "UNIQUE constraint failed: planner_decisions.id":
-            raise
         return {
             "decision_id": row[0], "entity_id": row[1], "decided_at": row[2],
             "action": row[3], "stop_reason": row[4], "reason_code": row[5],
@@ -138,14 +147,28 @@ def main(argv: list[str] | None = None) -> int:
             # different stop. When the latest persisted action decision was
             # derived from the same sealed assessment and session history,
             # replay it instead.
-            row = conn.execute(
+            # Select the newest persisted action decision by parsed UTC
+            # instant, not lexical TEXT ordering: directly populated or
+            # legacy rows may carry noncanonical offsets. Rows with
+            # unparseable decided_at sort last (treated as oldest).
+            from datetime import datetime, timezone as _tz2
+            from sara.acquisition_planner import _instant
+
+            def _sort_key(row_):
+                try:
+                    return _instant(str(row_[2]))
+                except ValueError:
+                    return datetime.min.replace(tzinfo=_tz2.utc)
+
+            candidates = conn.execute(
                 f"SELECT id,business_entity_id,decided_at,action,stop_reason,"
                 f"reason_code,target_domain,policy_version,details_json "
                 f"FROM planner_decisions "
                 f"WHERE business_entity_id IN ({lineage_marks}) "
-                f"AND action IS NOT NULL ORDER BY decided_at DESC LIMIT 1",
+                f"AND action IS NOT NULL",
                 tuple(lineage),
-            ).fetchone()
+            ).fetchall()
+            row = max(candidates, key=_sort_key) if candidates else None
             if row is not None:
                 stored = json.loads(row[8])
                 stored_inputs = stored.get("planner_inputs", {})
