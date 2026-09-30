@@ -523,6 +523,34 @@ def _record_failed_extraction(
     )
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # R8-03: replay is decided by an exact-identity check under the
+        # writer lock, NOT by suppressing constraint errors. Only a
+        # byte-identical row for the same attempt id counts as a
+        # genuine replay; anything else — a tampered row under this id,
+        # or any FK/CHECK/NOT-NULL/trigger violation on the insert —
+        # propagates untouched.
+        stored = conn.execute(
+            "SELECT config_json,config_hash,status,started_at,finished_at,error "
+            "FROM acquisition_sessions WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        if stored is not None:
+            if tuple(stored) == (
+                config,
+                sha256_text(config),
+                "failed",
+                failed_at,
+                failed_at,
+                error,
+            ):
+                # Genuine same-attempt replay (identical failed_at
+                # second): already durably recorded with these bytes.
+                conn.rollback()
+                return session_id
+            raise ReviewIntelligenceError(
+                f"failed review session replay provenance mismatch: "
+                f"{session_id}"
+            )
         conn.execute(
             "INSERT INTO acquisition_sessions("
             "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
@@ -552,9 +580,11 @@ def _record_failed_extraction(
             )
         conn.commit()
     except sqlite3.IntegrityError:
-        # Same-attempt id (identical failed_at second): already recorded.
+        # Every constraint violation propagates: replay detection above
+        # is deterministic, so nothing legitimate reaches this path.
         if conn.in_transaction:
             conn.rollback()
+        raise
     except BaseException:
         if conn.in_transaction:
             conn.rollback()

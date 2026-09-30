@@ -287,6 +287,114 @@ def test_entity_scoped_extraction_processes_and_skips(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_failed_session_pk_replay_with_mismatch_propagates(tmp_path: Path) -> None:
+    """R8-03: a primary-key collision with DIFFERENT bytes must propagate."""
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    conn = prepared(tmp_path / "failed-mismatch.sqlite", reviews="not-a-list")
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    failed_at = "2026-09-26T12:00:00+00:00"
+    config = json.dumps(
+        {
+            "input_kind": "retained_maps_review_snapshot",
+            "source_maps_business_id": source_evidence["metadata"]["legacy_business_id"],
+            "source_business_entity_id": source_evidence["frozen_entity_id"],
+            "source_location_id": source_evidence["frozen_location_id"],
+            "source_evidence_id": source_evidence["id"],
+            "source_content_sha256": source_evidence["content_sha256"],
+            "extraction_outcome": "failed",
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    session_id = review_opaque_id(
+        "acq", "retained-maps-reviews-failed", source_evidence["id"],
+        str(source_evidence["frozen_location_id"]), "2", failed_at)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, str(source_evidence["frozen_location_id"]),
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "failed", failed_at, failed_at,
+         "tampered error text", None, 0, 0))
+    conn.commit()
+    with pytest.raises(ReviewIntelligenceError, match="provenance mismatch"):
+        extract_retained_reviews(conn, business_id=1,
+                                 now=lambda: failed_at)
+    conn.close()
+
+
+def test_failed_session_same_attempt_replay_suppressed(tmp_path: Path) -> None:
+    """R8-03: the byte-identical same-attempt replay is suppressed."""
+    conn = prepared(tmp_path / "failed-replay.sqlite", reviews="not-a-list")
+    for _ in range(2):
+        with pytest.raises(ReviewIntelligenceError, match="recorded as failed"):
+            extract_retained_reviews(
+                conn, business_id=1,
+                now=lambda: "2026-09-26T12:00:00+00:00")
+    n = conn.execute(
+        "SELECT COUNT(*) FROM acquisition_sessions "
+        "WHERE status='failed' AND collector_name='sara.reviews.maps_snapshot'"
+    ).fetchone()[0]
+    assert n == 1
+    conn.close()
+
+
+def test_legacy_v1_zero_review_session_yields_unavailable_outcome(tmp_path: Path) -> None:
+    """R8-04: a v1 zero-evidence session (no outcome key) derives the
+    unavailable outcome, so reputation resolves and the planner neither
+    deadlocks nor re-schedules a mined snapshot."""
+    from sara.dossier import persist_dossier_assessment
+    from sara.dossier.surface import build_business_dossier
+
+    conn = prepared(tmp_path / "legacy-v1-zero.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    session_id, rows = _seed_legacy_v1_session(conn)
+    assert rows == 0
+    dossier = build_business_dossier(conn, entity_id=entity)
+    outcomes = dossier["customer_voice"]["review_evidence_unavailable"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["session_id"] == session_id
+    assert outcomes[0]["source_retrieved_at"]  # source freshness carried
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:10:00+00:00")
+    state = conn.execute(
+        "SELECT state FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='reputation'",
+        (seal.assessment_id,)).fetchone()[0]
+    assert state == "sufficient"
+    conn.close()
+
+
+def test_unavailable_outcome_staleness_uses_source_retrieval(tmp_path: Path) -> None:
+    """R8-05: mining an OLD snapshot today does not make the source
+    current — the outcome window follows the snapshot's retrieved_at."""
+    from sara.dossier import persist_dossier_assessment
+
+    conn = prepared(tmp_path / "stale-source.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    # Snapshot retrieved 2026-09-26T09:59; extraction happens a month
+    # later. Under the old extraction-clock rule the outcome would look
+    # current for 30 more days; the source rule exposes its real age.
+    stats = extract_retained_reviews(
+        conn, business_id=1, now=lambda: "2026-10-30T12:00:00+00:00")
+    assert stats.status == "unavailable"
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-10-30T12:05:00+00:00")
+    state = conn.execute(
+        "SELECT state FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='reputation'",
+        (seal.assessment_id,)).fetchone()[0]
+    assert state != "sufficient"
+    assert state == "stale"
+    conn.close()
+
+
 def test_reviews_cli_entity_id(tmp_path: Path, capsys) -> None:
     """F-04: the sara-reviews CLI accepts the entity-scoped executor target."""
     from sara.reviews import main as reviews_main

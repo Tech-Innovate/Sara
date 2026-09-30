@@ -452,18 +452,25 @@ def _reputation_domain(
     )
     unavailable_current: list[dict[str, Any]] = []
     for outcome in unavailable_outcomes:
-        finished = outcome.get("finished_at")
-        if not isinstance(finished, str):
+        # R8-05: an outcome is current when its SOURCE is current —
+        # measured from the retained snapshot's retrieval time, exactly
+        # like customer-review observations — never from the extraction
+        # wall-clock. Mining an old snapshot today does not make the
+        # underlying source current.
+        retrieved = outcome.get("source_retrieved_at")
+        if not isinstance(retrieved, str):
             continue
         outcome_session_id = str(outcome.get("session_id"))
-        finished_at = parse_timestamp(
-            finished,
+        source_retrieved_at = parse_timestamp(
+            retrieved,
             field=(
                 f"review outcome session "
-                f"{outcome_session_id} finished_at"
+                f"{outcome_session_id} source_retrieved_at"
             ),
         )
-        outcome_age_days = (evaluated_at - finished_at).total_seconds() / 86400
+        outcome_age_days = (
+            evaluated_at - source_retrieved_at
+        ).total_seconds() / 86400
         if 0 <= outcome_age_days <= 30:
             unavailable_current.append(outcome)
     if rating and review_count and current_voice:

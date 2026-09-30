@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v8): for the SAME entity, the SAME sealed
+Determinism contract (v9): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -40,7 +40,11 @@ from typing import Any
 # are scoped to the candidate action's collector; and
 # extract_retained_reviews is schedulable only while a Maps snapshot
 # newer than the last complete review extraction remains unmined.
-PLANNER_POLICY_VERSION = "acquisition-planner-v8"
+# v9: the Location lineage is the SAME ownership-independent reverse
+# redirect closure the customer-voice projection uses (cross-owner
+# aliases included), and mining completeness is judged per resolved
+# current Location, not entity-globally.
+PLANNER_POLICY_VERSION = "acquisition-planner-v9"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -176,22 +180,24 @@ def _lineage_subjects(conn: sqlite3.Connection, entity_id: str) -> dict[str, lis
     """Every subject the entity's acquisition history lives on.
 
     v8 (F-02): review extraction sessions target their frozen
-    SOURCE-TIME Location subject, not the Business Entity. The
-    lineage therefore covers the reverse Business-Entity merge
-    closure AND every location owned by an entity in that closure;
-    otherwise review sessions would be invisible to in-flight
-    suppression, terminal chronology, and retry state.
+    SOURCE-TIME Location subject, not the Business Entity.
+    v9 (R8-01): the Location set is the SAME ownership-independent
+    reverse redirect closure the customer-voice projection uses —
+    every Location that currently redirects into one of the entity's
+    current Locations, regardless of the historical owner recorded on
+    the row. Selecting by business_locations.business_entity_id
+    misses cross-owner aliases whose sessions the dossier still sees.
+    The closure helper is imported from the projection itself so the
+    planner can never drift from what the assessment consumes.
     """
+    from .dossier.core import locations as dossier_locations
+    from .dossier.customer_voice import _location_lineage
+
     entities = _entity_lineage(conn, entity_id)
-    entity_marks = ",".join("?" for _ in entities)
-    location_rows = conn.execute(
-        f"SELECT bl.id FROM business_locations bl "
-        f"WHERE bl.business_entity_id IN ({entity_marks}) ORDER BY bl.id",
-        tuple(entities),
-    ).fetchall()
+    _rows, current_location_ids = dossier_locations(conn, entity_id)
     return {
         "entities": entities,
-        "locations": [str(row[0]) for row in location_rows],
+        "locations": _location_lineage(conn, current_location_ids),
     }
 
 
@@ -331,12 +337,9 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
         f"AND status IN ('complete','partial')",
         tuple(subjects),
     ).fetchall()
-    review_collector = _review_collector_name()
     newest_terminal: tuple[datetime, str] | None = None
     corrupt_terminal = 0
     unprovable_terminal = False
-    newest_review_terminal: tuple[datetime, str] | None = None
-    review_unprovable = False
     for started_at, finished_at, collector in terminal_rows:
         # Freshness is defined on terminal completion: finished_at. A
         # corrupt or missing finish timestamp makes completion chronology
@@ -347,15 +350,9 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
         except (ValueError, TypeError):
             corrupt_terminal += 1
             unprovable_terminal = True
-            if str(collector) == review_collector:
-                review_unprovable = True
             continue
         if newest_terminal is None or when > newest_terminal[0]:
             newest_terminal = (when, str(finished_at))
-        if str(collector) == review_collector and (
-            newest_review_terminal is None or when > newest_review_terminal[0]
-        ):
-            newest_review_terminal = (when, str(finished_at))
     if unprovable_terminal:
         # At least one terminal row's completion time cannot be proven:
         # refuse to certify assessment currency.
@@ -378,10 +375,6 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
             str(latest_terminal[0]) if latest_terminal else None,
         "corrupt_terminal_timestamps": corrupt_terminal,
         "terminal_chronology_unprovable": stale_unprovable,
-        "latest_review_terminal_time": (
-            str(newest_review_terminal[1]) if newest_review_terminal else None
-        ),
-        "review_terminal_chronology_unprovable": review_unprovable,
         "collector_histories": collector_histories,
         "retry_window_seconds": RETRY_WINDOW_SECONDS,
         "cooldown_horizon_seconds": COOLDOWN_SECONDS,
@@ -391,46 +384,83 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
 def _review_extraction_pending(
     conn: sqlite3.Connection, history: dict[str, Any]
 ) -> bool | None:
-    """Whether a retained Maps snapshot still needs review extraction.
+    """Whether some retained Maps snapshot still needs review extraction.
 
-    True  — at least one Maps-linked business snapshot is newer than
-            the newest complete review extraction over the lineage, or
-            snapshots exist and none was ever extracted.
-    False — every retained snapshot is already mined.
-    None  — chronology is unprovable (corrupt timestamps): fail
+    v9 (R8-02): completeness is judged PER RESOLVED CURRENT LOCATION,
+    never entity-globally — one location's completed extraction must
+    not mask another location's failed or never-attempted snapshot.
+    For each current Location, the newest Maps snapshot attached to
+    its redirect closure is compared against the newest complete
+    review extraction targeting that same closure.
+
+    True  — at least one location has an unmined (or never-mined)
+            snapshot.
+    False — every location is mined.
+    None  — chronology or subject resolution is unprovable: fail
             closed, the action is not scheduled.
 
     This is the F-01 termination guard: after an entity-scoped
     extraction mines every current snapshot, re-scheduling the same
     action would be a provable no-op. A newer Maps sync re-arms it.
     """
-    if history.get("review_terminal_chronology_unprovable"):
-        return None
-    finish_raw = history.get("latest_review_terminal_time")
-    review_finish = _instant(str(finish_raw)) if finish_raw else None
+    from .dossier.core import DossierQueryError, resolve_subject
+    from .reviews.model import COLLECTOR_NAME
+
     locations = history["lineage_subjects"]["locations"]
     if not locations:
         return False
     marks = ",".join("?" for _ in locations)
-    rows = conn.execute(
-        f"SELECT b.last_seen_at FROM maps_business_location_links m "
+
+    def _canonical(location_id: str) -> str | None:
+        try:
+            resolved = resolve_subject(conn, location_id, "location")
+        except DossierQueryError:
+            return None
+        return str(resolved["canonical"]["id"])
+
+    session_rows = conn.execute(
+        f"SELECT target_subject_id, finished_at FROM acquisition_sessions "
+        f"WHERE collector_name=? AND status IN ('complete','partial') "
+        f"AND target_subject_id IN ({marks})",
+        (COLLECTOR_NAME, *locations),
+    ).fetchall()
+    mined_at: dict[str, datetime] = {}
+    for target_subject_id, finished_at in session_rows:
+        canonical = _canonical(str(target_subject_id))
+        if canonical is None:
+            return None  # unresolvable session target: fail closed
+        try:
+            when = _instant(str(finished_at))
+        except (ValueError, TypeError):
+            return None  # corrupt finish: fail closed
+        if canonical not in mined_at or when > mined_at[canonical]:
+            mined_at[canonical] = when
+
+    link_rows = conn.execute(
+        f"SELECT m.location_id, b.last_seen_at FROM maps_business_location_links m "
         f"JOIN businesses b ON b.id=m.business_id "
         f"WHERE m.location_id IN ({marks})",
         tuple(locations),
     ).fetchall()
-    newest_snapshot: datetime | None = None
-    for (last_seen_at,) in rows:
+    snapshot_at: dict[str, datetime] = {}
+    for location_id, last_seen_at in link_rows:
+        canonical = _canonical(str(location_id))
+        if canonical is None:
+            return None
         try:
             when = _instant(str(last_seen_at))
-        except ValueError:
+        except (ValueError, TypeError):
             return None  # corrupt snapshot chronology: fail closed
-        if newest_snapshot is None or when > newest_snapshot:
-            newest_snapshot = when
-    if newest_snapshot is None:
+        if canonical not in snapshot_at or when > snapshot_at[canonical]:
+            snapshot_at[canonical] = when
+
+    if not snapshot_at:
         return False  # no Maps-linked business: nothing retained to mine
-    if review_finish is None:
-        return True
-    return newest_snapshot > review_finish
+    for canonical, snapshot_time in sorted(snapshot_at.items()):
+        finish = mined_at.get(canonical)
+        if finish is None or snapshot_time > finish:
+            return True
+    return False
 
 
 def _decision_hash(payload: dict[str, Any]) -> str:

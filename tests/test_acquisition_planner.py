@@ -1308,7 +1308,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v8",
+         "acquisition-planner-v9",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1320,7 +1320,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v8",
+         "acquisition-planner-v9",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -1532,6 +1532,154 @@ def test_unavailable_outcome_satisfies_reputation_assessment(tmp_path: Path) -> 
     assert after.target_domain != "reputation"
     if after.action == "extract_retained_reviews":
         pytest.fail("review action re-scheduled against a mined snapshot")
+    conn.close()
+
+
+def test_review_session_on_cross_owner_alias_is_visible(tmp_path: Path) -> None:
+    """R8-01: a review session on a Location owned by ANOTHER entity that
+    redirects into our current Location is part of our lineage, exactly
+    like the customer-voice projection sees it."""
+    conn = prepared(tmp_path / "cross-owner.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    location = location_id_for_maps_business(1)
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,created_at,updated_at) "
+        "VALUES ('be_other','business_entity','active',"
+        "'2026-09-25T00:00:00+00:00','2026-09-26T00:00:00+00:00')",
+    )
+    conn.execute(
+        "INSERT INTO business_entities(id,display_name,entity_type,lifecycle_status,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        ("be_other", "Other Owner", "independent_business", "operating",
+         "2026-09-25T00:00:00+00:00", "2026-09-26T00:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
+        "merged_at,created_at,updated_at) "
+        "VALUES ('loc_alias','location','merged',?,"
+        "'2026-09-26T11:00:00+00:00','2026-09-25T10:00:00+00:00','2026-09-26T11:00:00+00:00')",
+        (location,),
+    )
+    conn.execute(
+        "INSERT INTO business_locations(id,business_entity_id,label,location_type,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        ("loc_alias", "be_other", "alias", "branch",
+         "2026-09-25T10:00:00+00:00", "2026-09-26T11:00:00+00:00"),
+    )
+    conn.commit()
+    acquire(conn, tmp_path)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_alias_running", "loc_alias", "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         "{}", "y" * 64, "running", "2026-09-26T12:29:00+00:00",
+         None, None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason == "acquisition_in_progress"
+    assert decision.action is None
+    assert "loc_alias" in decision.details["planner_inputs"]["session_history"][
+        "lineage_subjects"]["locations"]
+    conn.close()
+
+
+def test_per_location_pending_failed_location_stays_pending(tmp_path: Path) -> None:
+    """R8-02: one location's completed extraction must not mask another
+    location's failed attempt — pending is judged per resolved location."""
+    from unittest.mock import patch as mock_patch
+    from sara.dossier import assessment as assessment_module
+
+    conn = prepared(tmp_path / "per-location.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    location = location_id_for_maps_business(1)
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("r2", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
+         '{"strict_bounds":true}', "/evidence/r2.jsonl", "complete",
+         "2026-09-25T11:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO businesses(id,canonical_key,title,first_seen_at,last_seen_at,"
+        "last_run_id,raw_json) VALUES (?,?,?,?,?,?,?)",
+        (2, "second-business", "Second Business",
+         "2026-09-25T11:00:00+00:00", "2026-09-26T09:59:00+00:00",
+         "r2", "{}"),
+    )
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,created_at,updated_at) "
+        "VALUES ('loc2','location','active',"
+        "'2026-09-25T10:00:00+00:00','2026-09-26T10:00:00+00:00')",
+    )
+    conn.execute(
+        "INSERT INTO business_locations(id,business_entity_id,label,location_type,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        ("loc2", entity, "second", "branch",
+         "2026-09-25T10:00:00+00:00", "2026-09-26T10:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO maps_business_location_links(business_id,location_id,linked_at) "
+        "VALUES (2,'loc2','2026-09-25T10:00:00+00:00')",
+    )
+    # Location 1: mined to completion — as a REAL zero-review session
+    # would be frozen (unavailable outcome against the retained
+    # platform evidence, so the outcome projection and the assessment
+    # watermark both see it). Location 2: deterministic failure.
+    platform = conn.execute(
+        "SELECT id, content_sha256 FROM evidence_items "
+        "WHERE source_id='src_google_maps' AND source_role='platform' "
+        "LIMIT 1"
+    ).fetchone()
+    loc1_config = json.dumps(
+        {
+            "input_kind": "retained_maps_review_snapshot",
+            "source_location_id": location,
+            "source_evidence_id": platform[0],
+            "source_content_sha256": platform[1],
+            "extraction_outcome": "unavailable",
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_loc1_done", location, "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         loc1_config, "x" * 64, "complete",
+         "2026-09-26T12:00:00+00:00",
+         "2026-09-26T12:00:05+00:00", None, None, 0, 0))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_loc2_failed", "loc2", "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         "{}", "x" * 64, "failed", "2026-09-26T12:01:00+00:00",
+         "2026-09-26T12:01:05+00:00", "malformed retained reviews",
+         None, 0, 0))
+    conn.commit()
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    # loc2's snapshot (09:59) predates loc1's completion (12:00): a GLOBAL
+    # newest-vs-newest comparison would call the entity mined. The
+    # per-location comparison must keep loc2 pending.
+    assert decision.action == "extract_retained_reviews"
+    assert decision.target_domain == "reputation"
+    assert decision.stop_reason is None
     conn.close()
 
 

@@ -689,6 +689,7 @@ def _input_signature(
                 "finished_at": outcome["finished_at"],
                 "source_evidence_id": outcome["source_evidence_id"],
                 "source_content_sha256": outcome["source_content_sha256"],
+                "source_retrieved_at": outcome["source_retrieved_at"],
             }
             for outcome in dossier["customer_voice"].get(
                 "review_evidence_unavailable", ()

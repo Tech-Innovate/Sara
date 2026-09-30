@@ -500,6 +500,14 @@ def review_evidence_unavailable_outcomes(
     can satisfy the domain instead of the planner re-scheduling a
     provably no-op extraction forever. Sessions whose config cannot be
     decoded are integrity issues, never outcomes.
+
+    R8-04: pre-outcome v1 configs gain the semantics by derivation — a
+    v1 session with zero review evidence rows IS a zero-review
+    extraction by construction. R8-05: each outcome carries its source
+    freshness (the retained snapshot's retrieved_at) so consumers
+    measure currency from the SOURCE, never the extraction clock; a
+    config naming missing evidence is an integrity issue, not an
+    outcome.
     """
     source_ids = _location_lineage(conn, current_location_ids)
     if not source_ids:
@@ -507,7 +515,8 @@ def review_evidence_unavailable_outcomes(
     placeholders = ",".join("?" for _ in source_ids)
     cursor = conn.execute(
         "SELECT id,target_subject_id,collector_name,collector_version,"
-        "config_json,status,finished_at FROM acquisition_sessions "
+        "config_json,status,finished_at,evidence_count "
+        "FROM acquisition_sessions "
         f"WHERE collector_name=? AND target_subject_id IN ({placeholders}) "
         "AND status='complete' ORDER BY finished_at,id",
         (COLLECTOR_NAME, *source_ids),
@@ -529,7 +538,15 @@ def review_evidence_unavailable_outcomes(
                 }
             )
             continue
-        if config.get("extraction_outcome") != "unavailable":
+        outcome = config.get("extraction_outcome")
+        if outcome is None:
+            # R8-04: pre-outcome v1 config — derive from evidence count.
+            outcome = (
+                "unavailable"
+                if int(item["evidence_count"] or 0) == 0
+                else "complete"
+            )
+        if outcome != "unavailable":
             continue
         finished_at = item["finished_at"]
         if not isinstance(finished_at, str) or not finished_at:
@@ -544,15 +561,46 @@ def review_evidence_unavailable_outcomes(
             finished_at,
             field=f"review outcome session {session_id} finished_at",
         )
+        # R8-05: outcome currency is SOURCE currency — carry the
+        # retained snapshot's retrieval time alongside the session
+        # finish so assessment measures freshness from the source.
+        source_evidence_id = config.get("source_evidence_id")
+        evidence_row = None
+        if isinstance(source_evidence_id, str) and source_evidence_id:
+            evidence_row = conn.execute(
+                "SELECT retrieved_at FROM evidence_items WHERE id=?",
+                (source_evidence_id,),
+            ).fetchone()
+        if (
+            evidence_row is None
+            or not isinstance(evidence_row[0], str)
+            or not evidence_row[0]
+        ):
+            issues.append(
+                {
+                    "code": "review_outcome_source_evidence_missing",
+                    "session_id": session_id,
+                }
+            )
+            continue
+        source_retrieved_at = str(evidence_row[0])
+        parse_timestamp(
+            source_retrieved_at,
+            field=(
+                f"review outcome session {session_id} "
+                f"source retrieved_at"
+            ),
+        )
         outcomes.append(
             {
                 "session_id": session_id,
                 "target_subject_id": str(item["target_subject_id"]),
                 "collector_version": str(item["collector_version"]),
                 "finished_at": finished_at,
-                "source_evidence_id": str(config.get("source_evidence_id")),
+                "source_evidence_id": str(source_evidence_id),
                 "source_content_sha256": str(config.get("source_content_sha256")),
                 "source_location_id": str(config.get("source_location_id")),
+                "source_retrieved_at": source_retrieved_at,
             }
         )
     issues.sort(
