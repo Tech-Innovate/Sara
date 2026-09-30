@@ -7,6 +7,7 @@ from typing import Any
 
 from ..reviews.model import (
     COLLECTOR_NAME,
+    REVIEW_ARRAY_FIELDS,
     REVIEW_PREDICATE,
     canonical_json,
     sha256_text,
@@ -33,6 +34,53 @@ _REVIEW_NORMALIZED_FIELDS = frozenset(
 _OWNER_RESPONSE_FIELDS = frozenset(
     {"text", "language", "translated_language", "published_at", "updated_at"}
 )
+_GOOGLE_MAPS_SOURCE_ID = "src_google_maps"
+_MAPS_COLLECTOR_KINDS = {
+    "sara.maps_backfill": "legacy_maps_business_snapshot",
+    "sara.maps_sync": "maps_sync_snapshot",
+}
+_LEGACY_V1_CONFIG_KEYS = frozenset({
+    "input_kind",
+    "source_maps_business_id",
+    "source_business_entity_id",
+    "source_location_id",
+    "source_evidence_id",
+    "source_content_sha256",
+    "review_array_fields",
+    "source_review_records",
+    "review_evidence_records",
+})
+
+
+def _is_strict_legacy_v1_zero_config(config: dict[str, Any]) -> bool:
+    """R9-03: the EXACT canonical pre-outcome v1 config shape with
+    zero declared review records on both count keys. Anything else
+    fails the inference and surfaces as an integrity issue."""
+    if set(config) != _LEGACY_V1_CONFIG_KEYS:
+        return False
+    if config["input_kind"] != "retained_maps_review_snapshot":
+        return False
+    if config["review_array_fields"] != list(REVIEW_ARRAY_FIELDS):
+        return False
+    if config["source_review_records"] != 0:
+        return False
+    if config["review_evidence_records"] != 0:
+        return False
+    business_id = config["source_maps_business_id"]
+    if isinstance(business_id, bool) or not isinstance(business_id, int):
+        return False
+    for key in (
+        "source_business_entity_id",
+        "source_location_id",
+        "source_evidence_id",
+        "source_content_sha256",
+    ):
+        value = config[key]
+        if not isinstance(value, str) or not value:
+            return False
+    return True
+
+
 _REVIEW_TEXT_FIELDS = (
     "review_id",
     "source",
@@ -508,6 +556,20 @@ def review_evidence_unavailable_outcomes(
     measure currency from the SOURCE, never the extraction clock; a
     config naming missing evidence is an integrity issue, not an
     outcome.
+
+    R9-03: the v1 derivation applies ONLY to rigorously verified v1
+    rows — collector version 1, the exact canonical legacy config
+    shape with zero declared counts, and zero actual evidence and
+    observation rows. Any other no-outcome zero-evidence row (a
+    malformed v2/future row) is an integrity issue, never an outcome;
+    a no-outcome row WITH evidence is a historical with-reviews
+    session and is silently skipped. R9-04: the referenced retained
+    Maps evidence is validated against the frozen content hash, Maps
+    source/role/status, the Maps collector session (name, version,
+    complete) and its snapshot metadata before any outcome is
+    projected — the same fail-closed provenance discipline review
+    observations get. A mismatch is an integrity issue and produces
+    no outcome.
     """
     source_ids = _location_lineage(conn, current_location_ids)
     if not source_ids:
@@ -540,12 +602,37 @@ def review_evidence_unavailable_outcomes(
             continue
         outcome = config.get("extraction_outcome")
         if outcome is None:
-            # R8-04: pre-outcome v1 config — derive from evidence count.
-            outcome = (
-                "unavailable"
-                if int(item["evidence_count"] or 0) == 0
-                else "complete"
-            )
+            if int(item["evidence_count"] or 0) != 0:
+                # A historical no-outcome session that DID produce
+                # review evidence: nothing to project here.
+                continue
+            # R9-03: infer unavailable ONLY for a rigorously verified
+            # v1 zero-review row: version 1, canonical legacy config
+            # shape, zero declared counts, zero ACTUAL evidence and
+            # observation rows. Anything else is an integrity issue.
+            actual_evidence = int(conn.execute(
+                "SELECT COUNT(*) FROM evidence_items "
+                "WHERE acquisition_session_id=?", (session_id,)
+            ).fetchone()[0])
+            actual_observations = int(conn.execute(
+                "SELECT COUNT(*) FROM observations o "
+                "JOIN evidence_items e ON e.id=o.evidence_id "
+                "WHERE e.acquisition_session_id=?", (session_id,)
+            ).fetchone()[0])
+            if (
+                str(item["collector_version"]) != "1"
+                or not _is_strict_legacy_v1_zero_config(config)
+                or actual_evidence != 0
+                or actual_observations != 0
+            ):
+                issues.append(
+                    {
+                        "code": "review_outcome_session_config_invalid",
+                        "session_id": session_id,
+                    }
+                )
+                continue
+            outcome = "unavailable"
         if outcome != "unavailable":
             continue
         finished_at = item["finished_at"]
@@ -561,21 +648,25 @@ def review_evidence_unavailable_outcomes(
             finished_at,
             field=f"review outcome session {session_id} finished_at",
         )
-        # R8-05: outcome currency is SOURCE currency — carry the
-        # retained snapshot's retrieval time alongside the session
-        # finish so assessment measures freshness from the source.
+        # R8-05 + R9-04: outcome currency is SOURCE currency, and the
+        # referenced retained Maps evidence must pass the same
+        # fail-closed provenance discipline review observations get:
+        # frozen content hash, Maps source/role/status, a complete
+        # Maps collector session of the expected version, and snapshot
+        # metadata that matches the frozen business/location identity.
         source_evidence_id = config.get("source_evidence_id")
         evidence_row = None
         if isinstance(source_evidence_id, str) and source_evidence_id:
             evidence_row = conn.execute(
-                "SELECT retrieved_at FROM evidence_items WHERE id=?",
+                "SELECT e.content_sha256,e.source_id,e.source_role,e.status,"
+                "e.retrieved_at,a.collector_name,a.collector_version,"
+                "a.status AS session_status,e.metadata_json "
+                "FROM evidence_items e "
+                "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+                "WHERE e.id=?",
                 (source_evidence_id,),
             ).fetchone()
-        if (
-            evidence_row is None
-            or not isinstance(evidence_row[0], str)
-            or not evidence_row[0]
-        ):
+        if evidence_row is None:
             issues.append(
                 {
                     "code": "review_outcome_source_evidence_missing",
@@ -583,7 +674,64 @@ def review_evidence_unavailable_outcomes(
                 }
             )
             continue
-        source_retrieved_at = str(evidence_row[0])
+        (
+            ev_content_sha,
+            ev_source_id,
+            ev_source_role,
+            ev_status,
+            ev_retrieved_at,
+            ev_collector,
+            ev_collector_version,
+            ev_session_status,
+            ev_metadata_json,
+        ) = evidence_row
+        expected_kind = _MAPS_COLLECTOR_KINDS.get(str(ev_collector))
+        try:
+            ev_metadata = json.loads(str(ev_metadata_json))
+            if not isinstance(ev_metadata, dict):
+                raise ValueError("metadata is not a JSON object")
+        except ValueError:
+            ev_metadata = None
+        provenance_valid = (
+            str(ev_source_id) == _GOOGLE_MAPS_SOURCE_ID
+            and str(ev_source_role) == "platform"
+            and str(ev_status) == "usable"
+            and str(ev_session_status) == "complete"
+            and str(ev_content_sha) == str(config.get("source_content_sha256"))
+            and expected_kind is not None
+            and ev_metadata is not None
+            and ev_metadata.get("import_kind") == expected_kind
+        )
+        if provenance_valid:
+            from ..maps_backfill import BACKFILL_VERSION
+            from ..maps_sync import SYNC_VERSION
+
+            expected_version = (
+                BACKFILL_VERSION
+                if str(ev_collector) == "sara.maps_backfill"
+                else SYNC_VERSION
+            )
+            identity_matches = (
+                ev_metadata.get("legacy_business_id")
+                == config.get("source_maps_business_id")
+                if expected_kind == "legacy_maps_business_snapshot"
+                else ev_metadata.get("sync_location_id")
+                == config.get("source_location_id")
+            )
+            provenance_valid = (
+                str(ev_collector_version) == str(expected_version)
+                and identity_matches
+            )
+        if not provenance_valid or not isinstance(ev_retrieved_at, str) \
+                or not ev_retrieved_at:
+            issues.append(
+                {
+                    "code": "review_outcome_source_evidence_mismatch",
+                    "session_id": session_id,
+                }
+            )
+            continue
+        source_retrieved_at = str(ev_retrieved_at)
         parse_timestamp(
             source_retrieved_at,
             field=(

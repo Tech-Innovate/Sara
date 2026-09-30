@@ -529,19 +529,34 @@ def _record_failed_extraction(
         # genuine replay; anything else — a tampered row under this id,
         # or any FK/CHECK/NOT-NULL/trigger violation on the insert —
         # propagates untouched.
+        # R9-02: the replay comparison covers the ENTIRE expected
+        # session row — identity columns, collector name/version,
+        # config bytes and hash, lifecycle, error, legacy run id, and
+        # zero evidence/observation counts. Any single differing
+        # column is a provenance mismatch, never a suppressed replay.
         stored = conn.execute(
-            "SELECT config_json,config_hash,status,started_at,finished_at,error "
+            "SELECT id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at,finished_at,error,legacy_run_id,"
+            "evidence_count,observation_count "
             "FROM acquisition_sessions WHERE id=?",
             (session_id,),
         ).fetchone()
         if stored is not None:
             if tuple(stored) == (
+                session_id,
+                str(source_evidence["frozen_location_id"]),
+                mb.GOOGLE_MAPS_SOURCE_ID,
+                COLLECTOR_NAME,
+                COLLECTOR_VERSION,
                 config,
                 sha256_text(config),
                 "failed",
                 failed_at,
                 failed_at,
                 error,
+                None,
+                0,
+                0,
             ):
                 # Genuine same-attempt replay (identical failed_at
                 # second): already durably recorded with these bytes.

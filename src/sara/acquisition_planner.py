@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v9): for the SAME entity, the SAME sealed
+Determinism contract (v10): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -44,7 +44,12 @@ from typing import Any
 # redirect closure the customer-voice projection uses (cross-owner
 # aliases included), and mining completeness is judged per resolved
 # current Location, not entity-globally.
-PLANNER_POLICY_VERSION = "acquisition-planner-v9"
+# v10: mining completeness matches each EXACT current retained Maps
+# snapshot by its deterministic evidence identity (backfill/sync
+# evidence id over business id, run, and content hash) against the
+# source_evidence_id frozen in complete review-session configs —
+# canonical-Location aggregation cannot mask a sibling snapshot.
+PLANNER_POLICY_VERSION = "acquisition-planner-v10"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -386,24 +391,28 @@ def _review_extraction_pending(
 ) -> bool | None:
     """Whether some retained Maps snapshot still needs review extraction.
 
-    v9 (R8-02): completeness is judged PER RESOLVED CURRENT LOCATION,
-    never entity-globally — one location's completed extraction must
-    not mask another location's failed or never-attempted snapshot.
-    For each current Location, the newest Maps snapshot attached to
-    its redirect closure is compared against the newest complete
-    review extraction targeting that same closure.
+    v10 (R9-01): completeness is judged per EXACT current retained
+    snapshot — never per canonical Location, which the schema allows
+    several Maps businesses to share through alias Locations in one
+    redirect closure. Each Maps business's CURRENT snapshot is
+    identified by its deterministic evidence id (backfill or sync
+    shape over business id, run, and content hash); a snapshot is mined
+    only when a complete review session's frozen config names that
+    exact source_evidence_id.
 
-    True  — at least one location has an unmined (or never-mined)
-            snapshot.
-    False — every location is mined.
-    None  — chronology or subject resolution is unprovable: fail
-            closed, the action is not scheduled.
+    True  — at least one current snapshot is unmined.
+    False — every current snapshot is mined (or none exists).
+    None  — coverage is unprovable (ambiguous snapshot, unparseable
+            session config): fail closed, the action is not
+            scheduled.
 
     This is the F-01 termination guard: after an entity-scoped
     extraction mines every current snapshot, re-scheduling the same
-    action would be a provable no-op. A newer Maps sync re-arms it.
+    action would be a provable no-op. A newer Maps sync mints a new
+    evidence identity and re-arms the action.
     """
-    from .dossier.core import DossierQueryError, resolve_subject
+    from .maps_backfill import GOOGLE_MAPS_SOURCE_ID, _evidence_id
+    from .maps_sync import _sync_evidence_id
     from .reviews.model import COLLECTOR_NAME
 
     locations = history["lineage_subjects"]["locations"]
@@ -411,56 +420,58 @@ def _review_extraction_pending(
         return False
     marks = ",".join("?" for _ in locations)
 
-    def _canonical(location_id: str) -> str | None:
-        try:
-            resolved = resolve_subject(conn, location_id, "location")
-        except DossierQueryError:
-            return None
-        return str(resolved["canonical"]["id"])
-
-    session_rows = conn.execute(
-        f"SELECT target_subject_id, finished_at FROM acquisition_sessions "
-        f"WHERE collector_name=? AND status IN ('complete','partial') "
-        f"AND target_subject_id IN ({marks})",
-        (COLLECTOR_NAME, *locations),
-    ).fetchall()
-    mined_at: dict[str, datetime] = {}
-    for target_subject_id, finished_at in session_rows:
-        canonical = _canonical(str(target_subject_id))
-        if canonical is None:
-            return None  # unresolvable session target: fail closed
-        try:
-            when = _instant(str(finished_at))
-        except (ValueError, TypeError):
-            return None  # corrupt finish: fail closed
-        if canonical not in mined_at or when > mined_at[canonical]:
-            mined_at[canonical] = when
-
     link_rows = conn.execute(
-        f"SELECT m.location_id, b.last_seen_at FROM maps_business_location_links m "
+        f"SELECT m.business_id, b.raw_json, b.last_run_id "
+        f"FROM maps_business_location_links m "
         f"JOIN businesses b ON b.id=m.business_id "
         f"WHERE m.location_id IN ({marks})",
         tuple(locations),
     ).fetchall()
-    snapshot_at: dict[str, datetime] = {}
-    for location_id, last_seen_at in link_rows:
-        canonical = _canonical(str(location_id))
-        if canonical is None:
-            return None
-        try:
-            when = _instant(str(last_seen_at))
-        except (ValueError, TypeError):
-            return None  # corrupt snapshot chronology: fail closed
-        if canonical not in snapshot_at or when > snapshot_at[canonical]:
-            snapshot_at[canonical] = when
+    snapshot_ids: set[str] = set()
+    for business_id, raw_json, last_run_id in link_rows:
+        if not isinstance(raw_json, str) or not raw_json:
+            continue  # no computable current snapshot identity
+        if not isinstance(last_run_id, str) or not last_run_id:
+            continue
+        raw_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+        candidates = (
+            _evidence_id(int(business_id), raw_hash),
+            _sync_evidence_id(int(business_id), last_run_id, raw_hash),
+        )
+        evidence_rows = conn.execute(
+            "SELECT id FROM evidence_items "
+            "WHERE id IN (?,?) AND source_id=? "
+            "AND source_role='platform' AND status='usable'",
+            (*candidates, GOOGLE_MAPS_SOURCE_ID),
+        ).fetchall()
+        if len(evidence_rows) > 1:
+            return None  # ambiguous retained snapshot: fail closed
+        if evidence_rows:
+            snapshot_ids.add(str(evidence_rows[0][0]))
 
-    if not snapshot_at:
-        return False  # no Maps-linked business: nothing retained to mine
-    for canonical, snapshot_time in sorted(snapshot_at.items()):
-        finish = mined_at.get(canonical)
-        if finish is None or snapshot_time > finish:
-            return True
-    return False
+    if not snapshot_ids:
+        return False  # no current retained snapshot: nothing to mine
+
+    session_rows = conn.execute(
+        f"SELECT config_json FROM acquisition_sessions "
+        f"WHERE collector_name=? AND status IN ('complete','partial') "
+        f"AND target_subject_id IN ({marks})",
+        (COLLECTOR_NAME, *locations),
+    ).fetchall()
+    mined_ids: set[str] = set()
+    for (config_json,) in session_rows:
+        try:
+            config = json.loads(str(config_json))
+            if not isinstance(config, dict):
+                raise ValueError("config is not a JSON object")
+        except ValueError:
+            return None  # unprovable coverage: fail closed
+        evidence_id = config.get("source_evidence_id")
+        if not isinstance(evidence_id, str) or not evidence_id:
+            return None  # coverage target unprovable: fail closed
+        mined_ids.add(evidence_id)
+
+    return bool(snapshot_ids - mined_ids)
 
 
 def _decision_hash(payload: dict[str, Any]) -> str:
