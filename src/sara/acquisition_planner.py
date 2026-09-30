@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v12): for the SAME entity, the SAME sealed
+Determinism contract (v13): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -57,7 +57,13 @@ from typing import Any
 # to pass the executor's FULL provenance contract
 # (review_session_mined_evidence) — a malformed zero-output marker
 # never suppresses the real acquisition.
-PLANNER_POLICY_VERSION = "acquisition-planner-v12"
+# v13: coverage classification is three-way per snapshot — mined,
+# genuinely pending (clean deterministic id), or INVALID state at
+# the deterministic id. Invalid state stops planning and demands
+# recovery: execution would collide as incompatible provenance
+# with no durable-failure path, so the action would be
+# unexecutable and non-terminating.
+PLANNER_POLICY_VERSION = "acquisition-planner-v13"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -115,6 +121,7 @@ IN_FLIGHT_HORIZON_SECONDS = 6 * 3600
 #: chronology (misconfigured clock or tampered row) and routes to the
 #: recovery-required stop instead of staying "fresh" (5 minutes).
 IN_FLIGHT_SKEW_SECONDS = 5 * 60
+STOP_INVALID_REVIEW_STATE = "invalid_review_session_state"
 STOP_UNSUPPORTED = "unsupported_deficiency"
 STOP_RETRIES = "retry_ceiling"
 STOP_COOLDOWN = "cooldown_active"
@@ -394,10 +401,10 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     }
 
 
-def _review_extraction_pending(
+def _review_extraction_state(
     conn: sqlite3.Connection, history: dict[str, Any]
-) -> bool | None:
-    """Whether some retained Maps snapshot still needs review extraction.
+) -> tuple[str, dict[str, Any]]:
+    """Classify review coverage per exact current snapshot (R12-01).
 
     v11 (R10-01): snapshot identity comes from the EXECUTOR'S own
     resolver — the shared current_maps_evidence_for_business — which
@@ -409,30 +416,43 @@ def _review_extraction_pending(
 
     v12 (R11-01): coverage requires complete review sessions that pass
     the executor's FULL session provenance contract
-    (review_session_mined_evidence: supported version, source
-    binding, canonical config bytes and hash, deterministic id, target
-    binding, declared counts matching stored AND actual output, and
-    output semantics consistent with the declared outcome). Sessions
-    failing the contract are not coverage: a malformed zero-output
-    marker never suppresses the real acquisition.
+    (review_session_mined_evidence: supported version, source binding,
+    canonical config bytes and hash, deterministic id, target binding,
+    declared counts matching stored AND actual output, byte-exact
+    child provenance, and output semantics consistent with the
+    declared outcome).
 
-    True  — at least one current snapshot is unmined.
-    False — every current snapshot is mined (or none exists).
-    None  — coverage is unprovable (corrupt parent provenance,
-            unparseable session config): fail closed, the action is
-            not scheduled.
+    v13 (R12-01): the classification is three-way per snapshot:
+
+    "mined"       — a verified complete review session covers the
+                    snapshot.
+    "pending"     — NO session occupies the deterministic
+                    review-session id for this evidence/location/version
+                    pair, so execution is clean and the action is
+                    genuinely executable.
+    "invalid"     — a session EXISTS at that deterministic id but fails
+                    the executor's provenance contract. Execution would
+                    collide as incompatible provenance with no durable-
+                    failure path, so planning stops and demands
+                    recovery instead of emitting an unexecutable action.
+    "unprovable"  — corrupt parent provenance: fail closed, no action.
+    "none"        — no current retained snapshot: nothing to mine.
 
     This is the F-01 termination guard: after an entity-scoped
     extraction mines every current snapshot, re-scheduling the same
     action would be a provable no-op. A newer Maps sync mints a new
     evidence identity and re-arms the action.
     """
-    from .reviews.core import current_maps_evidence_for_business
-    from .reviews.model import COLLECTOR_NAME, ReviewIntelligenceError
+    from .reviews.core import (
+        current_maps_evidence_for_business,
+        review_session_mined_evidence,
+    )
+    from .reviews.model import ReviewIntelligenceError
+    from .reviews.model import opaque_id as review_opaque_id
 
     locations = history["lineage_subjects"]["locations"]
     if not locations:
-        return False
+        return ("none", {})
     marks = ",".join("?" for _ in locations)
 
     link_rows = conn.execute(
@@ -441,45 +461,78 @@ def _review_extraction_pending(
         f"WHERE m.location_id IN ({marks}) ORDER BY m.business_id",
         tuple(locations),
     ).fetchall()
-    snapshot_ids: set[str] = set()
+    snapshots: list[tuple[int, str, str]] = []
     for (business_id,) in link_rows:
         try:
             evidence = current_maps_evidence_for_business(
                 conn, business_id=int(business_id))
         except ReviewIntelligenceError:
-            return None  # corrupt parent provenance: fail closed
+            return ("unprovable", {})  # corrupt parent: fail closed
         if evidence is not None:
-            snapshot_ids.add(str(evidence["id"]))
+            snapshots.append((
+                int(business_id),
+                str(evidence["id"]),
+                str(evidence["frozen_location_id"]),
+            ))
 
-    if not snapshot_ids:
-        return False  # no current retained snapshot: nothing to mine
+    if not snapshots:
+        return ("none", {})  # no current retained snapshot
 
-    from .reviews.core import review_session_mined_evidence
-
-    session_rows = conn.execute(
-        f"SELECT id,target_subject_id,source_id,collector_name,"
-        f"collector_version,config_json,config_hash,status,finished_at,"
-        f"evidence_count,observation_count "
-        f"FROM acquisition_sessions "
-        f"WHERE collector_name=? AND status='complete' "
-        f"AND target_subject_id IN ({marks})",
-        (COLLECTOR_NAME, *locations),
-    ).fetchall()
     session_keys = (
         "id", "target_subject_id", "source_id", "collector_name",
         "collector_version", "config_json", "config_hash", "status",
         "finished_at", "evidence_count", "observation_count",
     )
-    mined_ids: set[str] = set()
-    for row in session_rows:
-        session = {
-            key: row[index] for index, key in enumerate(session_keys)
-        }
-        evidence_id = review_session_mined_evidence(conn, session)
-        if evidence_id is not None:
-            mined_ids.add(evidence_id)
-
-    return bool(snapshot_ids - mined_ids)
+    pending_found = False
+    for business_id, evidence_id, location_id in snapshots:
+        deterministic_ids = (
+            review_opaque_id(
+                "acq", "retained-maps-reviews",
+                evidence_id, location_id, "1"),
+            review_opaque_id(
+                "acq", "retained-maps-reviews",
+                evidence_id, location_id, "2"),
+        )
+        rows = conn.execute(
+            f"SELECT id,target_subject_id,source_id,collector_name,"
+            f"collector_version,config_json,config_hash,status,finished_at,"
+            f"evidence_count,observation_count "
+            f"FROM acquisition_sessions WHERE id IN (?,?)",
+            deterministic_ids,
+        ).fetchall()
+        if not rows:
+            # Clean deterministic id space: execution would succeed.
+            pending_found = True
+            continue
+        verified = False
+        for row in rows:
+            session = {
+                key: row[index] for index, key in enumerate(session_keys)
+            }
+            if review_session_mined_evidence(conn, session) == evidence_id:
+                verified = True
+                break
+        if not verified:
+            # R12-01: a session occupies the deterministic id but fails
+            # the executor's contract — the scheduled action would be
+            # unexecutable (incompatible-provenance collision with no
+            # durable-failure path). Demand recovery instead.
+            return (
+                "invalid",
+                {
+                    "business_id": business_id,
+                    "evidence_id": evidence_id,
+                    "session_id": str(rows[0][0]),
+                    "recovery": (
+                        "deterministic review session state fails the "
+                        "executor provenance contract; manual recovery "
+                        "required"
+                    ),
+                },
+            )
+    if pending_found:
+        return ("pending", {})
+    return ("mined", {})
 
 
 def _decision_hash(payload: dict[str, Any]) -> str:
@@ -707,11 +760,20 @@ def plan_next_acquisition(
                      "window_seconds": RETRY_WINDOW_SECONDS},
                 ))
                 continue
-            if action_name == "extract_retained_reviews" and (
-                _review_extraction_pending(conn, history) is not True
-            ):
-                actions_not_applicable.append(action_name)
-                continue
+            if action_name == "extract_retained_reviews":
+                state, state_details = _review_extraction_state(
+                    conn, history)
+                if state == "invalid":
+                    # R12-01: unexecutable deterministic state —
+                    # stop and demand recovery, never re-emit the
+                    # acquisition action.
+                    return decide(
+                        None, STOP_INVALID_REVIEW_STATE,
+                        "deterministic_review_session_state_invalid",
+                        None, state_details, assessment_id)
+                if state != "pending":
+                    actions_not_applicable.append(action_name)
+                    continue
             return decide(action_name, None,
                           "deficient_domain_supported_by_collector", domain,
                           {"collector": collector,

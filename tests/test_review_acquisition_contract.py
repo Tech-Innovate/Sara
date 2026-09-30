@@ -777,6 +777,89 @@ def test_supersession_requires_valid_historical_parent(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_historical_parent_wrong_evidence_identity_is_integrity_issue(tmp_path: Path) -> None:
+    """R12-03: a fabricated historical parent under an ARBITRARY evidence
+    id with otherwise fully correct business/entity/location/raw bytes is
+    an integrity issue — the deterministic producer identity fails, so
+    supersession may not be silent."""
+    from sara.dossier.surface import build_business_dossier
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import canonical_json as rj, sha256_text
+    from sara.reviews.model import opaque_id as review_opaque_id
+
+    conn = prepared(tmp_path / "wrong-parent-id.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("r3", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
+         "{}", "/evidence/r3.jsonl", "complete", "2026-09-26T11:00:00+00:00"),
+    )
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    real_meta = source_evidence["metadata"]
+    raw = business["raw_json"]
+    import hashlib as _hl
+
+    raw_hash = _hl.sha256(raw.encode("utf-8")).hexdigest()
+    fake_meta = dict(real_meta)
+    fake_meta["legacy_run_id"] = "r3"
+    # A parent session whose run binding is consistent and whose metadata
+    # binds the CORRECT business/entity/location/raw bytes — but whose
+    # evidence id is NOT the deterministic producer id.
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_fake_r3_parent", None, "src_google_maps",
+         "sara.maps_backfill", "2", "{}", "z" * 64, "complete",
+         "2026-09-26T11:00:00+00:00", "2026-09-26T11:00:05+00:00",
+         None, "r3", 1, 0))
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
+        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("ev_arbitrary_id", "acq_fake_r3_parent", "src_google_maps",
+         "google_maps:legacy:1", "platform", "usable",
+         "2026-09-26T09:59:00+00:00", raw_hash, None,
+         json.dumps(fake_meta, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")),
+         "2026-09-26T09:59:00+00:00"))
+    cfg = json.loads(reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=0,
+        review_evidence_records=0,
+    ))
+    cfg["source_evidence_id"] = "ev_arbitrary_id"
+    cfg["extraction_outcome"] = "unavailable"
+    config = rj(cfg)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (review_opaque_id("acq", "retained-maps-reviews", "ev_arbitrary_id",
+                          cfg["source_location_id"], "2"),
+         cfg["source_location_id"],
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         "2026-09-26T12:00:00+00:00", "2026-09-26T12:00:05+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    dossier = build_business_dossier(conn, entity_id=entity)
+    assert dossier["customer_voice"]["review_evidence_unavailable"] == []
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "review_outcome_source_evidence_mismatch" in codes
+    conn.close()
+
+
 def test_reviews_cli_entity_id(tmp_path: Path, capsys) -> None:
     """F-04: the sara-reviews CLI accepts the entity-scoped executor target."""
     from sara.reviews import main as reviews_main

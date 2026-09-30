@@ -1308,7 +1308,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v12",
+         "acquisition-planner-v13",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1320,7 +1320,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v12",
+         "acquisition-planner-v13",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -1952,13 +1952,17 @@ def test_newer_snapshot_supersedes_unavailable_outcome(tmp_path: Path) -> None:
 
 
 def test_malformed_complete_marker_does_not_suppress_acquisition(tmp_path: Path) -> None:
-    """R11-01: a zero-output extraction_outcome="complete" marker naming
-    the current snapshot is NOT coverage — only sessions passing the
-    executor's full provenance contract suppress the real acquisition."""
+    """R11-01/R12-01: a zero-output extraction_outcome="complete" marker
+    naming the current snapshot at the DETERMINISTIC session id is not
+    coverage — and because it occupies the id the executor would use,
+    planning stops fail-closed and demands recovery instead of emitting
+    an unexecutable action."""
     from unittest.mock import patch as mock_patch
     from sara.dossier import assessment as assessment_module
     from sara.reviews import core as reviews_core
     from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    from sara.acquisition_planner import STOP_INVALID_REVIEW_STATE
 
     conn = prepared(tmp_path / "bad-marker.sqlite", reviews=[])
     entity = business_entity_id_for_maps_business(1)
@@ -1992,17 +1996,108 @@ def test_malformed_complete_marker_does_not_suppress_acquisition(tmp_path: Path)
          "2026-09-26T09:00:00+00:00", "2026-09-26T09:00:05+00:00",
          None, None, 0, 0))
     conn.commit()
-    # The marker projects nothing (outcome complete, zero output) and must
-    # not cover the snapshot either.
+    # The marker projects nothing, does not cover the snapshot, and —
+    # critically — squats on the deterministic id the executor derives,
+    # so a scheduled action would collide as incompatible provenance
+    # with no durable-failure path. The planner must stop fail-closed.
     with mock_patch.object(assessment_module, "derive_domain_assessments",
                            _reputation_only_deficient):
         persist_dossier_assessment(
             conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
         decision = plan_next_acquisition(conn, entity_id=entity,
                                          now="2026-09-26T12:30:00+00:00")
-    assert decision.action == "extract_retained_reviews"
-    assert decision.target_domain == "reputation"
-    assert decision.stop_reason is None
+    assert decision.action is None
+    assert decision.stop_reason == STOP_INVALID_REVIEW_STATE
+    assert decision.details["session_id"] == marker_id
+    assert "manual recovery" in decision.details["recovery"]
+    conn.close()
+
+
+def test_child_drift_at_deterministic_id_demands_recovery(tmp_path: Path) -> None:
+    """R12-02: a session with the RIGHT child counts but drifted content
+    fails the executor's byte-exact child contract — coverage is refused
+    and, at the deterministic id, planning stops and demands recovery
+    instead of emitting an action the executor would reject as drift."""
+    from unittest.mock import patch as mock_patch
+    from sara.acquisition_planner import STOP_INVALID_REVIEW_STATE
+    from sara.dossier import assessment as assessment_module
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    conn = prepared(tmp_path / "child-drift.sqlite", reviews=[REVIEW_SIMPLE])
+    entity = business_entity_id_for_maps_business(1)
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    raw = json.loads(business["raw_json"])
+    reviews, source_count = reviews_core.extract_reviews(raw)
+    assert len(reviews) == 1
+    config = reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=source_count,
+        review_evidence_records=len(reviews),
+    )
+    cfg = json.loads(config)
+    cfg["extraction_outcome"] = "complete"
+    config = json.dumps(cfg, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"))
+    session_id = review_opaque_id(
+        "acq", "retained-maps-reviews", cfg["source_evidence_id"],
+        cfg["source_location_id"], "2")
+    extracted_at = "2026-09-26T12:00:00+00:00"
+    rows = reviews_core._expected_review_rows(
+        session_id=session_id, source_evidence=source_evidence,
+        reviews=reviews, extracted_at=extracted_at, extractor_version="2")
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, cfg["source_location_id"], "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         extracted_at, extracted_at, None, None, len(rows), len(rows)))
+    for evidence, observation in rows:
+        conn.execute(
+            "INSERT INTO evidence_items("
+            "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+            "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(evidence[key] for key in (
+                "id", "acquisition_session_id", "source_id", "source_locator",
+                "source_role", "status", "retrieved_at", "published_at",
+                "language", "media_type", "content_sha256", "artifact_ref",
+                "metadata_json", "created_at")))
+        drifted = dict(observation)
+        # Same count, drifted bytes: the stored observation claims the
+        # legacy extractor version. Invisible to count checks and to the
+        # read model, but the executor's byte-exact replay comparison
+        # rejects it.
+        drifted["extractor_version"] = "1"
+        conn.execute(
+            "INSERT INTO observations("
+            "id,subject_id,predicate,evidence_id,value_json,normalized_value_json,value_hash,"
+            "observation_kind,observed_at,extracted_at,extraction_method,extractor_name,"
+            "extractor_version,confidence,created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(drifted[key] for key in (
+                "id", "subject_id", "predicate", "evidence_id", "value_json",
+                "normalized_value_json", "value_hash", "observation_kind",
+                "observed_at", "extracted_at", "extraction_method",
+                "extractor_name", "extractor_version", "confidence",
+                "created_at")))
+    conn.commit()
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action is None
+    assert decision.stop_reason == STOP_INVALID_REVIEW_STATE
+    assert decision.details["session_id"] == session_id
     conn.close()
 
 

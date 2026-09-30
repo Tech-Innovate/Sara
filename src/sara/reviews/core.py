@@ -391,6 +391,48 @@ def _stats(
     )
 
 
+def _compare_stored_children(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    expected_rows: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> None:
+    """Raise ReviewIntelligenceError when stored evidence or observation
+    rows drift from the executor's expected bytes.
+
+    Shared by replay verification (_verify_existing) and planner-side
+    coverage verification (review_session_mined_evidence, R12-02) so
+    both enforce the identical child provenance contract: same counts
+    with drifted content is drift, never coverage.
+    """
+    evidence_rows = conn.execute(
+        "SELECT id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at "
+        "FROM evidence_items WHERE acquisition_session_id=? ORDER BY id",
+        (session_id,),
+    ).fetchall()
+    actual_evidence = [dict(row) for row in evidence_rows]
+    expected_evidence = sorted((item[0] for item in expected_rows), key=lambda item: item["id"])
+    if actual_evidence != expected_evidence:
+        raise ReviewIntelligenceError(
+            f"existing review extraction session {session_id} evidence has drifted"
+        )
+    observation_rows = conn.execute(
+        "SELECT o.id,o.subject_id,o.predicate,o.evidence_id,o.value_json,o.normalized_value_json,"
+        "o.value_hash,o.observation_kind,o.observed_at,o.extracted_at,o.extraction_method,"
+        "o.extractor_name,o.extractor_version,o.confidence,o.created_at "
+        "FROM observations o JOIN evidence_items e ON e.id=o.evidence_id "
+        "WHERE e.acquisition_session_id=? ORDER BY o.id",
+        (session_id,),
+    ).fetchall()
+    actual_observations = [dict(row) for row in observation_rows]
+    expected_observations = sorted((item[1] for item in expected_rows), key=lambda item: item["id"])
+    if actual_observations != expected_observations:
+        raise ReviewIntelligenceError(
+            f"existing review extraction session {session_id} observations have drifted"
+        )
+
+
 def _verify_existing(
     conn: sqlite3.Connection,
     *,
@@ -443,32 +485,8 @@ def _verify_existing(
         extracted_at=extracted_at,
         extractor_version=collector_version,
     )
-    evidence_rows = conn.execute(
-        "SELECT id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
-        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at "
-        "FROM evidence_items WHERE acquisition_session_id=? ORDER BY id",
-        (session_id,),
-    ).fetchall()
-    actual_evidence = [dict(row) for row in evidence_rows]
-    expected_evidence = sorted((item[0] for item in expected_rows), key=lambda item: item["id"])
-    if actual_evidence != expected_evidence:
-        raise ReviewIntelligenceError(
-            f"existing review extraction session {session_id} evidence has drifted"
-        )
-    observation_rows = conn.execute(
-        "SELECT o.id,o.subject_id,o.predicate,o.evidence_id,o.value_json,o.normalized_value_json,"
-        "o.value_hash,o.observation_kind,o.observed_at,o.extracted_at,o.extraction_method,"
-        "o.extractor_name,o.extractor_version,o.confidence,o.created_at "
-        "FROM observations o JOIN evidence_items e ON e.id=o.evidence_id "
-        "WHERE e.acquisition_session_id=? ORDER BY o.id",
-        (session_id,),
-    ).fetchall()
-    actual_observations = [dict(row) for row in observation_rows]
-    expected_observations = sorted((item[1] for item in expected_rows), key=lambda item: item["id"])
-    if actual_observations != expected_observations:
-        raise ReviewIntelligenceError(
-            f"existing review extraction session {session_id} observations have drifted"
-        )
+    _compare_stored_children(
+        conn, session_id=session_id, expected_rows=expected_rows)
     return _stats(
         session_id=session_id,
         business_id=business_id,
@@ -1230,6 +1248,66 @@ def review_session_mined_evidence(
         return None  # zero-output complete is semantically invalid
     if outcome == "unavailable" and declared != 0:
         return None
+    # R12-02: the executor's FULL child provenance contract — rebuild
+    # the expected evidence/observation rows from the parent snapshot
+    # and compare the stored rows byte for byte, exactly as replay
+    # verification does. Same counts with drifted content are not
+    # coverage.
+    parent_row = conn.execute(
+        "SELECT content_sha256,retrieved_at,source_locator,artifact_ref,"
+        "metadata_json FROM evidence_items WHERE id=?",
+        (config["source_evidence_id"],),
+    ).fetchone()
+    if parent_row is None:
+        return None
+    (parent_sha, parent_retrieved, parent_locator,
+     parent_artifact_ref, parent_metadata_json) = parent_row
+    if str(parent_sha) != config["source_content_sha256"]:
+        return None
+    if not isinstance(parent_retrieved, str) or not parent_retrieved:
+        return None
+    try:
+        parent_metadata = json.loads(str(parent_metadata_json))
+        if not isinstance(parent_metadata, dict):
+            raise ValueError("metadata is not a JSON object")
+    except ValueError:
+        return None
+    raw_snapshot = parent_metadata.get("raw_json")
+    if not isinstance(raw_snapshot, str) or not raw_snapshot:
+        return None
+    if sha256_text(raw_snapshot) != str(parent_sha):
+        return None
+    try:
+        reviews, source_review_records = extract_reviews(
+            json.loads(raw_snapshot))
+    except (ReviewIntelligenceError, ValueError):
+        return None
+    if source_review_records != int(config["source_review_records"]):
+        return None
+    if len(reviews) != declared:
+        return None
+    frozen_source_evidence = {
+        "id": config["source_evidence_id"],
+        "content_sha256": config["source_content_sha256"],
+        "frozen_entity_id": config["source_business_entity_id"],
+        "frozen_location_id": config["source_location_id"],
+        "retrieved_at": parent_retrieved,
+        "source_locator": parent_locator,
+        "artifact_ref": parent_artifact_ref,
+        "metadata": parent_metadata,
+    }
+    expected_rows = _expected_review_rows(
+        session_id=session_id,
+        source_evidence=frozen_source_evidence,
+        reviews=reviews,
+        extracted_at=str(session["finished_at"]),
+        extractor_version=version,
+    )
+    try:
+        _compare_stored_children(
+            conn, session_id=session_id, expected_rows=expected_rows)
+    except ReviewIntelligenceError:
+        return None
     return config["source_evidence_id"]
 
 
@@ -1252,11 +1330,18 @@ def _validate_frozen_maps_parent(
     business (legacy) or entity/location (sync) identity; the frozen
     content hash agreeing with the metadata's raw snapshot; and a
     parseable retrieval timestamp.
+
+    R12-03: the validator also reproduces the Maps producer's
+    identity — the parent session's source binding and run binding,
+    the legacy canonical-key binding, and the DETERMINISTIC evidence
+    id (backfill id over business+content hash; sync id over
+    business+run+content hash) — before supersession may be silent.
     """
     row = conn.execute(
         "SELECT e.content_sha256,e.source_id,e.source_role,e.status,"
         "e.retrieved_at,a.collector_name,a.collector_version,"
-        "a.status AS session_status,e.metadata_json "
+        "a.status AS session_status,a.source_id AS parent_source_id,"
+        "a.legacy_run_id AS parent_legacy_run_id,e.metadata_json "
         "FROM evidence_items e "
         "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
         "WHERE e.id=?",
@@ -1265,8 +1350,12 @@ def _validate_frozen_maps_parent(
     if row is None:
         return None
     (content_sha, source_id, role, status, retrieved_at,
-     collector, collector_version, session_status, metadata_json) = row
+     collector, collector_version, session_status, parent_source_id,
+     parent_legacy_run_id, metadata_json) = row
     if str(source_id) != mb.GOOGLE_MAPS_SOURCE_ID:
+        return None
+    # R12-03: the parent acquisition session's own source binding.
+    if str(parent_source_id) != mb.GOOGLE_MAPS_SOURCE_ID:
         return None
     if str(role) != "platform" or str(status) != "usable":
         return None
@@ -1300,6 +1389,12 @@ def _validate_frozen_maps_parent(
         return None
     if sha256_text(raw_snapshot) != str(content_sha):
         return None
+    # R12-03: the parent session's run binding must agree with the
+    # snapshot metadata's run before any producer identity check.
+    if not parent_legacy_run_id:
+        return None
+    if str(metadata.get("legacy_run_id") or "") != str(parent_legacy_run_id):
+        return None
     if kind == "legacy_maps_business_snapshot":
         business_id = int(config["source_maps_business_id"])
         if metadata.get("legacy_business_id") != business_id:
@@ -1310,14 +1405,40 @@ def _validate_frozen_maps_parent(
         ):
             return None
         if (
-            config["source_location_id"]
+                config["source_location_id"]
             != mb.location_id_for_maps_business(business_id)
+        ):
+            return None
+        # R12-03: reproduce the producer's deterministic evidence id
+        # and the legacy canonical-key binding — a fabricated row
+        # under an arbitrary id with otherwise plausible metadata is
+        # not a legitimate historical parent.
+        business_row = conn.execute(
+            "SELECT canonical_key FROM businesses WHERE id=?",
+            (business_id,),
+        ).fetchone()
+        if business_row is None:
+            return None
+        if metadata.get("legacy_canonical_key") != business_row[0]:
+            return None
+        if (
+            config["source_evidence_id"]
+            != mb._evidence_id(business_id, str(content_sha))
         ):
             return None
     else:
         if metadata.get("sync_entity_id") != config["source_business_entity_id"]:
             return None
         if metadata.get("sync_location_id") != config["source_location_id"]:
+            return None
+        if (
+            config["source_evidence_id"]
+            != ms._sync_evidence_id(
+                int(config["source_maps_business_id"]),
+                str(parent_legacy_run_id),
+                str(content_sha),
+            )
+        ):
             return None
     if not isinstance(retrieved_at, str) or not retrieved_at:
         return None
