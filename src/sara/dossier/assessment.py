@@ -451,6 +451,18 @@ def _chronology_inputs(
             outcome.get("finished_at"),
             f"review outcome {outcome['session_id']} finished_at",
         )
+    journey_chronology_seen: set[tuple[str, str]] = set()
+    for stage in (dossier.get("customer_journey") or {}).get("stages", ()):
+        for entry in stage.get("evidence", ()):
+            key = (str(entry.get("evidence_id")), str(entry.get("retrieved_at")))
+            if key in journey_chronology_seen:
+                continue
+            journey_chronology_seen.add(key)
+            add(
+                entry.get("retrieved_at"),
+                f"customer journey {stage.get('stage')} evidence "
+                f"{entry.get('evidence_id')} retrieved_at",
+            )
     for review in dossier["customer_voice"]["reviews"]:
         add(review.get("observed_at"), f"review {review['observation_id']} observed_at")
         add(review.get("extracted_at"), f"review {review['observation_id']} extracted_at")
@@ -620,6 +632,56 @@ def understanding_state_fingerprint(
         return {"unprovable": True, "error": str(exc)}
 
 
+def _customer_journey_signature(journey: dict[str, Any]) -> dict[str, Any]:
+    """Bounded sealing view of the journey reconstruction: stage states,
+    evidence-backed channels and hand-offs, evidence identities, and the
+    fixed missing-knowledge vocabulary. Every material journey input is
+    sealed, so changed channel/page evidence invalidates the assessment."""
+    return {
+        "reconstruction_version": journey.get("reconstruction_version"),
+        "stages": [
+            {
+                "stage": stage.get("stage"),
+                "evidence_state": stage.get("evidence_state"),
+                "channels": [
+                    {
+                        "channel_type": channel.get("channel_type"),
+                        "normalized_identifier": channel.get(
+                            "normalized_identifier"
+                        ),
+                        "evidence_id": channel.get("evidence_id"),
+                    }
+                    for channel in stage.get("channels", ())
+                ],
+                "handoffs": [
+                    {
+                        "from": handoff.get("from"),
+                        "to": handoff.get("to"),
+                        "evidence_id": handoff.get("evidence_id"),
+                    }
+                    for handoff in stage.get("handoffs", ())
+                ],
+                "evidence": sorted(
+                    str(entry.get("evidence_id"))
+                    for entry in stage.get("evidence", ())
+                ),
+                "missing_knowledge": list(stage.get("missing_knowledge", ())),
+            }
+            for stage in journey.get("stages", ())
+        ],
+        "handoffs": [
+            {
+                "from": handoff.get("from"),
+                "to": handoff.get("to"),
+                "evidence_id": handoff.get("evidence_id"),
+            }
+            for handoff in journey.get("handoffs", ())
+        ],
+        "observed_stage_count": journey.get("observed_stage_count"),
+        "current_stage_count": journey.get("current_stage_count"),
+    }
+
+
 def _input_signature(
     dossier: dict[str, Any],
     domains: list[dict[str, Any]],
@@ -682,6 +744,9 @@ def _input_signature(
             }
             for review in dossier["customer_voice"]["reviews"]
         ],
+        "customer_journey": _customer_journey_signature(
+            dossier.get("customer_journey") or {}
+        ),
         "customer_voice_unavailable": [
             {
                 "session_id": outcome["session_id"],

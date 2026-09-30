@@ -212,6 +212,23 @@ def test_build_business_dossier_surfaces_independent_integrity_findings(monkeypa
     monkeypatch.setattr(surface, "persisted_assessment", lambda *_args: assessment)
     monkeypatch.setattr(surface, "maps_businesses", lambda *_args: [])
     monkeypatch.setattr(surface, "preview_domains", lambda *_args: [])
+    # PR #22: the journey reconstruction is another read collaborator; this
+    # unit test exercises surface's integrity plumbing with every read
+    # stubbed and a bare in-memory connection, so stub it the same way.
+    monkeypatch.setattr(
+        surface,
+        "reconstruct_customer_journey",
+        lambda *_args, **_kwargs: (
+            {
+                "reconstruction_version": "observable-customer-journey-v1",
+                "stages": [],
+                "handoffs": [],
+                "observed_stage_count": 0,
+                "current_stage_count": 0,
+            },
+            [],
+        ),
+    )
 
     conn = sqlite3.connect(":memory:")
     dossier = surface.build_business_dossier(conn, entity_id="entity")

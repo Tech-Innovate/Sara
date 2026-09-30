@@ -20,6 +20,7 @@ from .core import (
     resolve_selection,
     verify_schema,
 )
+from .customer_journey import reconstruct_customer_journey
 from .customer_voice import (
     customer_review_observations,
     review_evidence_unavailable_outcomes,
@@ -84,12 +85,22 @@ def build_business_dossier(
     unavailable_outcomes, unavailable_issues = (
         review_evidence_unavailable_outcomes(conn, current_location_ids)
     )
+    customer_journey_doc, customer_journey_issues = (
+        reconstruct_customer_journey(
+            conn,
+            entity_id=canonical_entity_id,
+            facts=facts,
+            evidence=evidence,
+            evaluated_at=evaluation.isoformat(),
+        )
+    )
     integrity_issues = sort_integrity_issues(
         [
             *integrity_issues,
             *additional_fact_integrity(facts),
             *customer_voice_issues,
             *unavailable_issues,
+            *customer_journey_issues,
         ]
     )
     unknowns = controlled_unknowns(conn, canonical_entity_id, current_location_ids, facts)
@@ -120,6 +131,7 @@ def build_business_dossier(
             "reviews": customer_voice,
             "review_evidence_unavailable": unavailable_outcomes,
         },
+        "customer_journey": customer_journey_doc,
         "unknowns": unknowns,
         "integrity_issues": integrity_issues,
         "dossier_status": {

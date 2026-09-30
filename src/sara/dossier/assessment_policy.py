@@ -6,7 +6,11 @@ from typing import Any
 from ..understanding_vocabulary import DOSSIER_DOMAIN_SEED_V1
 from .core import parse_timestamp
 
-DERIVATION_VERSION = "dossier-assessment-v1"
+# v2: Customer Journey moved from permanent-partial to policy over the
+# deterministic observable-journey reconstruction (identity-affecting:
+# the reason objects seal this version, so old persisted assessments
+# cannot masquerade as the new interpretation).
+DERIVATION_VERSION = "dossier-assessment-v2"
 _VALUE_STATUSES = frozenset({"confirmed", "single_source"})
 _CAPABILITY_PREDICATES = (
     "capability.online_booking",
@@ -552,34 +556,87 @@ def _reputation_domain(
 
 
 def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    facts, unknowns, _fresh = _domain_context(dossier, "customer_journey")
-    supporting_predicates = {
-        "business.model.transaction_type",
-        "location.phone",
-        "business.website.official",
-        *_CAPABILITY_PREDICATES,
+    """Policy over the deterministic observable-journey reconstruction.
+
+    The reconstruction is the understanding layer; this policy only maps
+    it to a sufficiency state and never judges journey quality. Hard
+    invariants carried by the reconstruction: ordering never implies
+    payment, booking/order never implies receipt, and reviews never
+    establish operational stages. No `strong` or `not_applicable` is
+    emitted in v2 — no evidence-backed definition exists for either.
+    """
+    journey = dossier.get("customer_journey") or {}
+    stages = {
+        str(stage.get("stage")): str(stage.get("evidence_state"))
+        for stage in journey.get("stages", ())
     }
-    supporting = [
-        fact
-        for fact in dossier["facts"]
-        if fact["predicate"] in supporting_predicates
-        and (_fresh_value(fact) or _absence_inspection_current(fact))
-    ]
-    if any(fact["status"] == "conflicted" for fact in facts):
+    facts, unknowns, _fresh = _domain_context(dossier, "customer_journey")
+    conflicted_stages = sorted(
+        stage for stage, state in stages.items() if state == "conflicted"
+    )
+    if conflicted_stages:
         return "conflicted", _reason(
-            code="customer_journey_fact_conflict", facts=facts, unknowns=unknowns
-        )
-    if facts or supporting:
-        return "partial", _reason(
-            code="customer_interaction_evidence_exists_without_stage_reconstruction_contract",
+            code="customer_journey_stage_conflict",
             facts=facts,
             unknowns=unknowns,
-            extra={"supporting_fact_ids": sorted(str(fact["id"]) for fact in supporting)},
+            extra={"conflicted_stages": conflicted_stages},
         )
-    return "not_started", _reason(
-        code="no_customer_journey_reconstruction_evidence",
+    current = {stage for stage, state in stages.items() if state == "observed"}
+    ever_observed = {
+        stage for stage, state in stages.items()
+        if state in ("observed", "stale")
+    }
+    if not ever_observed:
+        return "not_started", _reason(
+            code="no_customer_journey_reconstruction_evidence",
+            facts=facts,
+            unknowns=unknowns,
+        )
+    if not current:
+        return "stale", _reason(
+            code="customer_journey_evidence_stale",
+            facts=facts,
+            unknowns=unknowns,
+            extra={"observed_stage_count": journey.get("observed_stage_count")},
+        )
+    handoffs = journey.get("handoffs") or []
+    external_action_handoff = any(
+        str(handoff.get("from")) == "official_website"
+        and str(handoff.get("to")) in ("booking", "ordering")
+        for handoff in handoffs
+    )
+    unmet = [
+        label
+        for label, ok in (
+            ("entry_or_evaluation_stage", bool(current & {"discover", "evaluate"})),
+            ("customer_action_stage", bool(current & {"contact", "book_order"})),
+            (
+                "later_stage_or_action_handoff",
+                bool(current & {"pay", "receive", "support", "return"})
+                or external_action_handoff,
+            ),
+        )
+        if not ok
+    ]
+    if not unmet:
+        return "sufficient", _reason(
+            code="observable_journey_stages_reconstructed",
+            facts=facts,
+            unknowns=unknowns,
+            extra={
+                "current_stages": sorted(current),
+                "reconstruction_version": journey.get("reconstruction_version"),
+            },
+        )
+    return "partial", _reason(
+        code="journey_partially_reconstructed",
         facts=facts,
         unknowns=unknowns,
+        extra={
+            "current_stages": sorted(current),
+            "unmet_conditions": unmet,
+            "reconstruction_version": journey.get("reconstruction_version"),
+        },
     )
 
 
