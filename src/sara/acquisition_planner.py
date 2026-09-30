@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v11): for the SAME entity, the SAME sealed
+Determinism contract (v12): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -53,7 +53,11 @@ from typing import Any
 # current_maps_evidence_for_business), so run-bound unchanged-content
 # re-syncs legitimately re-arm instead of reading as ambiguity, and
 # only COMPLETE review sessions count as coverage.
-PLANNER_POLICY_VERSION = "acquisition-planner-v11"
+# v12: coverage additionally requires each complete review session
+# to pass the executor's FULL provenance contract
+# (review_session_mined_evidence) — a malformed zero-output marker
+# never suppresses the real acquisition.
+PLANNER_POLICY_VERSION = "acquisition-planner-v12"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -401,8 +405,16 @@ def _review_extraction_pending(
     (current last_run_id). An unchanged-content re-sync therefore
     legitimately resolves to the NEW sync evidence and re-arms the
     action instead of reading as ambiguity, and only the snapshot the
-    executor would actually mine counts. Coverage requires COMPLETE
-    review sessions naming that exact source_evidence_id.
+    executor would actually mine counts.
+
+    v12 (R11-01): coverage requires complete review sessions that pass
+    the executor's FULL session provenance contract
+    (review_session_mined_evidence: supported version, source
+    binding, canonical config bytes and hash, deterministic id, target
+    binding, declared counts matching stored AND actual output, and
+    output semantics consistent with the declared outcome). Sessions
+    failing the contract are not coverage: a malformed zero-output
+    marker never suppresses the real acquisition.
 
     True  — at least one current snapshot is unmined.
     False — every current snapshot is mined (or none exists).
@@ -442,24 +454,30 @@ def _review_extraction_pending(
     if not snapshot_ids:
         return False  # no current retained snapshot: nothing to mine
 
+    from .reviews.core import review_session_mined_evidence
+
     session_rows = conn.execute(
-        f"SELECT config_json FROM acquisition_sessions "
+        f"SELECT id,target_subject_id,source_id,collector_name,"
+        f"collector_version,config_json,config_hash,status,finished_at,"
+        f"evidence_count,observation_count "
+        f"FROM acquisition_sessions "
         f"WHERE collector_name=? AND status='complete' "
         f"AND target_subject_id IN ({marks})",
         (COLLECTOR_NAME, *locations),
     ).fetchall()
+    session_keys = (
+        "id", "target_subject_id", "source_id", "collector_name",
+        "collector_version", "config_json", "config_hash", "status",
+        "finished_at", "evidence_count", "observation_count",
+    )
     mined_ids: set[str] = set()
-    for (config_json,) in session_rows:
-        try:
-            config = json.loads(str(config_json))
-            if not isinstance(config, dict):
-                raise ValueError("config is not a JSON object")
-        except ValueError:
-            return None  # unprovable coverage: fail closed
-        evidence_id = config.get("source_evidence_id")
-        if not isinstance(evidence_id, str) or not evidence_id:
-            return None  # coverage target unprovable: fail closed
-        mined_ids.add(evidence_id)
+    for row in session_rows:
+        session = {
+            key: row[index] for index, key in enumerate(session_keys)
+        }
+        evidence_id = review_session_mined_evidence(conn, session)
+        if evidence_id is not None:
+            mined_ids.add(evidence_id)
 
     return bool(snapshot_ids - mined_ids)
 

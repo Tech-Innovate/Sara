@@ -940,22 +940,15 @@ _LEGACY_V1_CONFIG_KEYS = frozenset({
 })
 
 
-def _is_strict_zero_review_config(config: dict[str, Any]) -> bool:
-    """The EXACT canonical zero-review config shape (R9-03/R10-03).
-
-    Both the rigorous v1 inference and the explicit v2 outcome share
-    this shape: a v2 zero-review config is the legacy shape plus the
-    frozen extraction_outcome key.
-    """
+def _is_canonical_review_config(config: dict[str, Any]) -> bool:
+    """The canonical review-config shape: exact key set, typed identity
+    fields, and non-negative declared counts with deduplicated evidence
+    never exceeding source records (R11-01)."""
     if set(config) != _LEGACY_V1_CONFIG_KEYS:
         return False
     if config["input_kind"] != "retained_maps_review_snapshot":
         return False
     if config["review_array_fields"] != list(REVIEW_ARRAY_FIELDS):
-        return False
-    if config["source_review_records"] != 0:
-        return False
-    if config["review_evidence_records"] != 0:
         return False
     business_id = config["source_maps_business_id"]
     if isinstance(business_id, bool) or not isinstance(business_id, int):
@@ -969,7 +962,27 @@ def _is_strict_zero_review_config(config: dict[str, Any]) -> bool:
         value = config[key]
         if not isinstance(value, str) or not value:
             return False
+    for key in ("source_review_records", "review_evidence_records"):
+        value = config[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+    if config["review_evidence_records"] > config["source_review_records"]:
+        return False
     return True
+
+
+def _is_strict_zero_review_config(config: dict[str, Any]) -> bool:
+    """The canonical config shape with zero declared review records.
+
+    Both the rigorous v1 inference and the explicit v2 outcome share
+    this shape: a v2 zero-review config is the legacy shape plus the
+    frozen extraction_outcome key.
+    """
+    return (
+        _is_canonical_review_config(config)
+        and config["source_review_records"] == 0
+        and config["review_evidence_records"] == 0
+    )
 
 
 def current_maps_evidence_for_business(
@@ -1050,6 +1063,11 @@ def strict_unavailable_outcome_session(
         return invalid
     if version not in _SUPPORTED_REVIEW_VERSIONS:
         return invalid
+    # R11-02: the review session's own source binding — the executor
+    # replay contract expects src_google_maps; a deterministic-looking
+    # session under any other registered source is invalid.
+    if str(session.get("source_id")) != mb.GOOGLE_MAPS_SOURCE_ID:
+        return invalid
     config_json = str(session["config_json"])
     if canonical_json(config) != config_json:
         return invalid
@@ -1088,33 +1106,30 @@ def strict_unavailable_outcome_session(
         _validated_timestamp(finished_at, field="review outcome finished_at")
     except ReviewIntelligenceError:
         return invalid
-    # R10-04: the outcome binds to the business's CURRENT snapshot.
-    # A fabricated parent reference is corruption; a real reference
-    # that is simply no longer current is ordinary supersession — the
-    # outcome ceases to satisfy reputation silently so the lifecycle
-    # can proceed to re-mine the newer snapshot.
+    # R11-03: validate the frozen HISTORICAL parent independently
+    # FIRST — only a legitimate old parent may later be classified as
+    # ordinary supersession. An existing but malformed historical
+    # parent is an integrity issue, never hidden lifecycle.
     referenced = conn.execute(
         "SELECT 1 FROM evidence_items WHERE id=?",
         (config["source_evidence_id"],),
     ).fetchone()
     if referenced is None:
         return invalid  # fabricated parent reference
+    frozen_parent = _validate_frozen_maps_parent(conn, config)
+    if frozen_parent is None:
+        return mismatch  # existing historical parent fails provenance
+    # R10-04: the outcome binds to the business's CURRENT snapshot.
     try:
         parent = current_maps_evidence_for_business(
             conn, business_id=int(config["source_maps_business_id"]))
     except ReviewIntelligenceError:
         return mismatch
     if parent is None or str(parent["id"]) != config["source_evidence_id"]:
-        return (None, None)  # superseded: drop, never flag
-    if str(parent["content_sha256"]) != config["source_content_sha256"]:
-        return mismatch
-    if str(parent["frozen_entity_id"]) != config["source_business_entity_id"]:
-        return mismatch
-    if str(parent["frozen_location_id"]) != config["source_location_id"]:
-        return mismatch
-    retrieved = parent["retrieved_at"]
-    if not isinstance(retrieved, str) or not retrieved:
-        return mismatch
+        # A VALID old parent that is simply no longer current: ordinary
+        # supersession — drop silently so the lifecycle can proceed.
+        return (None, None)
+    retrieved = frozen_parent["retrieved_at"]
     return (
         {
             "session_id": session_id,
@@ -1128,6 +1143,189 @@ def strict_unavailable_outcome_session(
         },
         None,
     )
+
+
+def review_session_mined_evidence(
+    conn: sqlite3.Connection, session: dict[str, Any]
+) -> str | None:
+    """The exact evidence id a COMPLETE review session legitimately
+    mined (R11-01), or None when the session fails the executor's
+    provenance contract.
+
+    The planner's coverage check uses ONLY verified sessions: a
+    malformed zero-output marker must never suppress the real
+    acquisition. Contract: review collector name and a supported
+    version; source binding to Google Maps; canonical config bytes
+    and hash; the deterministic review-session id; the session target
+    equal to the frozen source Location; declared counts matching the
+    stored counters AND the actual evidence/observation rows; and
+    output semantics consistent with the declared outcome (zero
+    output is valid only as unavailable).
+    """
+    session_id = str(session["id"])
+    if str(session["collector_name"]) != COLLECTOR_NAME:
+        return None
+    version = str(session["collector_version"])
+    if version not in _SUPPORTED_REVIEW_VERSIONS:
+        return None
+    if str(session["source_id"]) != mb.GOOGLE_MAPS_SOURCE_ID:
+        return None
+    try:
+        config = json.loads(str(session["config_json"]))
+        if not isinstance(config, dict):
+            raise ValueError("config is not a JSON object")
+    except ValueError:
+        return None
+    outcome = config.get("extraction_outcome")
+    if outcome is None:
+        if version != "1":
+            return None
+        stripped = config
+    elif outcome in ("complete", "unavailable"):
+        if version != "2":
+            return None
+        stripped = {
+            key: value for key, value in config.items()
+            if key != "extraction_outcome"
+        }
+    else:
+        return None
+    if not _is_canonical_review_config(stripped):
+        return None
+    config_json = str(session["config_json"])
+    if canonical_json(config) != config_json:
+        return None
+    if sha256_text(config_json) != str(session["config_hash"]):
+        return None
+    expected_id = opaque_id(
+        "acq",
+        "retained-maps-reviews",
+        config["source_evidence_id"],
+        config["source_location_id"],
+        version,
+    )
+    if session_id != expected_id:
+        return None
+    if str(session["target_subject_id"]) != config["source_location_id"]:
+        return None
+    declared = int(config["review_evidence_records"])
+    if int(session["evidence_count"] or 0) != declared:
+        return None
+    if int(session["observation_count"] or 0) != declared:
+        return None
+    actual_evidence = int(conn.execute(
+        "SELECT COUNT(*) FROM evidence_items "
+        "WHERE acquisition_session_id=?", (session_id,)
+    ).fetchone()[0])
+    if actual_evidence != declared:
+        return None
+    actual_observations = int(conn.execute(
+        "SELECT COUNT(*) FROM observations o "
+        "JOIN evidence_items e ON e.id=o.evidence_id "
+        "WHERE e.acquisition_session_id=?", (session_id,)
+    ).fetchone()[0])
+    if actual_observations != declared:
+        return None
+    if outcome == "complete" and declared == 0:
+        return None  # zero-output complete is semantically invalid
+    if outcome == "unavailable" and declared != 0:
+        return None
+    return config["source_evidence_id"]
+
+
+_MAPS_PARENT_KINDS = {
+    "sara.maps_backfill": "legacy_maps_business_snapshot",
+    "sara.maps_sync": "maps_sync_snapshot",
+}
+
+
+def _validate_frozen_maps_parent(
+    conn: sqlite3.Connection, config: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Validate the config's frozen HISTORICAL Maps parent on its own
+    terms (R11-03), independent of any current business state.
+
+    Returns the validated parent facts (retrieved_at) or None. The
+    contract: the referenced evidence exists; Google Maps source,
+    platform role, usable status; a complete Maps collector session
+    of the expected version; snapshot metadata matching the frozen
+    business (legacy) or entity/location (sync) identity; the frozen
+    content hash agreeing with the metadata's raw snapshot; and a
+    parseable retrieval timestamp.
+    """
+    row = conn.execute(
+        "SELECT e.content_sha256,e.source_id,e.source_role,e.status,"
+        "e.retrieved_at,a.collector_name,a.collector_version,"
+        "a.status AS session_status,e.metadata_json "
+        "FROM evidence_items e "
+        "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+        "WHERE e.id=?",
+        (config["source_evidence_id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    (content_sha, source_id, role, status, retrieved_at,
+     collector, collector_version, session_status, metadata_json) = row
+    if str(source_id) != mb.GOOGLE_MAPS_SOURCE_ID:
+        return None
+    if str(role) != "platform" or str(status) != "usable":
+        return None
+    if str(session_status) != "complete":
+        return None
+    if str(content_sha) != config["source_content_sha256"]:
+        return None
+    kind = _MAPS_PARENT_KINDS.get(str(collector))
+    if kind is None:
+        return None
+    try:
+        metadata = json.loads(str(metadata_json))
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata is not a JSON object")
+    except ValueError:
+        return None
+    if metadata.get("import_kind") != kind:
+        return None
+    from ..maps_backfill import BACKFILL_VERSION
+    from ..maps_sync import SYNC_VERSION
+
+    expected_version = (
+        BACKFILL_VERSION
+        if str(collector) == "sara.maps_backfill"
+        else SYNC_VERSION
+    )
+    if str(collector_version) != str(expected_version):
+        return None
+    raw_snapshot = metadata.get("raw_json")
+    if not isinstance(raw_snapshot, str) or not raw_snapshot:
+        return None
+    if sha256_text(raw_snapshot) != str(content_sha):
+        return None
+    if kind == "legacy_maps_business_snapshot":
+        business_id = int(config["source_maps_business_id"])
+        if metadata.get("legacy_business_id") != business_id:
+            return None
+        if (
+                config["source_business_entity_id"]
+            != mb.business_entity_id_for_maps_business(business_id)
+        ):
+            return None
+        if (
+            config["source_location_id"]
+            != mb.location_id_for_maps_business(business_id)
+        ):
+            return None
+    else:
+        if metadata.get("sync_entity_id") != config["source_business_entity_id"]:
+            return None
+        if metadata.get("sync_location_id") != config["source_location_id"]:
+            return None
+    if not isinstance(retrieved_at, str) or not retrieved_at:
+        return None
+    try:
+        _validated_timestamp(retrieved_at, field="Maps parent retrieved_at")
+    except ReviewIntelligenceError:
+        return None
+    return {"retrieved_at": str(retrieved_at)}
 
 
 def _positive_int(value: str) -> int:

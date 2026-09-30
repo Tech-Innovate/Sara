@@ -1308,7 +1308,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v11",
+         "acquisition-planner-v12",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1320,7 +1320,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v11",
+         "acquisition-planner-v12",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -1948,6 +1948,61 @@ def test_newer_snapshot_supersedes_unavailable_outcome(tmp_path: Path) -> None:
     assert after.action is None
     assert after.stop_reason == STOP_UNSUPPORTED
     assert "extract_retained_reviews" in after.details["actions_not_applicable"]
+    conn.close()
+
+
+def test_malformed_complete_marker_does_not_suppress_acquisition(tmp_path: Path) -> None:
+    """R11-01: a zero-output extraction_outcome="complete" marker naming
+    the current snapshot is NOT coverage — only sessions passing the
+    executor's full provenance contract suppress the real acquisition."""
+    from unittest.mock import patch as mock_patch
+    from sara.dossier import assessment as assessment_module
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    conn = prepared(tmp_path / "bad-marker.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    location = location_id_for_maps_business(1)
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    cfg = json.loads(reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=0,
+        review_evidence_records=0,
+    ))
+    cfg["extraction_outcome"] = "complete"  # zero output, complete claim
+    config = json.dumps(cfg, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"))
+    marker_id = review_opaque_id(
+        "acq", "retained-maps-reviews", source_evidence["id"],
+        str(source_evidence["frozen_location_id"]), "2")
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (marker_id, str(source_evidence["frozen_location_id"]),
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         # Pre-watermark timestamps: a terminal session with no dossier
+         # footprint must not trip assessment staleness.
+         "2026-09-26T09:00:00+00:00", "2026-09-26T09:00:05+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    # The marker projects nothing (outcome complete, zero output) and must
+    # not cover the snapshot either.
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action == "extract_retained_reviews"
+    assert decision.target_domain == "reputation"
+    assert decision.stop_reason is None
     conn.close()
 
 

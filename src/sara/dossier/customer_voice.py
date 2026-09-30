@@ -525,9 +525,9 @@ def review_evidence_unavailable_outcomes(
         return [], []
     placeholders = ",".join("?" for _ in source_ids)
     cursor = conn.execute(
-        "SELECT id,target_subject_id,collector_name,collector_version,"
-        "config_json,config_hash,status,finished_at,evidence_count,"
-        "observation_count "
+        "SELECT id,target_subject_id,source_id,collector_name,"
+        "collector_version,config_json,config_hash,status,finished_at,"
+        "evidence_count,observation_count "
         "FROM acquisition_sessions "
         f"WHERE collector_name=? AND target_subject_id IN ({placeholders}) "
         "AND status='complete' ORDER BY finished_at,id",
