@@ -7,9 +7,10 @@ over assessment state, and the only persisted output is the decision
 record itself.
 
 Determinism contract (v6): for the SAME entity, the SAME sealed
-assessment, the SAME session-history snapshot, and the SAME decision
-ceiling, the same policy version yields the same decision id and the
-same chosen action or stop. The session-history snapshot (which embeds
+assessment, the SAME session-history snapshot, the SAME
+Understanding-state fingerprint, and the SAME decision ceiling, the
+same policy version yields the same decision id and the same chosen
+action or stop. The session-history snapshot (which embeds
 the window/horizon counts and lineage) and max_decisions are sealed into
 the id; the raw decision clock is deliberately NOT sealed — its effects
 enter only through the snapshot counts — and decisions_taken is
