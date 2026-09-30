@@ -20,7 +20,10 @@ from .core import (
     resolve_selection,
     verify_schema,
 )
-from .customer_voice import customer_review_observations
+from .customer_voice import (
+    customer_review_observations,
+    review_evidence_unavailable_outcomes,
+)
 from .identity import enrich_location_aliases
 from .integrity import (
     additional_assessment_integrity,
@@ -78,11 +81,15 @@ def build_business_dossier(
         conn,
         current_location_ids,
     )
+    unavailable_outcomes, unavailable_issues = (
+        review_evidence_unavailable_outcomes(conn, current_location_ids)
+    )
     integrity_issues = sort_integrity_issues(
         [
             *integrity_issues,
             *additional_fact_integrity(facts),
             *customer_voice_issues,
+            *unavailable_issues,
         ]
     )
     unknowns = controlled_unknowns(conn, canonical_entity_id, current_location_ids, facts)
@@ -111,6 +118,7 @@ def build_business_dossier(
         "customer_voice": {
             "review_count": len(customer_voice),
             "reviews": customer_voice,
+            "review_evidence_unavailable": unavailable_outcomes,
         },
         "unknowns": unknowns,
         "integrity_issues": integrity_issues,

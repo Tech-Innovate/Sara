@@ -447,6 +447,32 @@ def _reputation_domain(
         age_days = (evaluated_at - retrieved_at).total_seconds() / 86400
         if 0 <= age_days <= 30:
             current_voice.append(review)
+    unavailable_outcomes = list(
+        dossier["customer_voice"].get("review_evidence_unavailable") or []
+    )
+    unavailable_current: list[dict[str, Any]] = []
+    for outcome in unavailable_outcomes:
+        # R8-05: an outcome is current when its SOURCE is current —
+        # measured from the retained snapshot's retrieval time, exactly
+        # like customer-review observations — never from the extraction
+        # wall-clock. Mining an old snapshot today does not make the
+        # underlying source current.
+        retrieved = outcome.get("source_retrieved_at")
+        if not isinstance(retrieved, str):
+            continue
+        outcome_session_id = str(outcome.get("session_id"))
+        source_retrieved_at = parse_timestamp(
+            retrieved,
+            field=(
+                f"review outcome session "
+                f"{outcome_session_id} source_retrieved_at"
+            ),
+        )
+        outcome_age_days = (
+            evaluated_at - source_retrieved_at
+        ).total_seconds() / 86400
+        if 0 <= outcome_age_days <= 30:
+            unavailable_current.append(outcome)
     if rating and review_count and current_voice:
         return "sufficient", _reason(
             code="current_platform_metrics_and_customer_voice_present",
@@ -455,6 +481,20 @@ def _reputation_domain(
             extra={
                 "current_review_observation_count": len(current_voice),
                 "total_review_observation_count": len(voice),
+                "review_retrieval_freshness_days": 30,
+            },
+        )
+    if rating and review_count and unavailable_current:
+        # F-01: the retained snapshot was mined and contains zero review
+        # records. Current platform metrics plus an explicit bounded
+        # unavailability of customer voice satisfy reputation instead of
+        # looping the same no-op extraction forever.
+        return "sufficient", _reason(
+            code="current_platform_metrics_review_evidence_explicitly_unavailable",
+            facts=facts,
+            unknowns=unknowns,
+            extra={
+                "review_evidence_unavailable_outcomes": len(unavailable_current),
                 "review_retrieval_freshness_days": 30,
             },
         )
@@ -491,6 +531,18 @@ def _reputation_domain(
             code="reputation_evidence_not_current_or_supported",
             facts=facts,
             unknowns=unknowns,
+        )
+    if unavailable_current:
+        # No reputation evidence at all beyond the explicit outcome: the
+        # review source is bounded-unavailable, nothing is assessable,
+        # and no absence fact is fabricated.
+        return "not_applicable", _reason(
+            code="review_evidence_explicitly_unavailable",
+            facts=facts,
+            unknowns=unknowns,
+            extra={
+                "review_evidence_unavailable_outcomes": len(unavailable_current)
+            },
         )
     return "not_started", _reason(
         code="no_reputation_or_customer_voice_evidence",

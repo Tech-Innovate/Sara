@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v6): for the SAME entity, the SAME sealed
+Determinism contract (v15): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -31,12 +31,53 @@ from typing import Any
 
 # v6: currentness became assessment-signature equality over the
 # resolved Entity+Location graph (v5 was Entity-only max-timestamp).
-PLANNER_POLICY_VERSION = "acquisition-planner-v6"
+# v7: multi-collector scheduling. extract_retained_reviews addresses
+# reputation from retained Maps evidence, and the session-history,
+# in-flight, and terminal-watermark queries became collector-agnostic
+# over the entity lineage.
+# v8: the lineage additionally covers Location subjects (review
+# sessions target Locations, not Entities); retry/cooldown ceilings
+# are scoped to the candidate action's collector; and
+# extract_retained_reviews is schedulable only while a Maps snapshot
+# newer than the last complete review extraction remains unmined.
+# v9: the Location lineage is the SAME ownership-independent reverse
+# redirect closure the customer-voice projection uses (cross-owner
+# aliases included), and mining completeness is judged per resolved
+# current Location, not entity-globally.
+# v10: mining completeness matches each EXACT current retained Maps
+# snapshot by its deterministic evidence identity (backfill/sync
+# evidence id over business id, run, and content hash) against the
+# source_evidence_id frozen in complete review-session configs —
+# canonical-Location aggregation cannot mask a sibling snapshot.
+# v11: snapshot identity comes from the EXECUTOR'S resolver (shared
+# current_maps_evidence_for_business), so run-bound unchanged-content
+# re-syncs legitimately re-arm instead of reading as ambiguity, and
+# only COMPLETE review sessions count as coverage.
+# v12: coverage additionally requires each complete review session
+# to pass the executor's FULL provenance contract
+# (review_session_mined_evidence) — a malformed zero-output marker
+# never suppresses the real acquisition.
+# v13: coverage classification is three-way per snapshot — mined,
+# genuinely pending (clean deterministic id), or INVALID state at
+# the deterministic id. Invalid state stops planning and demands
+# recovery: execution would collide as incompatible provenance
+# with no durable-failure path, so the action would be
+# unexecutable and non-terminating.
+# v14: the coverage verifier proves the executor's lifecycle
+# contract itself (complete status, no error, present timestamps),
+# so a non-complete deterministic occupant classifies INVALID
+# instead of mined.
+# v15: the guard loads the COMPLETE immutable session row including
+# the error column, so the verifier's no-error check sees the STORED
+# value — a complete-looking occupant with a non-NULL error
+# classifies INVALID, matching executor replay.
+PLANNER_POLICY_VERSION = "acquisition-planner-v15"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
 
-#: The single allowlisted acquisition action. v1 knows one collector.
+#: Allowlisted acquisition actions. Each maps a collector to the
+# Understanding domains its evidence can improve.
 ACTIONS = {
     "acquire_official_website": {
         "collector": "sara.website",
@@ -44,6 +85,22 @@ ACTIONS = {
             "digital_presence", "digital_capabilities", "communication",
             "offerings", "business_model",
         }),
+        # v8: session statuses that count toward this collector's
+        # scoped retry ceiling.
+        "retry_statuses": frozenset({"partial"}),
+        "scope": "business",
+    },
+    # v7: retained-review extraction is local (no network) — it turns
+    # reviews already retained in the Maps snapshot raw evidence into
+    # observations, which is what reputation assessments consume.
+    "extract_retained_reviews": {
+        "collector": "sara.reviews.maps_snapshot",
+        "improves_domains": frozenset({"reputation"}),
+        # v8 (F-06): review extraction is all-or-nothing and local, so
+        # its deterministic failed attempts count toward its own retry
+        # ceiling alongside (never occurring) partials.
+        "retry_statuses": frozenset({"partial", "failed"}),
+        "scope": "entity",
     },
 }
 
@@ -52,7 +109,7 @@ ACTIONS = {
 #: collector.
 UNSUPPORTED_DOMAINS = frozenset({
     "competitive_context", "customer_journey", "customer_market",
-    "identity", "locations", "classification", "reputation",
+    "identity", "locations", "classification",
     "marketing", "technology", "people", "operations", "change",
     "scale", "unknowns", "provenance",
 })
@@ -72,6 +129,7 @@ IN_FLIGHT_HORIZON_SECONDS = 6 * 3600
 #: chronology (misconfigured clock or tampered row) and routes to the
 #: recovery-required stop instead of staying "fresh" (5 minutes).
 IN_FLIGHT_SKEW_SECONDS = 5 * 60
+STOP_INVALID_REVIEW_STATE = "invalid_review_session_state"
 STOP_UNSUPPORTED = "unsupported_deficiency"
 STOP_RETRIES = "retry_ceiling"
 STOP_COOLDOWN = "cooldown_active"
@@ -146,12 +204,47 @@ def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _lineage_subjects(conn: sqlite3.Connection, entity_id: str) -> dict[str, list[str]]:
+    """Every subject the entity's acquisition history lives on.
+
+    v8 (F-02): review extraction sessions target their frozen
+    SOURCE-TIME Location subject, not the Business Entity.
+    v9 (R8-01): the Location set is the SAME ownership-independent
+    reverse redirect closure the customer-voice projection uses —
+    every Location that currently redirects into one of the entity's
+    current Locations, regardless of the historical owner recorded on
+    the row. Selecting by business_locations.business_entity_id
+    misses cross-owner aliases whose sessions the dossier still sees.
+    The closure helper is imported from the projection itself so the
+    planner can never drift from what the assessment consumes.
+    """
+    from .dossier.core import locations as dossier_locations
+    from .dossier.customer_voice import _location_lineage
+
+    entities = _entity_lineage(conn, entity_id)
+    _rows, current_location_ids = dossier_locations(conn, entity_id)
+    return {
+        "entities": entities,
+        "locations": _location_lineage(conn, current_location_ids),
+    }
+
+
+def _review_collector_name() -> str:
+    from .reviews.model import COLLECTOR_NAME
+    return COLLECTOR_NAME
+
+
 def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> dict[str, Any]:
-    """Snapshot the website session facts the decision depends on.
+    """Snapshot the acquisition-session facts the decision depends on.
 
     Timestamps are compared as normalized UTC instants, never lexically.
-    Only sessions inside the retry window count as partial retries; only
-    blocked/failed sessions inside the cooldown horizon hold cooldown.
+    v8 (F-03): retry-window and cooldown ceilings are derived PER
+    COLLECTOR — only sessions of a candidate action's own collector
+    over the lineage count, so heterogeneous collectors never inherit
+    each other's failure state. In-flight suppression and the terminal
+    evidence watermark stay entity-wide across collectors: any active
+    session holds planning, and any evidence-producing session finishing
+    after the assessment seal leaves unassessed evidence behind.
     Terminal (complete/partial) freshness is judged on finished_at and
     fails closed to stale when a finish timestamp is corrupt or missing;
     future-dated in-flight rows are invalid chronology and demand
@@ -164,13 +257,14 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     cooldown_floor = datetime.fromtimestamp(
         now_dt.timestamp() - COOLDOWN_SECONDS, tz=timezone.utc
     )
-    lineage = _entity_lineage(conn, entity_id)
-    lineage_marks = ",".join("?" for _ in lineage)
+    lineage = _lineage_subjects(conn, entity_id)
+    subjects = lineage["entities"] + lineage["locations"]
+    lineage_marks = ",".join("?" for _ in subjects)
     rows = conn.execute(
-        f"SELECT status, started_at, target_subject_id FROM acquisition_sessions "
-        f"WHERE target_subject_id IN ({lineage_marks}) "
-        f"AND collector_name='sara.website'",
-        tuple(lineage),
+        f"SELECT status, started_at, target_subject_id, collector_name "
+        f"FROM acquisition_sessions "
+        f"WHERE target_subject_id IN ({lineage_marks})",
+        tuple(subjects),
     ).fetchall()
     # started_at is plain TEXT: lexical SQL ordering is wrong across
     # differing UTC offsets. Parse every timestamp first, sort by the
@@ -178,46 +272,62 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     # consecutive streak and window counts. An unparseable timestamp
     # fails closed by keeping that session pinned at the newest edge.
     parsed: list[tuple[datetime, str, str]] = []
-    corrupt: list[str] = []  # statuses of sessions with unparseable timestamps
-    for status, started_at, _target in rows:
+    corrupt: list[tuple[str, str]] = []  # (status, collector) unparseable
+    for status, started_at, _target, collector in rows:
         try:
             when = _instant(str(started_at))
         except ValueError:
-            corrupt.append(str(status))  # fail closed, count preserved
+            corrupt.append((str(status), str(collector)))  # fail closed
             continue
-        parsed.append((when, status, str(started_at)))
+        parsed.append((when, str(status), str(collector)))
     parsed.sort(key=lambda item: item[0], reverse=True)
-    # Every corrupt-timestamp session is pinned at the newest edge with
-    # its own status: two corrupt partials hit the retry ceiling, three
-    # corrupt blocked/failed sessions hold cooldown.
-    corrupt_failures = sum(1 for s in corrupt if s in ("blocked", "failed"))
-    corrupt_partials = sum(1 for s in corrupt if s == "partial")
 
-    streak = corrupt_failures
-    for _when, status, _raw in parsed:
-        if status in ("blocked", "failed"):
-            streak += 1
-        else:
-            break
-    streak_recent = corrupt_failures
-    for when, status, _raw in parsed:
-        if status not in ("blocked", "failed"):
-            break
-        if when >= cooldown_floor:
-            streak_recent += 1
-        else:
-            break
-    partials_in_window = corrupt_partials
-    for when, status, _raw in parsed:
-        if status != "partial":
-            continue
-        if when >= retry_floor:
-            partials_in_window += 1
+    # v8 per-collector ceilings: every corrupt-timestamp session is
+    # pinned at the newest edge of ITS OWN collector's history with
+    # its own status (fail closed, count preserved).
+    retry_statuses: dict[str, set[str]] = {}
+    for spec in ACTIONS.values():
+        collector = str(spec["collector"])
+        retry_statuses.setdefault(collector, set()).update(
+            spec.get("retry_statuses", ())
+        )
+    collector_histories: dict[str, dict[str, Any]] = {}
+    for collector in sorted(retry_statuses):
+        statuses = retry_statuses[collector]
+        mine = [item for item in parsed if item[2] == collector]
+        my_corrupt = [s for s, c in corrupt if c == collector]
+        streak = sum(1 for s in my_corrupt if s in ("blocked", "failed"))
+        for _when, status, _c in mine:
+            if status in ("blocked", "failed"):
+                streak += 1
+            else:
+                break
+        streak_recent = sum(1 for s in my_corrupt if s in ("blocked", "failed"))
+        for when, status, _c in mine:
+            if status not in ("blocked", "failed"):
+                break
+            if when >= cooldown_floor:
+                streak_recent += 1
+            else:
+                break
+        retries = sum(1 for s in my_corrupt if s in statuses)
+        for when, status, _c in mine:
+            if status in statuses and when >= retry_floor:
+                retries += 1
+        collector_histories[collector] = {
+            "blocked_failed_streak_total": streak,
+            "blocked_failed_streak_in_cooldown_horizon": streak_recent,
+            "retry_sessions_in_window": retries,
+            "retry_statuses": sorted(statuses),
+        }
     in_flight_rows = conn.execute(
+        # Any active session on the lineage holds planning, regardless
+        # of collector — the planner schedules at most one acquisition
+        # per entity at a time.
         f"SELECT started_at FROM acquisition_sessions "
         f"WHERE target_subject_id IN ({lineage_marks}) "
-        f"AND collector_name='sara.website' AND status IN ('planned','running')",
-        tuple(lineage),
+        f"AND status IN ('planned','running')",
+        tuple(subjects),
     ).fetchall()
     in_flight = len(in_flight_rows)
     in_flight_orphaned = 0
@@ -246,16 +356,19 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     # alone — a session that started before an assessment but finished
     # after it leaves unassessed evidence behind.
     terminal_rows = conn.execute(
-        f"SELECT started_at, finished_at FROM acquisition_sessions "
+        # Evidence currency is per-entity, not per-collector: a
+        # review extraction finishing after the seal leaves just as
+        # much unassessed evidence behind as a website crawl does.
+        f"SELECT started_at, finished_at, collector_name "
+        f"FROM acquisition_sessions "
         f"WHERE target_subject_id IN ({lineage_marks}) "
-        f"AND collector_name='sara.website' "
         f"AND status IN ('complete','partial')",
-        tuple(lineage),
+        tuple(subjects),
     ).fetchall()
     newest_terminal: tuple[datetime, str] | None = None
     corrupt_terminal = 0
     unprovable_terminal = False
-    for started_at, finished_at in terminal_rows:
+    for started_at, finished_at, collector in terminal_rows:
         # Freshness is defined on terminal completion: finished_at. A
         # corrupt or missing finish timestamp makes completion chronology
         # unprovable and fails closed to stale; started_at is never a
@@ -280,7 +393,7 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
         stale_unprovable = False
     return {
         "session_count": len(rows),
-        "entity_lineage": lineage,
+        "lineage_subjects": lineage,
         "in_flight_sessions": in_flight,
         "in_flight_fresh": in_flight_fresh,
         "in_flight_orphaned": in_flight_orphaned,
@@ -290,12 +403,148 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
             str(latest_terminal[0]) if latest_terminal else None,
         "corrupt_terminal_timestamps": corrupt_terminal,
         "terminal_chronology_unprovable": stale_unprovable,
-        "blocked_failed_streak_total": streak,
-        "blocked_failed_streak_in_cooldown_horizon": streak_recent,
-        "partial_sessions_in_retry_window": partials_in_window,
+        "collector_histories": collector_histories,
         "retry_window_seconds": RETRY_WINDOW_SECONDS,
         "cooldown_horizon_seconds": COOLDOWN_SECONDS,
     }
+
+
+def _review_extraction_state(
+    conn: sqlite3.Connection, history: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """Classify review coverage per exact current snapshot (R12-01).
+
+    v11 (R10-01): snapshot identity comes from the EXECUTOR'S own
+    resolver — the shared current_maps_evidence_for_business — which
+    verifies the full provenance contract including the run binding
+    (current last_run_id). An unchanged-content re-sync therefore
+    legitimately resolves to the NEW sync evidence and re-arms the
+    action instead of reading as ambiguity, and only the snapshot the
+    executor would actually mine counts.
+
+    v12 (R11-01): coverage requires complete review sessions that pass
+    the executor's FULL session provenance contract
+    (review_session_mined_evidence: supported version, source binding,
+    canonical config bytes and hash, deterministic id, target binding,
+    declared counts matching stored AND actual output, byte-exact
+    child provenance, and output semantics consistent with the
+    declared outcome).
+
+    v13 (R12-01): the classification is three-way per snapshot:
+
+    "mined"       — a verified complete review session covers the
+                    snapshot.
+    "pending"     — NO session occupies the deterministic
+                    review-session id for this evidence/location/version
+                    pair, so execution is clean and the action is
+                    genuinely executable.
+    "invalid"     — a session EXISTS at that deterministic id but fails
+                    the executor's provenance contract. Execution would
+                    collide as incompatible provenance with no durable-
+                    failure path, so planning stops and demands
+                    recovery instead of emitting an unexecutable action.
+    "unprovable"  — corrupt parent provenance: fail closed, no action.
+    "none"        — no current retained snapshot: nothing to mine.
+
+    This is the F-01 termination guard: after an entity-scoped
+    extraction mines every current snapshot, re-scheduling the same
+    action would be a provable no-op. A newer Maps sync mints a new
+    evidence identity and re-arms the action.
+    """
+    from .reviews.core import (
+        current_maps_evidence_for_business,
+        review_session_mined_evidence,
+    )
+    from .reviews.model import ReviewIntelligenceError
+    from .reviews.model import opaque_id as review_opaque_id
+
+    locations = history["lineage_subjects"]["locations"]
+    if not locations:
+        return ("none", {})
+    marks = ",".join("?" for _ in locations)
+
+    link_rows = conn.execute(
+        f"SELECT m.business_id FROM maps_business_location_links m "
+        f"JOIN businesses b ON b.id=m.business_id "
+        f"WHERE m.location_id IN ({marks}) ORDER BY m.business_id",
+        tuple(locations),
+    ).fetchall()
+    snapshots: list[tuple[int, str, str]] = []
+    for (business_id,) in link_rows:
+        try:
+            evidence = current_maps_evidence_for_business(
+                conn, business_id=int(business_id))
+        except ReviewIntelligenceError:
+            return ("unprovable", {})  # corrupt parent: fail closed
+        if evidence is not None:
+            snapshots.append((
+                int(business_id),
+                str(evidence["id"]),
+                str(evidence["frozen_location_id"]),
+            ))
+
+    if not snapshots:
+        return ("none", {})  # no current retained snapshot
+
+    # R14-01: the complete immutable session row, error included — the
+    # verifier's no-error check must see the STORED value, not a
+    # missing key.
+    session_keys = (
+        "id", "target_subject_id", "source_id", "collector_name",
+        "collector_version", "config_json", "config_hash", "status",
+        "started_at", "finished_at", "error", "evidence_count",
+        "observation_count",
+    )
+    pending_found = False
+    for business_id, evidence_id, location_id in snapshots:
+        deterministic_ids = (
+            review_opaque_id(
+                "acq", "retained-maps-reviews",
+                evidence_id, location_id, "1"),
+            review_opaque_id(
+                "acq", "retained-maps-reviews",
+                evidence_id, location_id, "2"),
+        )
+        rows = conn.execute(
+            f"SELECT id,target_subject_id,source_id,collector_name,"
+            f"collector_version,config_json,config_hash,status,started_at,"
+            f"finished_at,error,evidence_count,observation_count "
+            f"FROM acquisition_sessions WHERE id IN (?,?)",
+            deterministic_ids,
+        ).fetchall()
+        if not rows:
+            # Clean deterministic id space: execution would succeed.
+            pending_found = True
+            continue
+        verified = False
+        for row in rows:
+            session = {
+                key: row[index] for index, key in enumerate(session_keys)
+            }
+            if review_session_mined_evidence(conn, session) == evidence_id:
+                verified = True
+                break
+        if not verified:
+            # R12-01: a session occupies the deterministic id but fails
+            # the executor's contract — the scheduled action would be
+            # unexecutable (incompatible-provenance collision with no
+            # durable-failure path). Demand recovery instead.
+            return (
+                "invalid",
+                {
+                    "business_id": business_id,
+                    "evidence_id": evidence_id,
+                    "session_id": str(rows[0][0]),
+                    "recovery": (
+                        "deterministic review session state fails the "
+                        "executor provenance contract; manual recovery "
+                        "required"
+                    ),
+                },
+            )
+    if pending_found:
+        return ("pending", {})
+    return ("mined", {})
 
 
 def _decision_hash(payload: dict[str, Any]) -> str:
@@ -472,36 +721,86 @@ def plan_next_acquisition(
         return decide(None, STOP_POLICY, "max_decisions_reached", None,
                       {"max_decisions": max_decisions}, assessment_id)
 
-    if history["blocked_failed_streak_in_cooldown_horizon"] >= _COOLDOWN_SESSIONS:
-        return decide(None, STOP_COOLDOWN,
-                      "consecutive_blocked_or_failed_sessions", None,
-                      {"streak": history["blocked_failed_streak_in_cooldown_horizon"],
-                       "ceiling": _COOLDOWN_SESSIONS,
-                       "horizon_seconds": COOLDOWN_SECONDS}, assessment_id)
-
-    if history["partial_sessions_in_retry_window"] >= _RETRY_CEILING:
-        return decide(None, STOP_RETRIES, "partial_acquisition_retry_ceiling",
-                      None, {"retries": history["partial_sessions_in_retry_window"],
-                             "ceiling": _RETRY_CEILING,
-                             "window_seconds": RETRY_WINDOW_SECONDS}, assessment_id)
-
     domains = {str(item["domain"]): str(item["state"])
                for item in assessment.get("domains", ())}
     blocking_current = [d for d in blocking if domains.get(d) not in READY_STATES]
 
-    action_spec = ACTIONS["acquire_official_website"]
-    improvable = sorted(d for d in blocking_current
-                        if d in action_spec["improves_domains"])
+    improvable = sorted(
+        d for d in blocking_current
+        if any(d in spec["improves_domains"] for spec in ACTIONS.values()))
     unsupported = sorted(d for d in blocking_current
                          if d in UNSUPPORTED_DOMAINS)
 
-    if improvable:
-        target = improvable[0]
-        return decide("acquire_official_website", None,
-                      "deficient_domain_supported_by_collector", target,
-                      {"collector": action_spec["collector"],
-                       "blocking": sorted(blocking_current)}, assessment_id)
+    # v8 candidate-scoped selection (F-03/F-04): the lexically first
+    # improvable domain is the target, and among the actions improving
+    # it the lexically first name wins — but an action is only
+    # eligible when ITS OWN collector is not at a retry/cooldown
+    # ceiling, and the review action additionally requires an unmined
+    # retained snapshot. The schedule stays deterministic and
+    # replay-stable.
+    ceiling_stops: list[tuple[str, str, str, str, dict[str, Any]]] = []
+    actions_not_applicable: list[str] = []
+    for domain in improvable:
+        for action_name in sorted(
+            name for name, spec in ACTIONS.items()
+            if domain in spec["improves_domains"]
+        ):
+            spec = ACTIONS[action_name]
+            collector = str(spec["collector"])
+            collector_state = history["collector_histories"][collector]
+            if (
+                collector_state["blocked_failed_streak_in_cooldown_horizon"]
+                >= _COOLDOWN_SESSIONS
+            ):
+                ceiling_stops.append((
+                    domain, action_name, STOP_COOLDOWN,
+                    "consecutive_blocked_or_failed_sessions",
+                    {"collector": collector,
+                     "streak": collector_state[
+                         "blocked_failed_streak_in_cooldown_horizon"],
+                     "ceiling": _COOLDOWN_SESSIONS,
+                     "horizon_seconds": COOLDOWN_SECONDS},
+                ))
+                continue
+            if collector_state["retry_sessions_in_window"] >= _RETRY_CEILING:
+                ceiling_stops.append((
+                    domain, action_name, STOP_RETRIES,
+                    "partial_acquisition_retry_ceiling",
+                    {"collector": collector,
+                     "retries": collector_state["retry_sessions_in_window"],
+                     "ceiling": _RETRY_CEILING,
+                     "window_seconds": RETRY_WINDOW_SECONDS},
+                ))
+                continue
+            if action_name == "extract_retained_reviews":
+                state, state_details = _review_extraction_state(
+                    conn, history)
+                if state == "invalid":
+                    # R12-01: unexecutable deterministic state —
+                    # stop and demand recovery, never re-emit the
+                    # acquisition action.
+                    return decide(
+                        None, STOP_INVALID_REVIEW_STATE,
+                        "deterministic_review_session_state_invalid",
+                        None, state_details, assessment_id)
+                if state != "pending":
+                    actions_not_applicable.append(action_name)
+                    continue
+            return decide(action_name, None,
+                          "deficient_domain_supported_by_collector", domain,
+                          {"collector": collector,
+                           "scope": str(spec.get("scope", "business")),
+                           "blocking": sorted(blocking_current)}, assessment_id)
+    if ceiling_stops:
+        # No improvable domain has an eligible action, and at least one
+        # candidate is ceiling-blocked: report the lexically first
+        # improvable domain's first ceiling.
+        _domain, action_name, stop, reason, details = ceiling_stops[0]
+        return decide(None, stop, reason, None,
+                      {**details, "action": action_name}, assessment_id)
 
     return decide(None, STOP_UNSUPPORTED, "no_allowlisted_action_for_deficiency",
                   unsupported[0] if unsupported else None,
-                  {"blocking": sorted(blocking_current)}, assessment_id)
+                  {"blocking": sorted(blocking_current),
+                   "actions_not_applicable": actions_not_applicable},
+                  assessment_id)

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from typing import Any
 
-from ..reviews.model import REVIEW_PREDICATE, canonical_json, sha256_text
+from ..reviews.model import (
+    COLLECTOR_NAME,
+    REVIEW_PREDICATE,
+    canonical_json,
+    sha256_text,
+)
 from .core import DossierQueryError, json_value, parse_timestamp, resolve_subject, row_dict
 
 
@@ -478,3 +484,72 @@ def customer_review_observations(
         )
     )
     return reviews, issues
+
+
+def review_evidence_unavailable_outcomes(
+    conn: sqlite3.Connection,
+    current_location_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project complete review extractions that found NO retained reviews.
+
+    The explicit-unavailable outcome is durable session state (F-01): a
+    complete sara.reviews.maps_snapshot session whose frozen config
+    carries extraction_outcome="unavailable" proves the retained
+    snapshot was mined and contained zero review records. Reputation
+    assessment consumes this so an explicitly unavailable review source
+    can satisfy the domain instead of the planner re-scheduling a
+    provably no-op extraction forever. Sessions whose config cannot be
+    decoded are integrity issues, never outcomes.
+
+    R8-04: pre-outcome v1 configs gain the semantics by derivation — a
+    v1 session with zero review evidence rows IS a zero-review
+    extraction by construction. R8-05: each outcome carries its source
+    freshness (the retained snapshot's retrieved_at) so consumers
+    measure currency from the SOURCE, never the extraction clock; a
+    config naming missing evidence is an integrity issue, not an
+    outcome.
+
+    R9-03/R9-04/R10-03: every session-level and parent-provenance
+    check lives in ONE strict verifier owned by the collector module
+    (reviews.core.strict_unavailable_outcome_session) so the
+    projection cannot drift from the executor's contract: supported
+    review collector version, canonical config bytes and hash,
+    deterministic session id, frozen-target binding, zero stored AND
+    actual output, and the executor's exact current-snapshot parent
+    provenance. A superseded snapshot drops its outcome (R10-04);
+    unknown/future review versions never contribute mandatory-domain
+    evidence.
+    """
+    source_ids = _location_lineage(conn, current_location_ids)
+    if not source_ids:
+        return [], []
+    placeholders = ",".join("?" for _ in source_ids)
+    cursor = conn.execute(
+        "SELECT id,target_subject_id,source_id,collector_name,"
+        "collector_version,config_json,config_hash,status,finished_at,"
+        "evidence_count,observation_count "
+        "FROM acquisition_sessions "
+        f"WHERE collector_name=? AND target_subject_id IN ({placeholders}) "
+        "AND status='complete' ORDER BY finished_at,id",
+        (COLLECTOR_NAME, *source_ids),
+    )
+    from ..reviews.core import strict_unavailable_outcome_session
+
+    outcomes: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for row in cursor.fetchall():
+        item = row_dict(cursor, row)
+        outcome, issue_code = strict_unavailable_outcome_session(conn, item)
+        if issue_code is not None:
+            issues.append(
+                {"code": issue_code, "session_id": str(item["id"])}
+            )
+        elif outcome is not None:
+            outcomes.append(outcome)
+    issues.sort(
+        key=lambda item: (
+            str(item.get("code", "")),
+            str(item.get("session_id", "")),
+        )
+    )
+    return outcomes, issues

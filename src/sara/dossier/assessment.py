@@ -444,6 +444,13 @@ def _chronology_inputs(
                 observation.get("extracted_at"),
                 f"observation {observation['id']} extracted_at",
             )
+    for outcome in dossier["customer_voice"].get(
+        "review_evidence_unavailable", ()
+    ):
+        add(
+            outcome.get("finished_at"),
+            f"review outcome {outcome['session_id']} finished_at",
+        )
     for review in dossier["customer_voice"]["reviews"]:
         add(review.get("observed_at"), f"review {review['observation_id']} observed_at")
         add(review.get("extracted_at"), f"review {review['observation_id']} extracted_at")
@@ -675,6 +682,19 @@ def _input_signature(
             }
             for review in dossier["customer_voice"]["reviews"]
         ],
+        "customer_voice_unavailable": [
+            {
+                "session_id": outcome["session_id"],
+                "target_subject_id": outcome["target_subject_id"],
+                "finished_at": outcome["finished_at"],
+                "source_evidence_id": outcome["source_evidence_id"],
+                "source_content_sha256": outcome["source_content_sha256"],
+                "source_retrieved_at": outcome["source_retrieved_at"],
+            }
+            for outcome in dossier["customer_voice"].get(
+                "review_evidence_unavailable", ()
+            )
+        ],
         "unknowns": [
             {
                 key: item.get(key)
@@ -874,6 +894,10 @@ def persist_dossier_assessment(
             "fact_count": len(dossier["facts"]),
             "customer_review_observation_count": int(
                 dossier["customer_voice"]["review_count"]
+            ),
+            "review_evidence_unavailable_count": len(
+                dossier["customer_voice"].get("review_evidence_unavailable")
+                or []
             ),
             "controlled_unresolved_count": len(dossier["unknowns"]),
             "integrity_issue_count": len(dossier["integrity_issues"]),
