@@ -860,6 +860,205 @@ def test_historical_parent_wrong_evidence_identity_is_integrity_issue(tmp_path: 
     conn.close()
 
 
+def test_historical_parent_session_identity_drift_is_integrity_issue(tmp_path: Path) -> None:
+    """R13-02: a historical parent with a fully valid deterministic
+    EVIDENCE id and metadata, but whose acquisition session fails the
+    producer's deterministic-session contract, is an integrity issue."""
+    from sara.dossier.surface import build_business_dossier
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import canonical_json as rj, sha256_text
+    from sara.reviews.model import opaque_id as review_opaque_id
+
+    conn = prepared(tmp_path / "parent-session-drift.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    from sara.maps_backfill import location_id_for_maps_business
+
+    location = location_id_for_maps_business(1)
+    canonical_key, real_raw = conn.execute(
+        "SELECT canonical_key, raw_json FROM businesses WHERE id=1").fetchone()
+    import hashlib as _hl
+
+    # A DIFFERENT snapshot content so the deterministic evidence id does
+    # not collide with the real one; all bindings otherwise correct.
+    raw2 = real_raw[:-1] + ',"extra_marker":true}'
+    raw2_hash = _hl.sha256(raw2.encode("utf-8")).hexdigest()
+    from sara.maps_backfill import _evidence_id
+
+    fake_evidence_id = _evidence_id(1, raw2_hash)
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("r4", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
+         "{}", "/evidence/r4.jsonl", "complete", "2026-09-26T09:59:00+00:00",
+         "2026-09-26T10:00:00+00:00"),
+    )
+    # The parent session carries the RIGHT canonical config and run
+    # timestamps — but NOT the producer's deterministic session id.
+    backfill_config = json.dumps(
+        {"import_mode": "latest_canonical_maps_snapshot", "legacy_run_id": "r4"},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_wrong_parent_session", None, "src_google_maps",
+         "sara.maps_backfill", "2", backfill_config,
+         sha256_text(backfill_config), "complete", "2026-09-26T09:59:00+00:00",
+         "2026-09-26T10:00:00+00:00", None, "r4", 1, 0))
+    metadata = json.dumps(
+        {
+            "import_kind": "legacy_maps_business_snapshot",
+            "legacy_business_id": 1,
+            "legacy_canonical_key": canonical_key,
+            "legacy_run_id": "r4",
+            "raw_json": raw2,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
+        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (fake_evidence_id, "acq_wrong_parent_session", "src_google_maps",
+         "google_maps:legacy:1", "platform", "usable",
+         "2026-09-26T09:59:00+00:00", raw2_hash, None, metadata,
+         "2026-09-26T09:59:00+00:00"))
+    cfg = {
+        "input_kind": "retained_maps_review_snapshot",
+        "source_maps_business_id": 1,
+        "source_business_entity_id": entity,
+        "source_location_id": location,
+        "source_evidence_id": fake_evidence_id,
+        "source_content_sha256": raw2_hash,
+        "review_array_fields": ["user_reviews", "user_reviews_extended"],
+        "source_review_records": 0,
+        "review_evidence_records": 0,
+        "extraction_outcome": "unavailable",
+    }
+    config = rj(cfg)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (review_opaque_id("acq", "retained-maps-reviews", fake_evidence_id,
+                          cfg["source_location_id"], "2"),
+         cfg["source_location_id"],
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         "2026-09-26T12:00:00+00:00", "2026-09-26T12:00:05+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    dossier = build_business_dossier(conn, entity_id=entity)
+    assert dossier["customer_voice"]["review_evidence_unavailable"] == []
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "review_outcome_source_evidence_mismatch" in codes
+    conn.close()
+
+
+def test_sync_parent_legacy_binding_drift_is_integrity_issue(tmp_path: Path) -> None:
+    """R13-02: a sync-kind historical parent with correct sync ids but a
+    wrong legacy_business_id binding is an integrity issue — the Maps
+    sync verifier applies the legacy bindings to ALL snapshot evidence."""
+    from sara.dossier.surface import build_business_dossier
+    from sara.reviews.model import canonical_json as rj, sha256_text
+    from sara.reviews.model import opaque_id as review_opaque_id
+    from sara.maps_backfill import _acquisition_id
+    from sara.maps_sync import SYNC_VERSION, _sync_evidence_id
+
+    conn = prepared(tmp_path / "sync-legacy-drift.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    from sara.maps_backfill import location_id_for_maps_business
+
+    location = location_id_for_maps_business(1)
+    canonical_key, real_raw = conn.execute(
+        "SELECT canonical_key, raw_json FROM businesses WHERE id=1").fetchone()
+    import hashlib as _hl
+
+    raw_hash = _hl.sha256(real_raw.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("r5", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
+         "{}", "/evidence/r5.jsonl", "complete", "2026-09-26T11:00:00+00:00",
+         "2026-09-26T11:00:05+00:00"),
+    )
+    sync_evidence_id = _sync_evidence_id(1, "r5", raw_hash)
+    parent_session_id = _acquisition_id("r5")
+    sync_config = json.dumps(
+        {"import_mode": "maps_sync_current_snapshot", "legacy_run_id": "r5"},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (parent_session_id, None, "src_google_maps", "sara.maps_sync",
+         SYNC_VERSION, sync_config, sha256_text(sync_config), "complete",
+         "2026-09-26T11:00:00+00:00", "2026-09-26T11:00:05+00:00",
+         None, "r5", 1, 0))
+    metadata = json.dumps(
+        {
+            "import_kind": "maps_sync_snapshot",
+            # Wrong legacy business binding — the sync verifier applies
+            # this check to every snapshot evidence row.
+            "legacy_business_id": 999,
+            "legacy_canonical_key": canonical_key,
+            "legacy_run_id": "r5",
+            "raw_json": real_raw,
+            "sync_entity_id": entity,
+            "sync_location_id": location,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
+        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (sync_evidence_id, parent_session_id, "src_google_maps",
+         "google_maps:sync:1", "platform", "usable",
+         "2026-09-26T11:00:00+00:00", raw_hash, None, metadata,
+         "2026-09-26T11:00:00+00:00"))
+    cfg = {
+        "input_kind": "retained_maps_review_snapshot",
+        "source_maps_business_id": 1,
+        "source_business_entity_id": entity,
+        "source_location_id": location,
+        "source_evidence_id": sync_evidence_id,
+        "source_content_sha256": raw_hash,
+        "review_array_fields": ["user_reviews", "user_reviews_extended"],
+        "source_review_records": 0,
+        "review_evidence_records": 0,
+        "extraction_outcome": "unavailable",
+    }
+    config = rj(cfg)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (review_opaque_id("acq", "retained-maps-reviews", sync_evidence_id,
+                          location, "2"),
+         location,
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         "2026-09-26T12:00:00+00:00", "2026-09-26T12:00:05+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    dossier = build_business_dossier(conn, entity_id=entity)
+    assert dossier["customer_voice"]["review_evidence_unavailable"] == []
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "review_outcome_source_evidence_mismatch" in codes
+    conn.close()
+
+
 def test_reviews_cli_entity_id(tmp_path: Path, capsys) -> None:
     """F-04: the sara-reviews CLI accepts the entity-scoped executor target."""
     from sara.reviews import main as reviews_main

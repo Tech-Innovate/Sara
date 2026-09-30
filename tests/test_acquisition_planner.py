@@ -1308,7 +1308,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v13",
+         "acquisition-planner-v14",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1320,7 +1320,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v13",
+         "acquisition-planner-v14",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -1518,6 +1518,7 @@ def _apply_sync_snapshot(
         business_entity_id_for_maps_business as _beid,
         location_id_for_maps_business as _locid,
     )
+    from sara.reviews.model import sha256_text
     from sara.maps_sync import SYNC_VERSION, _sync_evidence_id
 
     canonical_key, raw_json = conn.execute(
@@ -1526,12 +1527,22 @@ def _apply_sync_snapshot(
     raw_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
     conn.execute(
         "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
-        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "config_json,raw_path,status,started_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (new_run_id, "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
          2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
-         "{}", f"/evidence/{new_run_id}.jsonl", "complete", retrieved_at),
+         "{}", f"/evidence/{new_run_id}.jsonl", "complete", retrieved_at,
+         retrieved_at),
     )
-    session_id = f"acq_sync_{new_run_id}"
+    # The producer's deterministic session id and canonical sync config
+    # (maps_sync._ensure_session shape), so the historical-parent
+    # validator's R13-02 producer-session contract accepts it.
+    from sara.maps_backfill import _acquisition_id
+
+    session_id = _acquisition_id(new_run_id)
+    sync_config = json.dumps(
+        {"import_mode": "maps_sync_current_snapshot",
+         "legacy_run_id": new_run_id},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     metadata = json.dumps(
         {
             "import_kind": "maps_sync_snapshot",
@@ -1551,8 +1562,8 @@ def _apply_sync_snapshot(
         "legacy_run_id,evidence_count,observation_count"
         ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (session_id, None, "src_google_maps", "sara.maps_sync",
-         SYNC_VERSION, "{}", "z" * 64, "complete", retrieved_at,
-         retrieved_at, None, new_run_id, 1, 0))
+         SYNC_VERSION, sync_config, sha256_text(sync_config), "complete",
+         retrieved_at, retrieved_at, None, new_run_id, 1, 0))
     conn.execute(
         "INSERT INTO evidence_items("
         "id,acquisition_session_id,source_id,source_locator,source_role,status,"
@@ -2083,6 +2094,88 @@ def test_child_drift_at_deterministic_id_demands_recovery(tmp_path: Path) -> Non
             "extractor_version,confidence,created_at"
             ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(drifted[key] for key in (
+                "id", "subject_id", "predicate", "evidence_id", "value_json",
+                "normalized_value_json", "value_hash", "observation_kind",
+                "observed_at", "extracted_at", "extraction_method",
+                "extractor_name", "extractor_version", "confidence",
+                "created_at")))
+    conn.commit()
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action is None
+    assert decision.stop_reason == STOP_INVALID_REVIEW_STATE
+    assert decision.details["session_id"] == session_id
+    conn.close()
+
+
+def test_non_complete_deterministic_occupant_demands_recovery(tmp_path: Path) -> None:
+    """R13-01: a PARTIAL occupant at the deterministic review-session id —
+    fully valid config and children — is not coverage and not executable:
+    the verifier proves the lifecycle contract itself and the planner
+    stops invalid instead of classifying the snapshot mined."""
+    from unittest.mock import patch as mock_patch
+    from sara.acquisition_planner import STOP_INVALID_REVIEW_STATE
+    from sara.dossier import assessment as assessment_module
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    conn = prepared(tmp_path / "partial-occupant.sqlite", reviews=[REVIEW_SIMPLE])
+    entity = business_entity_id_for_maps_business(1)
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    raw = json.loads(business["raw_json"])
+    reviews, source_count = reviews_core.extract_reviews(raw)
+    cfg = json.loads(reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=source_count,
+        review_evidence_records=len(reviews),
+    ))
+    cfg["extraction_outcome"] = "complete"
+    config = json.dumps(cfg, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"))
+    session_id = review_opaque_id(
+        "acq", "retained-maps-reviews", cfg["source_evidence_id"],
+        cfg["source_location_id"], "2")
+    # Pre-watermark timestamps so the terminal-chronology guard does not
+    # fire first; only the LIFECYCLE status distinguishes this occupant.
+    extracted_at = "2026-09-26T09:00:00+00:00"
+    rows = reviews_core._expected_review_rows(
+        session_id=session_id, source_evidence=source_evidence,
+        reviews=reviews, extracted_at=extracted_at, extractor_version="2")
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, cfg["source_location_id"], "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "partial",
+         extracted_at, extracted_at, None, None, len(rows), len(rows)))
+    for evidence, observation in rows:
+        conn.execute(
+            "INSERT INTO evidence_items("
+            "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+            "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(evidence[key] for key in (
+                "id", "acquisition_session_id", "source_id", "source_locator",
+                "source_role", "status", "retrieved_at", "published_at",
+                "language", "media_type", "content_sha256", "artifact_ref",
+                "metadata_json", "created_at")))
+        conn.execute(
+            "INSERT INTO observations("
+            "id,subject_id,predicate,evidence_id,value_json,normalized_value_json,value_hash,"
+            "observation_kind,observed_at,extracted_at,extraction_method,extractor_name,"
+            "extractor_version,confidence,created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(observation[key] for key in (
                 "id", "subject_id", "predicate", "evidence_id", "value_json",
                 "normalized_value_json", "value_hash", "observation_kind",
                 "observed_at", "extracted_at", "extraction_method",

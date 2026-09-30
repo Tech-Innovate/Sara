@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v13): for the SAME entity, the SAME sealed
+Determinism contract (v14): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -63,7 +63,11 @@ from typing import Any
 # recovery: execution would collide as incompatible provenance
 # with no durable-failure path, so the action would be
 # unexecutable and non-terminating.
-PLANNER_POLICY_VERSION = "acquisition-planner-v13"
+# v14: the coverage verifier proves the executor's lifecycle
+# contract itself (complete status, no error, present timestamps),
+# so a non-complete deterministic occupant classifies INVALID
+# instead of mined.
+PLANNER_POLICY_VERSION = "acquisition-planner-v14"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -481,7 +485,8 @@ def _review_extraction_state(
     session_keys = (
         "id", "target_subject_id", "source_id", "collector_name",
         "collector_version", "config_json", "config_hash", "status",
-        "finished_at", "evidence_count", "observation_count",
+        "started_at", "finished_at", "evidence_count",
+        "observation_count",
     )
     pending_found = False
     for business_id, evidence_id, location_id in snapshots:
@@ -495,8 +500,8 @@ def _review_extraction_state(
         )
         rows = conn.execute(
             f"SELECT id,target_subject_id,source_id,collector_name,"
-            f"collector_version,config_json,config_hash,status,finished_at,"
-            f"evidence_count,observation_count "
+            f"collector_version,config_json,config_hash,status,started_at,"
+            f"finished_at,evidence_count,observation_count "
             f"FROM acquisition_sessions WHERE id IN (?,?)",
             deterministic_ids,
         ).fetchall()

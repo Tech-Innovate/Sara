@@ -1181,6 +1181,26 @@ def review_session_mined_evidence(
     output is valid only as unavailable).
     """
     session_id = str(session["id"])
+    # R13-01: the verifier no longer assumes a status-filtered caller.
+    # It proves the executor's lifecycle contract itself: status
+    # 'complete', no error, both lifecycle timestamps present, and a
+    # parseable finish (it stamps the expected children). A
+    # non-complete or lifecycle-invalid occupant at the deterministic
+    # id is INVALID state, never coverage.
+    if str(session.get("status")) != "complete":
+        return None
+    if session.get("error") is not None:
+        return None
+    started_at = session.get("started_at")
+    finished_at = session.get("finished_at")
+    if not isinstance(started_at, str) or not started_at:
+        return None
+    if not isinstance(finished_at, str) or not finished_at:
+        return None
+    try:
+        _validated_timestamp(finished_at, field="review session finished_at")
+    except ReviewIntelligenceError:
+        return None
     if str(session["collector_name"]) != COLLECTOR_NAME:
         return None
     version = str(session["collector_version"])
@@ -1336,12 +1356,30 @@ def _validate_frozen_maps_parent(
     the legacy canonical-key binding, and the DETERMINISTIC evidence
     id (backfill id over business+content hash; sync id over
     business+run+content hash) — before supersession may be silent.
+
+    R13-02: the producer contract now also covers the parent
+    ACQUISITION SESSION itself — deterministic session id from the
+    run, NULL target, canonical import-mode config with hash,
+    run-row-equal lifecycle timestamps, no error, stored counts
+    matching actual children — and the legacy business/canonical-key
+    bindings apply to BOTH kinds, exactly as the Maps sync verifier
+    applies them to all snapshot evidence.
     """
     row = conn.execute(
         "SELECT e.content_sha256,e.source_id,e.source_role,e.status,"
-        "e.retrieved_at,a.collector_name,a.collector_version,"
+        "e.retrieved_at,a.id AS parent_session_id,"
+        "a.target_subject_id AS parent_target_subject_id,"
+        "a.collector_name,a.collector_version,"
         "a.status AS session_status,a.source_id AS parent_source_id,"
-        "a.legacy_run_id AS parent_legacy_run_id,e.metadata_json "
+        "a.legacy_run_id AS parent_legacy_run_id,"
+        "a.config_json AS parent_config_json,"
+        "a.config_hash AS parent_config_hash,"
+        "a.started_at AS parent_started_at,"
+        "a.finished_at AS parent_finished_at,"
+        "a.error AS parent_error,"
+        "a.evidence_count AS parent_evidence_count,"
+        "a.observation_count AS parent_observation_count,"
+        "e.metadata_json "
         "FROM evidence_items e "
         "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
         "WHERE e.id=?",
@@ -1350,8 +1388,12 @@ def _validate_frozen_maps_parent(
     if row is None:
         return None
     (content_sha, source_id, role, status, retrieved_at,
-     collector, collector_version, session_status, parent_source_id,
-     parent_legacy_run_id, metadata_json) = row
+     parent_session_id, parent_target_subject_id, collector,
+     collector_version, session_status, parent_source_id,
+     parent_legacy_run_id, parent_config_json, parent_config_hash,
+     parent_started_at, parent_finished_at, parent_error,
+     parent_evidence_count, parent_observation_count,
+     metadata_json) = row
     if str(source_id) != mb.GOOGLE_MAPS_SOURCE_ID:
         return None
     # R12-03: the parent acquisition session's own source binding.
@@ -1395,10 +1437,73 @@ def _validate_frozen_maps_parent(
         return None
     if str(metadata.get("legacy_run_id") or "") != str(parent_legacy_run_id):
         return None
+    # R13-02: the legacy business and canonical-key bindings are COMMON
+    # to both producer kinds — the Maps sync verifier applies them to
+    # every snapshot evidence row, so a sync-kind parent with a wrong
+    # legacy_business_id or legacy_canonical_key is not legitimate.
+    business_id = int(config["source_maps_business_id"])
+    if metadata.get("legacy_business_id") != business_id:
+        return None
+    business_row = conn.execute(
+        "SELECT canonical_key FROM businesses WHERE id=?",
+        (business_id,),
+    ).fetchone()
+    if business_row is None:
+        return None
+    if metadata.get("legacy_canonical_key") != business_row[0]:
+        return None
+    # R13-02: reproduce the Maps producer's deterministic
+    # ACQUISITION-SESSION identity, config, hash, and lifecycle
+    # contract (mirroring maps_sync._ensure_session): the session id
+    # derived from the legacy run, NULL target, the canonical
+    # import-mode config for the collector kind with its hash,
+    # timestamps equal to the legacy run row's, no error, and stored
+    # counts matching actual children.
+    run_row = conn.execute(
+        "SELECT started_at, finished_at FROM runs WHERE id=?",
+        (str(parent_legacy_run_id),),
+    ).fetchone()
+    if run_row is None:
+        return None
+    if str(parent_session_id) != mb._acquisition_id(str(parent_legacy_run_id)):
+        return None
+    if parent_target_subject_id is not None:
+        return None
+    if parent_error not in (None, ""):
+        return None
+    if str(parent_started_at) != str(run_row[0]):
+        return None
+    if str(parent_finished_at) != str(run_row[1]):
+        return None
+    expected_import_mode = (
+        "latest_canonical_maps_snapshot"
+        if kind == "legacy_maps_business_snapshot"
+        else "maps_sync_current_snapshot"
+    )
+    expected_config = canonical_json({
+        "import_mode": expected_import_mode,
+        "legacy_run_id": str(parent_legacy_run_id),
+    })
+    if str(parent_config_json) != expected_config:
+        return None
+    if str(parent_config_hash) != sha256_text(expected_config):
+        return None
+    actual_parent_evidence = int(conn.execute(
+        "SELECT COUNT(*) FROM evidence_items "
+        "WHERE acquisition_session_id=?",
+        (str(parent_session_id),),
+    ).fetchone()[0])
+    if int(parent_evidence_count or 0) != actual_parent_evidence:
+        return None
+    actual_parent_observations = int(conn.execute(
+        "SELECT COUNT(*) FROM observations o "
+        "JOIN evidence_items e ON e.id=o.evidence_id "
+        "WHERE e.acquisition_session_id=?",
+        (str(parent_session_id),),
+    ).fetchone()[0])
+    if int(parent_observation_count or 0) != actual_parent_observations:
+        return None
     if kind == "legacy_maps_business_snapshot":
-        business_id = int(config["source_maps_business_id"])
-        if metadata.get("legacy_business_id") != business_id:
-            return None
         if (
                 config["source_business_entity_id"]
             != mb.business_entity_id_for_maps_business(business_id)
@@ -1409,18 +1514,9 @@ def _validate_frozen_maps_parent(
             != mb.location_id_for_maps_business(business_id)
         ):
             return None
-        # R12-03: reproduce the producer's deterministic evidence id
-        # and the legacy canonical-key binding — a fabricated row
-        # under an arbitrary id with otherwise plausible metadata is
-        # not a legitimate historical parent.
-        business_row = conn.execute(
-            "SELECT canonical_key FROM businesses WHERE id=?",
-            (business_id,),
-        ).fetchone()
-        if business_row is None:
-            return None
-        if metadata.get("legacy_canonical_key") != business_row[0]:
-            return None
+        # R12-03: reproduce the producer's deterministic evidence id —
+        # a fabricated row under an arbitrary id with otherwise
+        # plausible metadata is not a legitimate historical parent.
         if (
             config["source_evidence_id"]
             != mb._evidence_id(business_id, str(content_sha))
