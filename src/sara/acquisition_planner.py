@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v14): for the SAME entity, the SAME sealed
+Determinism contract (v15): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -67,7 +67,11 @@ from typing import Any
 # contract itself (complete status, no error, present timestamps),
 # so a non-complete deterministic occupant classifies INVALID
 # instead of mined.
-PLANNER_POLICY_VERSION = "acquisition-planner-v14"
+# v15: the guard loads the COMPLETE immutable session row including
+# the error column, so the verifier's no-error check sees the STORED
+# value — a complete-looking occupant with a non-NULL error
+# classifies INVALID, matching executor replay.
+PLANNER_POLICY_VERSION = "acquisition-planner-v15"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -482,10 +486,13 @@ def _review_extraction_state(
     if not snapshots:
         return ("none", {})  # no current retained snapshot
 
+    # R14-01: the complete immutable session row, error included — the
+    # verifier's no-error check must see the STORED value, not a
+    # missing key.
     session_keys = (
         "id", "target_subject_id", "source_id", "collector_name",
         "collector_version", "config_json", "config_hash", "status",
-        "started_at", "finished_at", "evidence_count",
+        "started_at", "finished_at", "error", "evidence_count",
         "observation_count",
     )
     pending_found = False
@@ -501,7 +508,7 @@ def _review_extraction_state(
         rows = conn.execute(
             f"SELECT id,target_subject_id,source_id,collector_name,"
             f"collector_version,config_json,config_hash,status,started_at,"
-            f"finished_at,evidence_count,observation_count "
+            f"finished_at,error,evidence_count,observation_count "
             f"FROM acquisition_sessions WHERE id IN (?,?)",
             deterministic_ids,
         ).fetchall()

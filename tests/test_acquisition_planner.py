@@ -1308,7 +1308,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v14",
+         "acquisition-planner-v15",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1320,7 +1320,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v14",
+         "acquisition-planner-v15",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -2194,7 +2194,96 @@ def test_non_complete_deterministic_occupant_demands_recovery(tmp_path: Path) ->
     conn.close()
 
 
+def test_complete_session_with_stored_error_demands_recovery(tmp_path: Path) -> None:
+    """R14-01: a deterministic occupant with status complete, valid
+    timestamps/config/children, and a NON-NULL stored error is the only
+    incompatible field — executor replay requires error IS NULL, so the
+    planner must classify it invalid, never mined."""
+    from unittest.mock import patch as mock_patch
+    from sara.acquisition_planner import STOP_INVALID_REVIEW_STATE
+    from sara.dossier import assessment as assessment_module
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    conn = prepared(tmp_path / "stored-error.sqlite", reviews=[REVIEW_SIMPLE])
+    entity = business_entity_id_for_maps_business(1)
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    raw = json.loads(business["raw_json"])
+    reviews, source_count = reviews_core.extract_reviews(raw)
+    cfg = json.loads(reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=source_count,
+        review_evidence_records=len(reviews),
+    ))
+    cfg["extraction_outcome"] = "complete"
+    config = json.dumps(cfg, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"))
+    session_id = review_opaque_id(
+        "acq", "retained-maps-reviews", cfg["source_evidence_id"],
+        cfg["source_location_id"], "2")
+    extracted_at = "2026-09-26T09:00:00+00:00"
+    rows = reviews_core._expected_review_rows(
+        session_id=session_id, source_evidence=source_evidence,
+        reviews=reviews, extracted_at=extracted_at, extractor_version="2")
+    # The schema CHECK forbids complete+error — this row can only exist
+    # as corruption written with constraint checking bypassed. Seed it
+    # exactly that way; the planner must still classify it invalid.
+    conn.execute("PRAGMA ignore_check_constraints=ON")
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, cfg["source_location_id"], "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         extracted_at, extracted_at,
+         "stale error text left on a complete row",  # the ONLY drift
+         None, len(rows), len(rows)))
+    conn.execute("PRAGMA ignore_check_constraints=OFF")
+    for evidence, observation in rows:
+        conn.execute(
+            "INSERT INTO evidence_items("
+            "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+            "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(evidence[key] for key in (
+                "id", "acquisition_session_id", "source_id", "source_locator",
+                "source_role", "status", "retrieved_at", "published_at",
+                "language", "media_type", "content_sha256", "artifact_ref",
+                "metadata_json", "created_at")))
+        conn.execute(
+            "INSERT INTO observations("
+            "id,subject_id,predicate,evidence_id,value_json,normalized_value_json,value_hash,"
+            "observation_kind,observed_at,extracted_at,extraction_method,extractor_name,"
+            "extractor_version,confidence,created_at"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(observation[key] for key in (
+                "id", "subject_id", "predicate", "evidence_id", "value_json",
+                "normalized_value_json", "value_hash", "observation_kind",
+                "observed_at", "extracted_at", "extraction_method",
+                "extractor_name", "extractor_version", "confidence",
+                "created_at")))
+    conn.commit()
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action is None
+    assert decision.stop_reason == STOP_INVALID_REVIEW_STATE
+    assert decision.details["session_id"] == session_id
+    conn.close()
+
+
 def test_review_action_not_rescheduled_after_mining(tmp_path: Path) -> None:
+
+
     """F-01 termination guard: with reputation still deficient, a mined
     snapshot is not re-scheduled as a provable no-op."""
     from unittest.mock import patch as mock_patch
