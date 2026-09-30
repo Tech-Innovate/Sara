@@ -208,7 +208,7 @@ def test_seed_requires_exact_phase_one_history_and_no_outer_transaction(tmp_path
     future = migrated_conn(tmp_path / "future.sqlite")
     future.execute(
         "INSERT INTO schema_migrations(version, name, checksum, applied_at) "
-        "VALUES (3, 'future_schema', ?, 't3')",
+        "VALUES (5, 'future_schema', ?, 't5')",
         ("f" * 64,),
     )
     future.commit()

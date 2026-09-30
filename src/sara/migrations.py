@@ -1392,6 +1392,44 @@ BUSINESS_UNDERSTANDING_V2: tuple[str, ...] = (
 )
 
 
+BUSINESS_UNDERSTANDING_V3 = (
+    """
+    CREATE TABLE planner_decisions(
+        id TEXT PRIMARY KEY,
+        business_entity_id TEXT NOT NULL,
+        decided_at TEXT NOT NULL,
+        action TEXT,
+        stop_reason TEXT,
+        reason_code TEXT NOT NULL,
+        target_domain TEXT,
+        policy_version TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK ((action IS NULL) <> (stop_reason IS NULL)),
+        FOREIGN KEY(business_entity_id) REFERENCES business_entities(id)
+    )
+    """,
+    "CREATE INDEX planner_decisions_entity_time "
+    "ON planner_decisions(business_entity_id, decided_at)",
+)
+
+BUSINESS_UNDERSTANDING_V4 = (
+    """
+    CREATE TRIGGER planner_decisions_no_update
+    BEFORE UPDATE ON planner_decisions
+    BEGIN
+        SELECT RAISE(ABORT, 'planner decisions are append-only audit records');
+    END
+    """,
+    """
+    CREATE TRIGGER planner_decisions_no_delete
+    BEFORE DELETE ON planner_decisions
+    BEGIN
+        SELECT RAISE(ABORT, 'planner decisions are append-only audit records');
+    END
+    """,
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -1402,6 +1440,16 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=2,
         name="external_identifier_status_chronology_v2",
         statements=BUSINESS_UNDERSTANDING_V2,
+    ),
+    Migration(
+        version=3,
+        name="acquisition_planner_decisions_v3",
+        statements=BUSINESS_UNDERSTANDING_V3,
+    ),
+    Migration(
+        version=4,
+        name="planner_decisions_append_only_v4",
+        statements=BUSINESS_UNDERSTANDING_V4,
     ),
 )
 

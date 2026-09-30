@@ -160,7 +160,7 @@ def test_backfill_reads_legacy_web_site_without_mutating_legacy_business_row(tmp
     record = _verbatim_v1181_shape()
     business_id = _insert_legacy_business(conn, record)
 
-    assert apply_migrations(conn) == (1, 2)
+    assert apply_migrations(conn) == (1, 2, 3, 4)
     seed_business_understanding_vocabulary(conn)
     before = tuple(conn.execute("SELECT website,raw_json FROM businesses WHERE id=?", (business_id,)).fetchone())
     mb.backfill_maps_business_understanding(conn)
@@ -181,7 +181,7 @@ def test_backfill_conflicting_website_aliases_rolls_back_understanding_bootstrap
     record = _verbatim_v1181_shape()
     record["website"] = "https://different.example/"
     _insert_legacy_business(conn, record)
-    assert apply_migrations(conn) == (1, 2)
+    assert apply_migrations(conn) == (1, 2, 3, 4)
     seed_business_understanding_vocabulary(conn)
 
     with pytest.raises(mb.MapsBackfillError, match="conflicting Maps website fields"):
