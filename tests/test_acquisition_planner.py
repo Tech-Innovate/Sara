@@ -1204,11 +1204,25 @@ def test_non_pk_integrity_error_propagates_not_replayed(tmp_path: Path) -> None:
                                     "session_history": {}, }})
 
     class RaisingConn:
-        """INSERT aborts with a CHECK-constraint IntegrityError (code 275)."""
+        """INSERT aborts with a REAL structured CHECK IntegrityError.
+
+        The error is raised by SQLite itself against a CHECK-constrained
+        probe table, so it carries the genuine extended identity
+        (SQLITE_CONSTRAINT_CHECK, code 275), not a hand-built exception.
+        """
+
+        def __init__(self):
+            self._probe = _sqlite3.connect(":memory:", isolation_level=None)
+            self._probe.execute(
+                "CREATE TABLE probe(x TEXT CHECK(x IN ('ok')))")
 
         def execute(self, sql, params=()):
             if sql.startswith("INSERT INTO planner_decisions"):
-                raise _sqlite3.IntegrityError("CHECK constraint failed: probe")
+                try:
+                    self._probe.execute(
+                        "INSERT INTO probe VALUES ('violated')")
+                except _sqlite3.IntegrityError as real_exc:
+                    raise real_exc from None
             return conn.execute(sql, params)
 
         def rollback(self):
@@ -1217,8 +1231,17 @@ def test_non_pk_integrity_error_propagates_not_replayed(tmp_path: Path) -> None:
         def commit(self):
             return conn.commit()
 
-    with pytest.raises(_sqlite3.IntegrityError, match="CHECK constraint"):
+    raised = None
+    try:
         _persist(RaisingConn(), decision, entity_id="be_missing_target")
+    except _sqlite3.IntegrityError as exc:
+        raised = exc
+    assert raised is not None
+    assert getattr(raised, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_CHECK"
+    assert getattr(raised, "sqlite_errorcode", None) == 275
+    assert conn.execute(
+        "SELECT COUNT(*) FROM planner_decisions WHERE id=?",
+        ("plan_probe_pk",)).fetchone()[0] == 0
     conn.close()
 
 
@@ -1228,18 +1251,19 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
     conn = prepared(tmp_path / "lexical-replay.sqlite")
     entity = business_entity_id_for_maps_business(1)
     acquire(conn, tmp_path)
-    # Two prior action decisions: the lexically-later one (+03:00) is the
-    # EARLIER instant; the lexically-earlier one (+00:00) is newest.
-    conn.execute(
-        "INSERT INTO planner_decisions("
-        "id,business_entity_id,decided_at,action,stop_reason,reason_code,"
-        "target_domain,policy_version,details_json,created_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
-         "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v6",
-         '{"assessment_id":"none","planner_inputs":{"max_decisions":1,'
-         '"session_history":{}}}', "2026-09-26T12:10:00+00:00"))
+    # Seal the assessment over the current state, then capture the exact
+    # sealed inputs the planner will recompute.
+    result = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:05:00+00:00")
+    probe_decision = plan_next_acquisition(
+        conn, entity_id=entity, now="2026-09-26T12:05:30+00:00",
+        decisions_taken=0, max_decisions=1)
+    matching_inputs = probe_decision.details["planner_inputs"]
+
+    # The lexically-LARGER row is the EARLIER instant and does NOT match
+    # the recomputed inputs (different ceiling, empty history); the
+    # lexically-smaller row is newest by instant and DOES match. Only
+    # the newest-by-instant row may be replayed.
     conn.execute(
         "INSERT INTO planner_decisions("
         "id,business_entity_id,decided_at,action,stop_reason,reason_code,"
@@ -1248,23 +1272,30 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
          "acquisition-planner-v6",
-         '{"assessment_id":"none","planner_inputs":{"max_decisions":1,'
-         '"session_history":{}}}', "2026-09-26T14:00:00+03:00"))
+         json.dumps({"assessment_id": result.assessment_id,
+                     "planner_inputs": {"max_decisions": 99,
+                                        "session_history": {}}},
+                    sort_keys=True), "2026-09-26T14:00:00+03:00"))
+    conn.execute(
+        "INSERT INTO planner_decisions("
+        "id,business_entity_id,decided_at,action,stop_reason,reason_code,"
+        "target_domain,policy_version,details_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
+         "acquire_official_website", None, "probe", "offerings",
+         "acquisition-planner-v6",
+         json.dumps({"assessment_id": result.assessment_id,
+                     "planner_inputs": matching_inputs},
+                    sort_keys=True), "2026-09-26T12:10:00+00:00"))
     conn.commit()
     conn.close()
     db = str(tmp_path / "lexical-replay.sqlite")
-    # decisions_taken = 2 >= ceiling 1 -> policy_ceiling; the replay
-    # shortcut picks the newest BY INSTANT (plan_lex_newer) but the
-    # sealed-state comparison fails (probe inputs), so the honest stop
-    # is returned. The selection itself is what this pins: run with a
-    # matching assessment so replay triggers, then assert the printed id.
+    # decisions_taken = 2 >= ceiling 1 recomputes policy_ceiling; the
+    # newest-by-instant candidate matches the sealed state, so it MUST be
+    # replayed — lexical selection would hand back plan_lex_older.
     rc = planner_cli_main(["--db", db, "--business-id", "1",
                            "--max-decisions", "1"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    # Either an honest policy_ceiling stop or a replay of the newest
-    # persisted action — never the lexically-larger older row alone.
-    if payload.get("replayed"):
-        assert payload["decision_id"] == "plan_lex_newer"
-    else:
-        assert payload["stop_reason"] == "policy_ceiling"
+    assert payload.get("replayed") is True
+    assert payload["decision_id"] == "plan_lex_newer"

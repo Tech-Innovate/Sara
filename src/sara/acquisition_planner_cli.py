@@ -49,16 +49,17 @@ def _persist(conn: sqlite3.Connection, decision, *, entity_id: str) -> dict | No
         return None
     except sqlite3.IntegrityError as exc:
         conn.rollback()
-        # Classify by SQLite's extended constraint code, not the
-        # human-readable message: PRIMARYKEY (2067) with the row already
-        # present is a deterministic replay; every other constraint
-        # (FOREIGN KEY, CHECK, NOT NULL, ...) propagates as a real error.
+        # Classify by SQLite's extended constraint identity, not the
+        # human-readable message: PRIMARYKEY with the row already present
+        # is a deterministic replay; every other constraint — UNIQUE
+        # (2067), FOREIGN KEY, CHECK, NOT NULL — propagates as a real
+        # error. Only the decision-ID primary-key collision may be
+        # suppressed.
         code = getattr(exc, "sqlite_errorcode", None)
         name = getattr(exc, "sqlite_errorname", None)
         is_primary_key_violation = (
             name == "SQLITE_CONSTRAINT_PRIMARYKEY"
             or code == 1555  # SQLITE_CONSTRAINT_PRIMARYKEY (short form)
-            or code == 2067  # SQLITE_CONSTRAINT_PRIMARYKEY (extended)
         )
         row = conn.execute(
             "SELECT id,business_entity_id,decided_at,action,stop_reason,reason_code,"
