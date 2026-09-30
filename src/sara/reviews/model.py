@@ -10,8 +10,25 @@ class ReviewIntelligenceError(RuntimeError):
     """Retained review evidence cannot be extracted safely."""
 
 
+class ReviewTargetUnavailableError(ReviewIntelligenceError):
+    """The requested target has no currently extractable snapshot.
+
+    Raised for selection- and evidence-availability failures (unknown
+    business, no current Maps selector or Understanding location, no
+    matching retained evidence): nothing is acquirable for this target
+    right now. Entity-scoped extraction skips such targets with an
+    explicit reason instead of aborting; parse- and integrity-class
+    failures keep raising ReviewIntelligenceError.
+    """
+
+
 COLLECTOR_NAME = "sara.reviews.maps_snapshot"
-COLLECTOR_VERSION = "1"
+# v2: the frozen session config gains the derived extraction_outcome
+# key. Sessions produced by v1 (identical extraction semantics,
+# outcome-free config) replay through the legacy-id/legacy-config
+# compatibility path in core._verify_existing instead of colliding
+# as incompatible provenance or minting duplicate review evidence.
+COLLECTOR_VERSION = "2"
 REVIEW_PREDICATE = "reputation.customer_review"
 ID_NAMESPACE = "sara.business-understanding.maps-reviews.v1"
 REVIEW_ARRAY_FIELDS = ("user_reviews", "user_reviews_extended")

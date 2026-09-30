@@ -12,7 +12,11 @@ from sara.maps_backfill import (
 )
 from sara.migrations import apply_migrations
 from sara.reviews import ReviewIntelligenceError, extract_retained_reviews
-from sara.reviews.model import COLLECTOR_NAME, REVIEW_PREDICATE
+from sara.reviews.model import (
+    COLLECTOR_NAME,
+    COLLECTOR_VERSION,
+    REVIEW_PREDICATE,
+)
 from sara.reviews.parser import extract_reviews
 from sara.storage import connect as storage_connect, ingest_records
 from sara.understanding_vocabulary import seed_business_understanding_vocabulary
@@ -179,7 +183,7 @@ def test_retained_reviews_become_source_location_observations_not_facts(
         stats.source_location_id,
         "src_google_maps",
         COLLECTOR_NAME,
-        "1",
+        COLLECTOR_VERSION,
         "complete",
         2,
         2,
@@ -213,7 +217,7 @@ def test_retained_reviews_become_source_location_observations_not_facts(
     assert {row["observation_kind"] for row in observations} == {"source_assertion"}
     assert {row["extraction_method"] for row in observations} == {"direct_structured"}
     assert {row["extractor_name"] for row in observations} == {COLLECTOR_NAME}
-    assert {row["extractor_version"] for row in observations} == {"1"}
+    assert {row["extractor_version"] for row in observations} == {COLLECTOR_VERSION}
     assert {row["confidence"] for row in observations} == {1.0}
 
     normalized = [json.loads(row["value_json"]) for row in observations]
@@ -322,7 +326,21 @@ def test_malformed_review_source_fails_closed_without_partial_review_session(tmp
     with pytest.raises(ReviewIntelligenceError, match="must be an array"):
         extract_retained_reviews(conn, business_id=business_id)
 
-    assert int(conn.execute("SELECT COUNT(*) FROM acquisition_sessions").fetchone()[0]) == sessions_before
+    # F-06 (PR #21): a deterministic malformed-review failure now
+    # leaves DURABLE acquisition state — exactly one failed session
+    # (never a partial one) with no evidence or observations.
+    rows = conn.execute(
+        "SELECT status, error, evidence_count, observation_count "
+        "FROM acquisition_sessions "
+        "WHERE collector_name=?", (COLLECTOR_NAME,)
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "failed"
+    assert "must be an array" in rows[0][1]
+    assert rows[0][2] == 0 and rows[0][3] == 0
+    assert int(conn.execute(
+        "SELECT COUNT(*) FROM acquisition_sessions").fetchone()[0]
+    ) == sessions_before + 1
     assert conn.execute(
         "SELECT COUNT(*) FROM observations WHERE predicate=?", (REVIEW_PREDICATE,)
     ).fetchone()[0] == 0

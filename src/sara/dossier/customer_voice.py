@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 from typing import Any
 
-from ..reviews.model import REVIEW_PREDICATE, canonical_json, sha256_text
+from ..reviews.model import (
+    COLLECTOR_NAME,
+    REVIEW_PREDICATE,
+    canonical_json,
+    sha256_text,
+)
 from .core import DossierQueryError, json_value, parse_timestamp, resolve_subject, row_dict
 
 
@@ -478,3 +484,81 @@ def customer_review_observations(
         )
     )
     return reviews, issues
+
+
+def review_evidence_unavailable_outcomes(
+    conn: sqlite3.Connection,
+    current_location_ids: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project complete review extractions that found NO retained reviews.
+
+    The explicit-unavailable outcome is durable session state (F-01): a
+    complete sara.reviews.maps_snapshot session whose frozen config
+    carries extraction_outcome="unavailable" proves the retained
+    snapshot was mined and contained zero review records. Reputation
+    assessment consumes this so an explicitly unavailable review source
+    can satisfy the domain instead of the planner re-scheduling a
+    provably no-op extraction forever. Sessions whose config cannot be
+    decoded are integrity issues, never outcomes.
+    """
+    source_ids = _location_lineage(conn, current_location_ids)
+    if not source_ids:
+        return [], []
+    placeholders = ",".join("?" for _ in source_ids)
+    cursor = conn.execute(
+        "SELECT id,target_subject_id,collector_name,collector_version,"
+        "config_json,status,finished_at FROM acquisition_sessions "
+        f"WHERE collector_name=? AND target_subject_id IN ({placeholders}) "
+        "AND status='complete' ORDER BY finished_at,id",
+        (COLLECTOR_NAME, *source_ids),
+    )
+    outcomes: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for row in cursor.fetchall():
+        item = row_dict(cursor, row)
+        session_id = str(item["id"])
+        try:
+            config = json.loads(str(item["config_json"]))
+            if not isinstance(config, dict):
+                raise ValueError("config is not a JSON object")
+        except ValueError:
+            issues.append(
+                {
+                    "code": "review_outcome_session_config_invalid",
+                    "session_id": session_id,
+                }
+            )
+            continue
+        if config.get("extraction_outcome") != "unavailable":
+            continue
+        finished_at = item["finished_at"]
+        if not isinstance(finished_at, str) or not finished_at:
+            issues.append(
+                {
+                    "code": "review_outcome_session_config_invalid",
+                    "session_id": session_id,
+                }
+            )
+            continue
+        parse_timestamp(
+            finished_at,
+            field=f"review outcome session {session_id} finished_at",
+        )
+        outcomes.append(
+            {
+                "session_id": session_id,
+                "target_subject_id": str(item["target_subject_id"]),
+                "collector_version": str(item["collector_version"]),
+                "finished_at": finished_at,
+                "source_evidence_id": str(config.get("source_evidence_id")),
+                "source_content_sha256": str(config.get("source_content_sha256")),
+                "source_location_id": str(config.get("source_location_id")),
+            }
+        )
+    issues.sort(
+        key=lambda item: (
+            str(item.get("code", "")),
+            str(item.get("session_id", "")),
+        )
+    )
+    return outcomes, issues

@@ -11,7 +11,13 @@ from typing import Any, Callable
 
 from .. import maps_backfill as mb
 from .. import maps_sync as ms
-from ..dossier.core import DossierQueryError, resolve_selection, resolve_subject
+from ..dossier.core import (
+    DossierQueryError,
+    locations as dossier_locations,
+    maps_businesses as dossier_maps_businesses,
+    resolve_selection,
+    resolve_subject,
+)
 from ..migrations import MigrationError, apply_migrations
 from ..storage import connect_existing
 from ..understanding_vocabulary import (
@@ -22,6 +28,7 @@ from ..understanding_vocabulary import (
 from .model import (
     COLLECTOR_NAME,
     COLLECTOR_VERSION,
+    ReviewTargetUnavailableError,
     REVIEW_ARRAY_FIELDS,
     REVIEW_PREDICATE,
     ParsedReview,
@@ -36,6 +43,11 @@ from .parser import extract_reviews
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Collector v1 froze the pre-outcome config shape; v1 sessions replay
+# under this version through the compatibility path (F-05).
+_LEGACY_COLLECTOR_VERSION = "1"
 
 
 def _validated_timestamp(value: str, *, field: str) -> str:
@@ -70,7 +82,8 @@ def _source_business(
     )
     row = cursor.fetchone()
     if row is None:
-        raise ReviewIntelligenceError(f"canonical Maps business {business_id} does not exist")
+        raise ReviewTargetUnavailableError(
+            f"canonical Maps business {business_id} does not exist")
     return {description[0]: row[index] for index, description in enumerate(cursor.description or ())}
 
 
@@ -94,14 +107,18 @@ def _resolve_target(
             canonical_key=canonical_key.strip() if canonical_key is not None else None,
             entity_id=None,
         )
-    except (VocabularySeedError, DossierQueryError) as exc:
+    except VocabularySeedError as exc:
         raise ReviewIntelligenceError(str(exc)) from exc
+    except DossierQueryError as exc:
+        raise ReviewTargetUnavailableError(str(exc)) from exc
     maps_business = selection.get("maps_business")
     if not isinstance(maps_business, dict) or not isinstance(maps_business.get("id"), int):
-        raise ReviewIntelligenceError("review extraction requires a current Maps business selector")
+        raise ReviewTargetUnavailableError(
+            "review extraction requires a current Maps business selector")
     location_id = selection.get("canonical_location_id")
     if not isinstance(location_id, str) or not location_id:
-        raise ReviewIntelligenceError("selected Maps business has no current Understanding location")
+        raise ReviewTargetUnavailableError(
+            "selected Maps business has no current Understanding location")
     source = _source_business(conn, business_id=int(maps_business["id"]))
     return int(maps_business["id"]), entity_id, location_id, source
 
@@ -216,7 +233,7 @@ def _maps_source_evidence(
         item["frozen_location_id"] = frozen_location_id
         candidates.append(item)
     if not candidates:
-        raise ReviewIntelligenceError(
+        raise ReviewTargetUnavailableError(
             "no exact retained Maps evidence matches the current business snapshot; "
             "run sara-maps-sync before review extraction"
         )
@@ -295,6 +312,7 @@ def _expected_review_rows(
     source_evidence: dict[str, Any],
     reviews: tuple[ParsedReview, ...],
     extracted_at: str,
+    extractor_version: str = COLLECTOR_VERSION,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
     observed_at = str(source_evidence["retrieved_at"])
@@ -333,7 +351,7 @@ def _expected_review_rows(
             "extracted_at": extracted_at,
             "extraction_method": "direct_structured",
             "extractor_name": COLLECTOR_NAME,
-            "extractor_version": COLLECTOR_VERSION,
+            "extractor_version": extractor_version,
             "confidence": 1.0,
             "created_at": extracted_at,
         }
@@ -378,6 +396,7 @@ def _verify_existing(
     *,
     session_id: str,
     config_json: str,
+    collector_version: str = COLLECTOR_VERSION,
     business_id: int,
     business_entity_id: str,
     canonical_location_id: str,
@@ -400,7 +419,7 @@ def _verify_existing(
         "target_subject_id": source_evidence["frozen_location_id"],
         "source_id": mb.GOOGLE_MAPS_SOURCE_ID,
         "collector_name": COLLECTOR_NAME,
-        "collector_version": COLLECTOR_VERSION,
+        "collector_version": collector_version,
         "config_json": config_json,
         "config_hash": sha256_text(config_json),
         "status": "complete",
@@ -422,6 +441,7 @@ def _verify_existing(
         source_evidence=source_evidence,
         reviews=reviews,
         extracted_at=extracted_at,
+        extractor_version=collector_version,
     )
     evidence_rows = conn.execute(
         "SELECT id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
@@ -464,6 +484,84 @@ def _verify_existing(
     )
 
 
+def _record_failed_extraction(
+    conn: sqlite3.Connection,
+    *,
+    source_evidence: dict[str, Any],
+    error: str,
+    now: Callable[[], str],
+) -> str:
+    """Persist one durable failed review-acquisition attempt (F-06).
+
+    A deterministic malformed-review failure must leave durable
+    acquisition state, or the planner would keep scheduling an action
+    that provably cannot succeed. The failed-session id embeds the
+    attempt timestamp (the per-attempt pattern the website collector
+    uses), so repeated attempts on an unchanged malformed snapshot
+    accumulate distinct rows and drive the review collector's scoped
+    retry ceiling.
+    """
+    failed_at = _validated_timestamp(now(), field="review extraction time")
+    config = canonical_json(
+        {
+            "input_kind": "retained_maps_review_snapshot",
+            "source_maps_business_id": source_evidence["metadata"]["legacy_business_id"],
+            "source_business_entity_id": source_evidence["frozen_entity_id"],
+            "source_location_id": source_evidence["frozen_location_id"],
+            "source_evidence_id": source_evidence["id"],
+            "source_content_sha256": source_evidence["content_sha256"],
+            "extraction_outcome": "failed",
+        }
+    )
+    session_id = opaque_id(
+        "acq",
+        "retained-maps-reviews-failed",
+        source_evidence["id"],
+        str(source_evidence["frozen_location_id"]),
+        COLLECTOR_VERSION,
+        failed_at,
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "INSERT INTO acquisition_sessions("
+            "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
+            "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                session_id,
+                str(source_evidence["frozen_location_id"]),
+                mb.GOOGLE_MAPS_SOURCE_ID,
+                COLLECTOR_NAME,
+                COLLECTOR_VERSION,
+                config,
+                sha256_text(config),
+                "failed",
+                failed_at,
+                failed_at,
+                error,
+                None,
+                0,
+                0,
+            ),
+        )
+        violations = list(conn.execute("PRAGMA foreign_key_check"))
+        if violations:
+            raise ReviewIntelligenceError(
+                f"foreign-key violations after failed-session record: {violations!r}"
+            )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Same-attempt id (identical failed_at second): already recorded.
+        if conn.in_transaction:
+            conn.rollback()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    return session_id
+
+
 def extract_retained_reviews(
     conn: sqlite3.Connection,
     *,
@@ -502,9 +600,24 @@ def extract_retained_reviews(
             business=business,
             location_id=canonical_location_id,
         )
-        raw = _parse_json_object(business["raw_json"], field="canonical Maps raw_json")
-        reviews, source_review_records = extract_reviews(raw)
-        config_json = _session_config(
+        try:
+            raw = _parse_json_object(
+                business["raw_json"], field="canonical Maps raw_json")
+            reviews, source_review_records = extract_reviews(raw)
+        except ReviewIntelligenceError as exc:
+            # F-06: roll back the writer transaction and durably record
+            # the failed attempt (its own transaction) before
+            # propagating, so bounded retry can see it.
+            if conn.in_transaction:
+                conn.rollback()
+            failed_session_id = _record_failed_extraction(
+                conn, source_evidence=source_evidence, error=str(exc), now=now
+            )
+            raise ReviewIntelligenceError(
+                f"{exc} (recorded as failed review acquisition session "
+                f"{failed_session_id})"
+            ) from exc
+        legacy_config_json = _session_config(
             source_evidence=source_evidence,
             source_review_records=source_review_records,
             review_evidence_records=len(reviews),
@@ -513,7 +626,7 @@ def extract_retained_reviews(
         # configuration: enrich it before the deterministic id and the
         # idempotency verification so replays compare identical bytes.
         outcome_status = "complete" if reviews else "unavailable"
-        config_with_outcome = json.loads(config_json)
+        config_with_outcome = json.loads(legacy_config_json)
         config_with_outcome["extraction_outcome"] = outcome_status
         config_json = canonical_json(config_with_outcome)
         source_location_id = str(source_evidence["frozen_location_id"])
@@ -538,6 +651,33 @@ def extract_retained_reviews(
         if existing is not None:
             conn.commit()
             return existing
+        # F-05 v1 compatibility: a genuine v1 session for this snapshot
+        # shares every identity input except the embedded version and
+        # freezes the pre-outcome config. It must replay as-is — never
+        # collide as incompatible provenance, never be re-mined into a
+        # duplicate v2 session with duplicate review evidence.
+        legacy_session_id = opaque_id(
+            "acq",
+            "retained-maps-reviews",
+            source_evidence["id"],
+            source_location_id,
+            _LEGACY_COLLECTOR_VERSION,
+        )
+        legacy_existing = _verify_existing(
+            conn,
+            session_id=legacy_session_id,
+            config_json=legacy_config_json,
+            collector_version=_LEGACY_COLLECTOR_VERSION,
+            business_id=resolved_business_id,
+            business_entity_id=entity_id,
+            canonical_location_id=canonical_location_id,
+            source_evidence=source_evidence,
+            reviews=reviews,
+            source_review_records=source_review_records,
+        )
+        if legacy_existing is not None:
+            conn.commit()
+            return legacy_existing
 
         extracted_at = _validated_timestamp(now(), field="review extraction time")
         rows = _expected_review_rows(
@@ -656,6 +796,71 @@ def extract_retained_reviews(
         raise
 
 
+def extract_retained_reviews_for_entity(
+    conn: sqlite3.Connection,
+    *,
+    entity_id: str,
+    now: Callable[[], str] = _utc_now,
+) -> dict[str, Any]:
+    """Extract retained reviews for EVERY Maps business of one entity.
+
+    F-04 deterministic executor target: the planner schedules review
+    extraction at Entity scope, so the extraction semantics are
+    Entity-scoped too — a multi-location entity owns several
+    Maps-backed review corpora. Businesses run in ascending business-id
+    order, each keeping its own per-snapshot identity and idempotency.
+    A target with no currently extractable snapshot is skipped with an
+    explicit reason instead of aborting the remaining locations;
+    parse-class failures propagate after their durable failed-session
+    record (F-06).
+    """
+    if conn.in_transaction:
+        raise ReviewIntelligenceError(
+            "review extraction requires a connection with no active transaction"
+        )
+    conn.execute("PRAGMA foreign_keys=ON")
+    if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+        raise ReviewIntelligenceError(
+            "SQLite foreign-key enforcement must be enabled for review extraction"
+        )
+    try:
+        verify_business_understanding_vocabulary(conn)
+    except VocabularySeedError as exc:
+        raise ReviewIntelligenceError(str(exc)) from exc
+    try:
+        canonical_entity_id, _selection = resolve_selection(
+            conn,
+            business_id=None,
+            canonical_key=None,
+            entity_id=str(entity_id).strip(),
+        )
+    except DossierQueryError as exc:
+        raise ReviewIntelligenceError(str(exc)) from exc
+    _location_rows, current_location_ids = dossier_locations(
+        conn, canonical_entity_id
+    )
+    businesses = dossier_maps_businesses(conn, current_location_ids)
+    results: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for business in sorted(businesses, key=lambda item: int(item["id"])):
+        business_id = int(business["id"])
+        try:
+            stats = extract_retained_reviews(
+                conn, business_id=business_id, now=now
+            )
+        except ReviewTargetUnavailableError as exc:
+            skipped.append({"business_id": business_id, "reason": str(exc)})
+            continue
+        results.append(asdict(stats))
+    return {
+        "entity_id": canonical_entity_id,
+        "businesses": results,
+        "skipped": skipped,
+        "business_count": len(results),
+        "skipped_count": len(skipped),
+    }
+
+
 def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -675,6 +880,7 @@ def _parser() -> argparse.ArgumentParser:
     selector = parser.add_mutually_exclusive_group(required=True)
     selector.add_argument("--business-id", type=_positive_int)
     selector.add_argument("--canonical-key")
+    selector.add_argument("--entity-id")
     parser.add_argument("--pretty", action="store_true")
     return parser
 
@@ -686,13 +892,19 @@ def main(argv: list[str] | None = None) -> int:
         conn = connect_existing(Path(args.db))
         apply_migrations(conn)
         seed_business_understanding_vocabulary(conn)
-        stats = extract_retained_reviews(
-            conn,
-            business_id=args.business_id,
-            canonical_key=args.canonical_key,
-        )
+        if args.entity_id is not None:
+            payload = extract_retained_reviews_for_entity(
+                conn, entity_id=args.entity_id
+            )
+        else:
+            payload = asdict(
+                extract_retained_reviews(
+                    conn,
+                    business_id=args.business_id,
+                    canonical_key=args.canonical_key,
+                )
+            )
         options = {"ensure_ascii": False, "sort_keys": True}
-        payload = asdict(stats)
         if args.pretty:
             print(json.dumps(payload, indent=2, **options))
         else:
