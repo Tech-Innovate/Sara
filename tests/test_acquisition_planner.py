@@ -1308,7 +1308,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v10",
+         "acquisition-planner-v11",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1320,7 +1320,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v10",
+         "acquisition-planner-v11",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -1409,6 +1409,163 @@ def test_review_running_session_suppresses_any_action(tmp_path: Path) -> None:
     assert location in decision.details["planner_inputs"]["session_history"][
         "lineage_subjects"]["locations"]
     conn.close()
+
+
+def _anchor_second_business(conn, *, merged_into: str) -> tuple[str, str, str]:
+    """Anchor Maps business id 2 whose deterministic anchor Location merged
+    into `merged_into`, carrying a fully provenance-valid retained snapshot
+    (run r2, backfill collector/version, canonical metadata) so the shared
+    executor resolver recognizes it as the business's current snapshot."""
+    import hashlib
+    from sara.maps_backfill import (
+        BACKFILL_VERSION,
+        _evidence_id,
+        business_entity_id_for_maps_business as _beid,
+        location_id_for_maps_business as _locid,
+    )
+
+    be2 = _beid(2)
+    loc_b2 = _locid(2)
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("r2", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
+         '{"strict_bounds":true}', "/evidence/r2.jsonl", "complete",
+         "2026-09-25T11:00:00+00:00"),
+    )
+    raw2 = "{}"
+    conn.execute(
+        "INSERT INTO businesses(id,canonical_key,title,first_seen_at,last_seen_at,"
+        "last_run_id,raw_json) VALUES (?,?,?,?,?,?,?)",
+        (2, "alias-business", "Alias Business",
+         "2026-09-25T11:00:00+00:00", "2026-09-26T09:59:00+00:00",
+         "r2", raw2),
+    )
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,created_at,updated_at) "
+        "VALUES (?,'business_entity','active',"
+        "'2026-09-25T00:00:00+00:00','2026-09-26T00:00:00+00:00')",
+        (be2,),
+    )
+    conn.execute(
+        "INSERT INTO business_entities(id,display_name,entity_type,lifecycle_status,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        (be2, "Alias Owner", "independent_business", "operating",
+         "2026-09-25T00:00:00+00:00", "2026-09-26T00:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
+        "merged_at,created_at,updated_at) "
+        "VALUES (?,'location','merged',?,"
+        "'2026-09-26T11:00:00+00:00','2026-09-25T10:00:00+00:00','2026-09-26T11:00:00+00:00')",
+        (loc_b2, merged_into),
+    )
+    conn.execute(
+        "INSERT INTO business_locations(id,business_entity_id,label,location_type,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        (loc_b2, be2, "alias", "branch",
+         "2026-09-25T10:00:00+00:00", "2026-09-26T11:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO maps_business_location_links(business_id,location_id,linked_at) "
+        "VALUES (2,?,'2026-09-25T10:00:00+00:00')",
+        (loc_b2,),
+    )
+    raw_hash = hashlib.sha256(raw2.encode("utf-8")).hexdigest()
+    evidence2 = _evidence_id(2, raw_hash)
+    metadata = json.dumps(
+        {
+            "import_kind": "legacy_maps_business_snapshot",
+            "legacy_business_id": 2,
+            "legacy_canonical_key": "alias-business",
+            "legacy_run_id": "r2",
+            "raw_json": raw2,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_b2_backfill", None, "src_google_maps", "sara.maps_backfill",
+         BACKFILL_VERSION, '{"import_mode":"latest_canonical_maps_snapshot"}',
+         "z" * 64, "complete", "2026-09-26T09:59:00+00:00",
+         "2026-09-26T10:00:00+00:00", None, "r2", 1, 0))
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
+        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (evidence2, "acq_b2_backfill", "src_google_maps",
+         "google_maps:legacy:2", "platform", "usable",
+         "2026-09-26T09:59:00+00:00", raw_hash, None, metadata,
+         "2026-09-26T09:59:00+00:00"))
+    conn.commit()
+    return be2, loc_b2, evidence2
+
+
+def _apply_sync_snapshot(
+    conn, *, business_id: int, new_run_id: str, retrieved_at: str
+) -> str:
+    """Simulate a Maps sync run observing the business's UNCHANGED raw
+    content: new run, new last_run_id/last_seen_at, and a NEW run-bound
+    sync evidence identity that supersedes the old backfill evidence
+    (R10-01/R10-04). Returns the new evidence id."""
+    import hashlib
+    from sara.maps_backfill import (
+        business_entity_id_for_maps_business as _beid,
+        location_id_for_maps_business as _locid,
+    )
+    from sara.maps_sync import SYNC_VERSION, _sync_evidence_id
+
+    canonical_key, raw_json = conn.execute(
+        "SELECT canonical_key, raw_json FROM businesses WHERE id=?",
+        (business_id,)).fetchone()
+    raw_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (new_run_id, "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
+         "{}", f"/evidence/{new_run_id}.jsonl", "complete", retrieved_at),
+    )
+    session_id = f"acq_sync_{new_run_id}"
+    metadata = json.dumps(
+        {
+            "import_kind": "maps_sync_snapshot",
+            "legacy_business_id": business_id,
+            "legacy_canonical_key": canonical_key,
+            "legacy_run_id": new_run_id,
+            "raw_json": raw_json,
+            "sync_entity_id": _beid(business_id),
+            "sync_location_id": _locid(business_id),
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    evidence_id = _sync_evidence_id(business_id, new_run_id, raw_hash)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, None, "src_google_maps", "sara.maps_sync",
+         SYNC_VERSION, "{}", "z" * 64, "complete", retrieved_at,
+         retrieved_at, None, new_run_id, 1, 0))
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
+        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (evidence_id, session_id, "src_google_maps",
+         f"google_maps:sync:{business_id}", "platform", "usable",
+         retrieved_at, raw_hash, None, metadata, retrieved_at))
+    conn.execute(
+        "UPDATE businesses SET last_run_id=?, last_seen_at=? WHERE id=?",
+        (new_run_id, retrieved_at, business_id))
+    conn.commit()
+    return evidence_id
 
 
 def _reputation_only_deficient(dossier):
@@ -1589,29 +1746,15 @@ def test_review_session_on_cross_owner_alias_is_visible(tmp_path: Path) -> None:
 
 
 def test_per_location_pending_failed_location_stays_pending(tmp_path: Path) -> None:
-    """R8-02: one location's completed extraction must not mask another
-    location's failed attempt — pending is judged per resolved location."""
+    """R8-02: one snapshot's completed extraction must not mask another
+    snapshot's failed attempt — pending is judged per exact snapshot."""
     from unittest.mock import patch as mock_patch
     from sara.dossier import assessment as assessment_module
 
     conn = prepared(tmp_path / "per-location.sqlite", reviews=[])
     entity = business_entity_id_for_maps_business(1)
-    location = location_id_for_maps_business(1)
-    conn.execute(
-        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
-        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("r2", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
-         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
-         '{"strict_bounds":true}', "/evidence/r2.jsonl", "complete",
-         "2026-09-25T11:00:00+00:00"),
-    )
-    conn.execute(
-        "INSERT INTO businesses(id,canonical_key,title,first_seen_at,last_seen_at,"
-        "last_run_id,raw_json) VALUES (?,?,?,?,?,?,?)",
-        (2, "second-business", "Second Business",
-         "2026-09-25T11:00:00+00:00", "2026-09-26T09:59:00+00:00",
-         "r2", "{}"),
-    )
+    # A second CURRENT location of our entity, carrying business 2 whose
+    # deterministic anchor Location redirects into it.
     conn.execute(
         "INSERT INTO knowledge_subjects(id,kind,record_state,created_at,updated_at) "
         "VALUES ('loc2','location','active',"
@@ -1623,91 +1766,29 @@ def test_per_location_pending_failed_location_stays_pending(tmp_path: Path) -> N
         ("loc2", entity, "second", "branch",
          "2026-09-25T10:00:00+00:00", "2026-09-26T10:00:00+00:00"),
     )
-    conn.execute(
-        "INSERT INTO maps_business_location_links(business_id,location_id,linked_at) "
-        "VALUES (2,'loc2','2026-09-25T10:00:00+00:00')",
-    )
-    # Location 1: mined to completion — as a REAL zero-review session
-    # would be frozen (canonical config shape + unavailable outcome
-    # against the retained platform evidence, so the outcome
-    # projection with its R9-04 provenance validation and the
-    # assessment watermark both accept it). Location 2: deterministic
-    # failure over its OWN retained snapshot.
-    from sara.reviews import core as reviews_core
-    from sara.reviews.model import canonical_json as rj
-
-    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
-        conn, business_id=1, canonical_key=None)
-    source_evidence = reviews_core._maps_source_evidence(
-        conn, business=business, location_id=canonical_location_id)
-    loc1_cfg = json.loads(reviews_core._session_config(
-        source_evidence=source_evidence,
-        source_review_records=0,
-        review_evidence_records=0,
-    ))
-    loc1_cfg["extraction_outcome"] = "unavailable"
-    loc1_config = rj(loc1_cfg)
-    # Business 2 gets its OWN retained snapshot: a backfill-style
-    # session plus the deterministic platform evidence row.
-    from sara.maps_backfill import _evidence_id
-
-    b2_raw = conn.execute(
-        "SELECT raw_json FROM businesses WHERE id=2").fetchone()[0]
-    evidence2 = _evidence_id(
-        2, __import__("hashlib").sha256(b2_raw.encode("utf-8")).hexdigest())
+    _be2, loc_b2, _ev2 = _anchor_second_business(conn, merged_into="loc2")
+    # Snapshot 2's deterministic failure leaves no coverage; snapshot 1 is
+    # then mined for real (a genuine unavailable session).
     conn.execute(
         "INSERT INTO acquisition_sessions("
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
         ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_b2_backfill", None, "src_google_maps", "sara.maps_backfill",
-         "2", '{"import_mode":"latest_canonical_maps_snapshot"}',
-         "z" * 64, "complete", "2026-09-26T09:59:00+00:00",
-         "2026-09-26T10:00:00+00:00", None, "r2", 1, 0))
-    conn.execute(
-        "INSERT INTO evidence_items("
-        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
-        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (evidence2, "acq_b2_backfill", "src_google_maps",
-         "google_maps:legacy:2", "platform", "usable",
-         "2026-09-26T09:59:00+00:00",
-         __import__("hashlib").sha256(b2_raw.encode("utf-8")).hexdigest(),
-         None, '{"import_kind":"legacy_maps_business_snapshot"}',
-         "2026-09-26T09:59:00+00:00"))
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_loc1_done", location, "src_google_maps",
-         "sara.reviews.maps_snapshot", "2",
-         loc1_config, "x" * 64, "complete",
-         "2026-09-26T12:00:00+00:00",
-         "2026-09-26T12:00:05+00:00", None, None, 0, 0))
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_loc2_failed", "loc2", "src_google_maps",
+        ("acq_loc2_failed", loc_b2, "src_google_maps",
          "sara.reviews.maps_snapshot", "2",
          "{}", "x" * 64, "failed", "2026-09-26T12:01:00+00:00",
          "2026-09-26T12:01:05+00:00", "malformed retained reviews",
          None, 0, 0))
     conn.commit()
+    extract_retained_reviews(
+        conn, business_id=1, now=lambda: "2026-09-26T12:00:00+00:00")
     with mock_patch.object(assessment_module, "derive_domain_assessments",
                            _reputation_only_deficient):
         persist_dossier_assessment(
             conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
         decision = plan_next_acquisition(conn, entity_id=entity,
                                          now="2026-09-26T12:30:00+00:00")
-    # loc2's snapshot (09:59) predates loc1's completion (12:00): a GLOBAL
-    # newest-vs-newest comparison would call the entity mined. The
-    # per-location comparison must keep loc2 pending.
     assert decision.action == "extract_retained_reviews"
     assert decision.target_domain == "reputation"
     assert decision.stop_reason is None
@@ -1715,112 +1796,22 @@ def test_per_location_pending_failed_location_stays_pending(tmp_path: Path) -> N
 
 
 def test_pending_matches_exact_snapshot_within_one_closure(tmp_path: Path) -> None:
-    """R9-01: two Maps businesses whose alias Locations share ONE canonical
-    Location are matched per exact snapshot — A-mined/B-failed inside the
-    same closure stays pending (canonical aggregation would call it
-    mined)."""
+    """R9-01: two Maps businesses whose anchor Locations share ONE canonical
+    Location are matched per exact snapshot — A-mined/B-unmined inside the
+    same redirect closure stays pending (canonical aggregation would call
+    the closure mined)."""
     from unittest.mock import patch as mock_patch
     from sara.dossier import assessment as assessment_module
-    from sara.maps_backfill import _evidence_id
-    from sara.reviews import core as reviews_core
-    from sara.reviews.model import canonical_json as rj
-    import hashlib
 
     conn = prepared(tmp_path / "same-closure.sqlite", reviews=[])
     entity = business_entity_id_for_maps_business(1)
     location = location_id_for_maps_business(1)
-    # A second Maps business on an ALIAS Location redirecting into the
-    # same canonical Location, owned by another entity (R8-01 shape).
-    conn.execute(
-        "INSERT INTO knowledge_subjects(id,kind,record_state,created_at,updated_at) "
-        "VALUES ('be_other','business_entity','active',"
-        "'2026-09-25T00:00:00+00:00','2026-09-26T00:00:00+00:00')",
-    )
-    conn.execute(
-        "INSERT INTO business_entities(id,display_name,entity_type,lifecycle_status,"
-        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
-        ("be_other", "Other Owner", "independent_business", "operating",
-         "2026-09-25T00:00:00+00:00", "2026-09-26T00:00:00+00:00"),
-    )
-    conn.execute(
-        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
-        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("r2", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
-         2.0, 1, '["restaurant"]', "gosom/google-maps-scraper:v1.18.1",
-         '{"strict_bounds":true}', "/evidence/r2.jsonl", "complete",
-         "2026-09-25T11:00:00+00:00"),
-    )
-    conn.execute(
-        "INSERT INTO businesses(id,canonical_key,title,first_seen_at,last_seen_at,"
-        "last_run_id,raw_json) VALUES (?,?,?,?,?,?,?)",
-        (2, "alias-business", "Alias Business",
-         "2026-09-25T11:00:00+00:00", "2026-09-26T09:59:00+00:00",
-         "r2", "{}"),
-    )
-    conn.execute(
-        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
-        "merged_at,created_at,updated_at) "
-        "VALUES ('loc_alias','location','merged',?,"
-        "'2026-09-26T11:00:00+00:00','2026-09-25T10:00:00+00:00','2026-09-26T11:00:00+00:00')",
-        (location,),
-    )
-    conn.execute(
-        "INSERT INTO business_locations(id,business_entity_id,label,location_type,"
-        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
-        ("loc_alias", "be_other", "alias", "branch",
-         "2026-09-25T10:00:00+00:00", "2026-09-26T11:00:00+00:00"),
-    )
-    conn.execute(
-        "INSERT INTO maps_business_location_links(business_id,location_id,linked_at) "
-        "VALUES (2,'loc_alias','2026-09-25T10:00:00+00:00')",
-    )
-    # Business 2's retained snapshot.
-    b2_raw = "{}"
-    evidence2 = _evidence_id(
-        2, hashlib.sha256(b2_raw.encode("utf-8")).hexdigest())
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_b2_backfill", None, "src_google_maps", "sara.maps_backfill",
-         "2", '{"import_mode":"latest_canonical_maps_snapshot"}',
-         "z" * 64, "complete", "2026-09-26T09:59:00+00:00",
-         "2026-09-26T10:00:00+00:00", None, "r2", 1, 0))
-    conn.execute(
-        "INSERT INTO evidence_items("
-        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
-        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (evidence2, "acq_b2_backfill", "src_google_maps",
-         "google_maps:legacy:2", "platform", "usable",
-         "2026-09-26T09:59:00+00:00",
-         hashlib.sha256(b2_raw.encode("utf-8")).hexdigest(),
-         None, '{"import_kind":"legacy_maps_business_snapshot"}',
-         "2026-09-26T09:59:00+00:00"))
-    # Business 1: mined to completion with the canonical config shape.
-    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
-        conn, business_id=1, canonical_key=None)
-    source_evidence = reviews_core._maps_source_evidence(
-        conn, business=business, location_id=canonical_location_id)
-    loc1_cfg = json.loads(reviews_core._session_config(
-        source_evidence=source_evidence,
-        source_review_records=0,
-        review_evidence_records=0,
-    ))
-    loc1_cfg["extraction_outcome"] = "unavailable"
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_b1_done", location, "src_google_maps",
-         "sara.reviews.maps_snapshot", "2", rj(loc1_cfg),
-         "x" * 64, "complete", "2026-09-26T12:00:00+00:00",
-         "2026-09-26T12:00:05+00:00", None, None, 0, 0))
-    conn.commit()
+    # Business 2's anchor Location redirects into the SAME canonical
+    # Location as business 1's.
+    _anchor_second_business(conn, merged_into=location)
+    # Business 1 mined for real; business 2's snapshot remains unmined.
+    extract_retained_reviews(
+        conn, business_id=1, now=lambda: "2026-09-26T12:00:00+00:00")
     with mock_patch.object(assessment_module, "derive_domain_assessments",
                            _reputation_only_deficient):
         persist_dossier_assessment(
@@ -1830,6 +1821,133 @@ def test_pending_matches_exact_snapshot_within_one_closure(tmp_path: Path) -> No
     assert decision.action == "extract_retained_reviews"
     assert decision.target_domain == "reputation"
     assert decision.stop_reason is None
+    conn.close()
+
+
+def test_synced_unchanged_snapshot_rearms_review_extraction(tmp_path: Path) -> None:
+    """R10-01: an unchanged-content re-sync mints a NEW run-bound sync
+    evidence identity. Resolving the current snapshot through the
+    EXECUTOR's contract (run binding) re-arms review extraction instead
+    of reading the two retained evidence ids as ambiguity."""
+    from unittest.mock import patch as mock_patch
+    from sara.dossier import assessment as assessment_module
+
+    conn = prepared(tmp_path / "resync.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    extract_retained_reviews(
+        conn, business_id=1, now=lambda: "2026-09-26T12:05:00+00:00")
+    _apply_sync_snapshot(
+        conn, business_id=1, new_run_id="r2",
+        retrieved_at="2026-09-26T12:10:00+00:00")
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action == "extract_retained_reviews"
+    assert decision.target_domain == "reputation"
+    assert decision.stop_reason is None
+    conn.close()
+
+
+def test_partial_review_session_does_not_count_as_coverage(tmp_path: Path) -> None:
+    """R10-01: only COMPLETE review sessions cover a snapshot — a partial
+    session naming the current evidence leaves it pending."""
+    from unittest.mock import patch as mock_patch
+    from sara.dossier import assessment as assessment_module
+    from sara.reviews.core import current_maps_evidence_for_business
+
+    conn = prepared(tmp_path / "partial.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    location = location_id_for_maps_business(1)
+    current_id = current_maps_evidence_for_business(
+        conn, business_id=1)["id"]
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_partial_probe", location, "src_google_maps",
+         "sara.reviews.maps_snapshot", "2",
+         json.dumps({"source_evidence_id": current_id},
+                    sort_keys=True, separators=(",", ":")),
+         "x" * 64, "partial", "2026-09-26T09:00:00+00:00",
+         "2026-09-26T09:00:05+00:00", None, None, 0, 0))
+    conn.commit()
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:00:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action == "extract_retained_reviews"
+    assert decision.target_domain == "reputation"
+    assert decision.stop_reason is None
+    conn.close()
+
+
+def test_newer_snapshot_supersedes_unavailable_outcome(tmp_path: Path) -> None:
+    """R10-04 lifecycle: S1 mined unavailable -> reputation sufficient; a
+    newer S2 (unchanged-content sync) DROPS S1's outcome -> reputation
+    blocks again and the review action returns; S2 mined -> sufficiency
+    restored and the action retires."""
+    from unittest.mock import patch as mock_patch
+    from sara.acquisition_planner import STOP_UNSUPPORTED
+    from sara.dossier import assessment as assessment_module
+
+    conn = prepared(tmp_path / "supersede.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+
+    def reputation_state(seal) -> str:
+        return conn.execute(
+            "SELECT state FROM dossier_domain_assessments "
+            "WHERE assessment_id=? AND domain='reputation'",
+            (seal.assessment_id,)).fetchone()[0]
+
+    first = extract_retained_reviews(
+        conn, business_id=1, now=lambda: "2026-09-26T12:05:00+00:00")
+    seal_a = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:06:00+00:00")
+    assert reputation_state(seal_a) == "sufficient"
+
+    _apply_sync_snapshot(
+        conn, business_id=1, new_run_id="r2",
+        retrieved_at="2026-09-26T12:10:00+00:00")
+    seal_b = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:20:00+00:00")
+    assert reputation_state(seal_b) != "sufficient"
+    summary_b = json.loads(conn.execute(
+        "SELECT summary_json FROM dossier_assessments WHERE id=?",
+        (seal_b.assessment_id,)).fetchone()[0])
+    assert "reputation" in summary_b["blocking_mandatory_domains"]
+
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:21:00+00:00")
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:30:00+00:00")
+    assert decision.action == "extract_retained_reviews"
+    assert decision.target_domain == "reputation"
+
+    second = extract_retained_reviews(
+        conn, business_id=1, now=lambda: "2026-09-26T12:40:00+00:00")
+    assert second.session_id != first.session_id
+    seal_c = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:50:00+00:00")
+    assert reputation_state(seal_c) == "sufficient"
+
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           _reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:51:00+00:00")
+        after = plan_next_acquisition(conn, entity_id=entity,
+                                      now="2026-09-26T13:00:00+00:00")
+    assert after.action is None
+    assert after.stop_reason == STOP_UNSUPPORTED
+    assert "extract_retained_reviews" in after.details["actions_not_applicable"]
     conn.close()
 
 

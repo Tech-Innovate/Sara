@@ -6,7 +6,7 @@ mutates facts, observations, or evidence: planning is a pure decision
 over assessment state, and the only persisted output is the decision
 record itself.
 
-Determinism contract (v10): for the SAME entity, the SAME sealed
+Determinism contract (v11): for the SAME entity, the SAME sealed
 assessment, the SAME session-history snapshot, the SAME
 Understanding-state fingerprint, and the SAME decision ceiling, the
 same policy version yields the same decision id and the same chosen
@@ -49,7 +49,11 @@ from typing import Any
 # evidence id over business id, run, and content hash) against the
 # source_evidence_id frozen in complete review-session configs —
 # canonical-Location aggregation cannot mask a sibling snapshot.
-PLANNER_POLICY_VERSION = "acquisition-planner-v10"
+# v11: snapshot identity comes from the EXECUTOR'S resolver (shared
+# current_maps_evidence_for_business), so run-bound unchanged-content
+# re-syncs legitimately re-arm instead of reading as ambiguity, and
+# only COMPLETE review sessions count as coverage.
+PLANNER_POLICY_VERSION = "acquisition-planner-v11"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
@@ -391,29 +395,28 @@ def _review_extraction_pending(
 ) -> bool | None:
     """Whether some retained Maps snapshot still needs review extraction.
 
-    v10 (R9-01): completeness is judged per EXACT current retained
-    snapshot — never per canonical Location, which the schema allows
-    several Maps businesses to share through alias Locations in one
-    redirect closure. Each Maps business's CURRENT snapshot is
-    identified by its deterministic evidence id (backfill or sync
-    shape over business id, run, and content hash); a snapshot is mined
-    only when a complete review session's frozen config names that
-    exact source_evidence_id.
+    v11 (R10-01): snapshot identity comes from the EXECUTOR'S own
+    resolver — the shared current_maps_evidence_for_business — which
+    verifies the full provenance contract including the run binding
+    (current last_run_id). An unchanged-content re-sync therefore
+    legitimately resolves to the NEW sync evidence and re-arms the
+    action instead of reading as ambiguity, and only the snapshot the
+    executor would actually mine counts. Coverage requires COMPLETE
+    review sessions naming that exact source_evidence_id.
 
     True  — at least one current snapshot is unmined.
     False — every current snapshot is mined (or none exists).
-    None  — coverage is unprovable (ambiguous snapshot, unparseable
-            session config): fail closed, the action is not
-            scheduled.
+    None  — coverage is unprovable (corrupt parent provenance,
+            unparseable session config): fail closed, the action is
+            not scheduled.
 
     This is the F-01 termination guard: after an entity-scoped
     extraction mines every current snapshot, re-scheduling the same
     action would be a provable no-op. A newer Maps sync mints a new
     evidence identity and re-arms the action.
     """
-    from .maps_backfill import GOOGLE_MAPS_SOURCE_ID, _evidence_id
-    from .maps_sync import _sync_evidence_id
-    from .reviews.model import COLLECTOR_NAME
+    from .reviews.core import current_maps_evidence_for_business
+    from .reviews.model import COLLECTOR_NAME, ReviewIntelligenceError
 
     locations = history["lineage_subjects"]["locations"]
     if not locations:
@@ -421,40 +424,27 @@ def _review_extraction_pending(
     marks = ",".join("?" for _ in locations)
 
     link_rows = conn.execute(
-        f"SELECT m.business_id, b.raw_json, b.last_run_id "
-        f"FROM maps_business_location_links m "
+        f"SELECT m.business_id FROM maps_business_location_links m "
         f"JOIN businesses b ON b.id=m.business_id "
-        f"WHERE m.location_id IN ({marks})",
+        f"WHERE m.location_id IN ({marks}) ORDER BY m.business_id",
         tuple(locations),
     ).fetchall()
     snapshot_ids: set[str] = set()
-    for business_id, raw_json, last_run_id in link_rows:
-        if not isinstance(raw_json, str) or not raw_json:
-            continue  # no computable current snapshot identity
-        if not isinstance(last_run_id, str) or not last_run_id:
-            continue
-        raw_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
-        candidates = (
-            _evidence_id(int(business_id), raw_hash),
-            _sync_evidence_id(int(business_id), last_run_id, raw_hash),
-        )
-        evidence_rows = conn.execute(
-            "SELECT id FROM evidence_items "
-            "WHERE id IN (?,?) AND source_id=? "
-            "AND source_role='platform' AND status='usable'",
-            (*candidates, GOOGLE_MAPS_SOURCE_ID),
-        ).fetchall()
-        if len(evidence_rows) > 1:
-            return None  # ambiguous retained snapshot: fail closed
-        if evidence_rows:
-            snapshot_ids.add(str(evidence_rows[0][0]))
+    for (business_id,) in link_rows:
+        try:
+            evidence = current_maps_evidence_for_business(
+                conn, business_id=int(business_id))
+        except ReviewIntelligenceError:
+            return None  # corrupt parent provenance: fail closed
+        if evidence is not None:
+            snapshot_ids.add(str(evidence["id"]))
 
     if not snapshot_ids:
         return False  # no current retained snapshot: nothing to mine
 
     session_rows = conn.execute(
         f"SELECT config_json FROM acquisition_sessions "
-        f"WHERE collector_name=? AND status IN ('complete','partial') "
+        f"WHERE collector_name=? AND status='complete' "
         f"AND target_subject_id IN ({marks})",
         (COLLECTOR_NAME, *locations),
     ).fetchall()

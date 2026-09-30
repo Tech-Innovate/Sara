@@ -524,6 +524,138 @@ def test_unavailable_outcome_parent_hash_mismatch_is_integrity_issue(tmp_path: P
     conn.close()
 
 
+def test_failed_session_replay_with_stray_children_propagates(tmp_path: Path) -> None:
+    """R10-02: stored 0/0 counters are not trusted — a same-id row with a
+    stray evidence child is a provenance mismatch, never a replay."""
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import opaque_id as review_opaque_id, sha256_text
+
+    conn = prepared(tmp_path / "failed-stray.sqlite", reviews="not-a-list")
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    failed_at = "2026-09-26T12:00:00+00:00"
+    error_text = (
+        "retained Maps field 'user_reviews' must be an array when present")
+    config = json.dumps(
+        {
+            "input_kind": "retained_maps_review_snapshot",
+            "source_maps_business_id": source_evidence["metadata"]["legacy_business_id"],
+            "source_business_entity_id": source_evidence["frozen_entity_id"],
+            "source_location_id": source_evidence["frozen_location_id"],
+            "source_evidence_id": source_evidence["id"],
+            "source_content_sha256": source_evidence["content_sha256"],
+            "extraction_outcome": "failed",
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    session_id = review_opaque_id(
+        "acq", "retained-maps-reviews-failed", source_evidence["id"],
+        str(source_evidence["frozen_location_id"]), "2", failed_at)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, str(source_evidence["frozen_location_id"]),
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "failed", failed_at, failed_at,
+         error_text, None, 0, 0))
+    # Identical row — but a stray evidence child references the session.
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,"
+        "retrieved_at,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("ev_stray_child", session_id, "src_google_maps",
+         "google_maps_review:stray", "customer_generated", "usable",
+         failed_at, "0" * 64, None, "{}", failed_at))
+    conn.commit()
+    with pytest.raises(ReviewIntelligenceError, match="provenance mismatch"):
+        extract_retained_reviews(conn, business_id=1, now=lambda: failed_at)
+    conn.close()
+
+
+def test_explicit_unavailable_non_deterministic_id_is_integrity_issue(tmp_path: Path) -> None:
+    """R10-03: an explicit unavailable session whose id is NOT the
+    deterministic identity is an integrity issue, never an outcome."""
+    from sara.dossier.surface import build_business_dossier
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import canonical_json as rj, sha256_text
+
+    conn = prepared(tmp_path / "nondet-id.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    cfg = json.loads(reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=0,
+        review_evidence_records=0,
+    ))
+    cfg["extraction_outcome"] = "unavailable"
+    config = rj(cfg)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_not_deterministic", str(source_evidence["frozen_location_id"]),
+         "src_google_maps", "sara.reviews.maps_snapshot", "2",
+         config, sha256_text(config), "complete",
+         "2026-09-26T12:00:00+00:00", "2026-09-26T12:00:05+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    dossier = build_business_dossier(conn, entity_id=entity)
+    assert dossier["customer_voice"]["review_evidence_unavailable"] == []
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "review_outcome_session_config_invalid" in codes
+    conn.close()
+
+
+def test_future_version_unavailable_never_contributes(tmp_path: Path) -> None:
+    """R10-03: an unknown/future review collector version claiming an
+    unavailable outcome is an integrity issue and never contributes
+    mandatory-domain evidence."""
+    from sara.dossier.surface import build_business_dossier
+    from sara.reviews import core as reviews_core
+    from sara.reviews.model import canonical_json as rj, sha256_text
+
+    conn = prepared(tmp_path / "future-version.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    _bid, _eid, canonical_location_id, business = reviews_core._resolve_target(
+        conn, business_id=1, canonical_key=None)
+    source_evidence = reviews_core._maps_source_evidence(
+        conn, business=business, location_id=canonical_location_id)
+    cfg = json.loads(reviews_core._session_config(
+        source_evidence=source_evidence,
+        source_review_records=0,
+        review_evidence_records=0,
+    ))
+    cfg["extraction_outcome"] = "unavailable"
+    config = rj(cfg)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,config_json,"
+        "config_hash,status,started_at,finished_at,error,legacy_run_id,"
+        "evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_future_version", str(source_evidence["frozen_location_id"]),
+         "src_google_maps", "sara.reviews.maps_snapshot", "3",
+         config, sha256_text(config), "complete",
+         "2026-09-26T12:00:00+00:00", "2026-09-26T12:00:05+00:00",
+         None, None, 0, 0))
+    conn.commit()
+    dossier = build_business_dossier(conn, entity_id=entity)
+    assert dossier["customer_voice"]["review_evidence_unavailable"] == []
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "review_outcome_session_config_invalid" in codes
+    conn.close()
+
+
 def test_reviews_cli_entity_id(tmp_path: Path, capsys) -> None:
     """F-04: the sara-reviews CLI accepts the entity-scoped executor target."""
     from sara.reviews import main as reviews_main

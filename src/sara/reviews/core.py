@@ -542,24 +542,43 @@ def _record_failed_extraction(
             (session_id,),
         ).fetchone()
         if stored is not None:
-            if tuple(stored) == (
-                session_id,
-                str(source_evidence["frozen_location_id"]),
-                mb.GOOGLE_MAPS_SOURCE_ID,
-                COLLECTOR_NAME,
-                COLLECTOR_VERSION,
-                config,
-                sha256_text(config),
-                "failed",
-                failed_at,
-                failed_at,
-                error,
-                None,
-                0,
-                0,
+            # R10-02: stored counters are not database-enforced
+            # summaries — evidence can reference a session regardless
+            # of its evidence_count. A genuine replay therefore needs
+            # the identical row AND zero ACTUAL evidence/observation
+            # children.
+            stray_evidence = int(conn.execute(
+                "SELECT COUNT(*) FROM evidence_items "
+                "WHERE acquisition_session_id=?", (session_id,)
+            ).fetchone()[0])
+            stray_observations = int(conn.execute(
+                "SELECT COUNT(*) FROM observations o "
+                "JOIN evidence_items e ON e.id=o.evidence_id "
+                "WHERE e.acquisition_session_id=?", (session_id,)
+            ).fetchone()[0])
+            if (
+                tuple(stored) == (
+                    session_id,
+                    str(source_evidence["frozen_location_id"]),
+                    mb.GOOGLE_MAPS_SOURCE_ID,
+                    COLLECTOR_NAME,
+                    COLLECTOR_VERSION,
+                    config,
+                    sha256_text(config),
+                    "failed",
+                    failed_at,
+                    failed_at,
+                    error,
+                    None,
+                    0,
+                    0,
+                )
+                and stray_evidence == 0
+                and stray_observations == 0
             ):
                 # Genuine same-attempt replay (identical failed_at
-                # second): already durably recorded with these bytes.
+                # second): already durably recorded with these bytes
+                # and no stray children.
                 conn.rollback()
                 return session_id
             raise ReviewIntelligenceError(
@@ -904,6 +923,211 @@ def extract_retained_reviews_for_entity(
         "business_count": len(results),
         "skipped_count": len(skipped),
     }
+
+
+_SUPPORTED_REVIEW_VERSIONS = frozenset({"1", "2"})
+
+_LEGACY_V1_CONFIG_KEYS = frozenset({
+    "input_kind",
+    "source_maps_business_id",
+    "source_business_entity_id",
+    "source_location_id",
+    "source_evidence_id",
+    "source_content_sha256",
+    "review_array_fields",
+    "source_review_records",
+    "review_evidence_records",
+})
+
+
+def _is_strict_zero_review_config(config: dict[str, Any]) -> bool:
+    """The EXACT canonical zero-review config shape (R9-03/R10-03).
+
+    Both the rigorous v1 inference and the explicit v2 outcome share
+    this shape: a v2 zero-review config is the legacy shape plus the
+    frozen extraction_outcome key.
+    """
+    if set(config) != _LEGACY_V1_CONFIG_KEYS:
+        return False
+    if config["input_kind"] != "retained_maps_review_snapshot":
+        return False
+    if config["review_array_fields"] != list(REVIEW_ARRAY_FIELDS):
+        return False
+    if config["source_review_records"] != 0:
+        return False
+    if config["review_evidence_records"] != 0:
+        return False
+    business_id = config["source_maps_business_id"]
+    if isinstance(business_id, bool) or not isinstance(business_id, int):
+        return False
+    for key in (
+        "source_business_entity_id",
+        "source_location_id",
+        "source_evidence_id",
+        "source_content_sha256",
+    ):
+        value = config[key]
+        if not isinstance(value, str) or not value:
+            return False
+    return True
+
+
+def current_maps_evidence_for_business(
+    conn: sqlite3.Connection, *, business_id: int
+) -> dict[str, Any] | None:
+    """The executor's exact current retained Maps snapshot (R10-01).
+
+    This IS the review executor's provenance contract — selection,
+    run binding (current last_run_id), expected Maps collector and
+    version, snapshot metadata, raw content hash, retrieval timestamp,
+    and frozen subject anchors — factored out so the planner and the
+    outcome projection resolve "the current snapshot" exactly the way
+    extraction does. Returns None when the business has no currently
+    extractable snapshot; integrity-class failures propagate.
+    """
+    try:
+        _bid, _eid, canonical_location_id, business = _resolve_target(
+            conn, business_id=business_id, canonical_key=None
+        )
+        return _maps_source_evidence(
+            conn, business=business, location_id=canonical_location_id
+        )
+    except ReviewTargetUnavailableError:
+        return None
+
+
+def strict_unavailable_outcome_session(
+    conn: sqlite3.Connection, session: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Strict unavailable-session verifier (R10-03/R10-04).
+
+    Given a COMPLETE sara.reviews.maps_snapshot session row, return
+    (outcome, issue_code): exactly one is non-None except the silent
+    skips — a session that produced review evidence, or whose outcome
+    is complete/failed, projects nothing and reports nothing.
+
+    An unavailable outcome is projected ONLY when the session proves
+    the FULL contract: supported review collector version; canonical
+    config bytes and hash; the deterministic review-session id; the
+    session target equals the frozen source Location; zero stored AND
+    actual review output; and the frozen business/entity/location/run
+    binding resolves — via the executor's own current-snapshot
+    resolver — to the business's CURRENT retained Maps snapshot. A
+    superseded snapshot therefore drops its outcome (R10-04), and
+    unknown/future review versions never contribute mandatory-domain
+    evidence.
+    """
+    session_id = str(session["id"])
+    invalid = (None, "review_outcome_session_config_invalid")
+    mismatch = (None, "review_outcome_source_evidence_mismatch")
+    try:
+        config = json.loads(str(session["config_json"]))
+        if not isinstance(config, dict):
+            raise ValueError("config is not a JSON object")
+    except ValueError:
+        return invalid
+    version = str(session["collector_version"])
+    outcome_key = config.get("extraction_outcome")
+    if outcome_key is None:
+        if int(session["evidence_count"] or 0) != 0:
+            return (None, None)  # historical with-reviews session
+        # R9-03: rigorous v1 inference only.
+        if version != "1" or not _is_strict_zero_review_config(config):
+            return invalid
+    elif outcome_key == "unavailable":
+        # R10-03: the explicit outcome carries the SAME strictness.
+        if version != "2":
+            return invalid
+        stripped = {
+            key: value for key, value in config.items()
+            if key != "extraction_outcome"
+        }
+        if not _is_strict_zero_review_config(stripped):
+            return invalid
+    else:
+        return (None, None)  # complete/failed outcomes project nothing
+    if str(session["collector_name"]) != COLLECTOR_NAME:
+        return invalid
+    if version not in _SUPPORTED_REVIEW_VERSIONS:
+        return invalid
+    config_json = str(session["config_json"])
+    if canonical_json(config) != config_json:
+        return invalid
+    if sha256_text(config_json) != str(session["config_hash"]):
+        return invalid
+    expected_id = opaque_id(
+        "acq",
+        "retained-maps-reviews",
+        config["source_evidence_id"],
+        config["source_location_id"],
+        version,
+    )
+    if session_id != expected_id:
+        return invalid
+    if str(session["target_subject_id"]) != config["source_location_id"]:
+        return invalid
+    if int(session["evidence_count"] or 0) != 0:
+        return invalid
+    if int(session["observation_count"] or 0) != 0:
+        return invalid
+    actual_evidence = int(conn.execute(
+        "SELECT COUNT(*) FROM evidence_items "
+        "WHERE acquisition_session_id=?", (session_id,)
+    ).fetchone()[0])
+    actual_observations = int(conn.execute(
+        "SELECT COUNT(*) FROM observations o "
+        "JOIN evidence_items e ON e.id=o.evidence_id "
+        "WHERE e.acquisition_session_id=?", (session_id,)
+    ).fetchone()[0])
+    if actual_evidence != 0 or actual_observations != 0:
+        return invalid
+    finished_at = session["finished_at"]
+    if not isinstance(finished_at, str) or not finished_at:
+        return invalid
+    try:
+        _validated_timestamp(finished_at, field="review outcome finished_at")
+    except ReviewIntelligenceError:
+        return invalid
+    # R10-04: the outcome binds to the business's CURRENT snapshot.
+    # A fabricated parent reference is corruption; a real reference
+    # that is simply no longer current is ordinary supersession — the
+    # outcome ceases to satisfy reputation silently so the lifecycle
+    # can proceed to re-mine the newer snapshot.
+    referenced = conn.execute(
+        "SELECT 1 FROM evidence_items WHERE id=?",
+        (config["source_evidence_id"],),
+    ).fetchone()
+    if referenced is None:
+        return invalid  # fabricated parent reference
+    try:
+        parent = current_maps_evidence_for_business(
+            conn, business_id=int(config["source_maps_business_id"]))
+    except ReviewIntelligenceError:
+        return mismatch
+    if parent is None or str(parent["id"]) != config["source_evidence_id"]:
+        return (None, None)  # superseded: drop, never flag
+    if str(parent["content_sha256"]) != config["source_content_sha256"]:
+        return mismatch
+    if str(parent["frozen_entity_id"]) != config["source_business_entity_id"]:
+        return mismatch
+    if str(parent["frozen_location_id"]) != config["source_location_id"]:
+        return mismatch
+    retrieved = parent["retrieved_at"]
+    if not isinstance(retrieved, str) or not retrieved:
+        return mismatch
+    return (
+        {
+            "session_id": session_id,
+            "target_subject_id": str(session["target_subject_id"]),
+            "collector_version": version,
+            "finished_at": finished_at,
+            "source_evidence_id": config["source_evidence_id"],
+            "source_content_sha256": config["source_content_sha256"],
+            "source_location_id": config["source_location_id"],
+            "source_retrieved_at": str(retrieved),
+        },
+        None,
+    )
 
 
 def _positive_int(value: str) -> int:
