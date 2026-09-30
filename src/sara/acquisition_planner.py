@@ -31,12 +31,17 @@ from typing import Any
 
 # v6: currentness became assessment-signature equality over the
 # resolved Entity+Location graph (v5 was Entity-only max-timestamp).
-PLANNER_POLICY_VERSION = "acquisition-planner-v6"
+# v7: multi-collector scheduling. extract_retained_reviews addresses
+# reputation from retained Maps evidence, and the session-history,
+# in-flight, and terminal-watermark queries became collector-agnostic
+# over the entity lineage.
+PLANNER_POLICY_VERSION = "acquisition-planner-v7"
 
 #: Domain states that satisfy the assessment's readiness bar.
 READY_STATES = frozenset({"sufficient", "strong", "not_applicable"})
 
-#: The single allowlisted acquisition action. v1 knows one collector.
+#: Allowlisted acquisition actions. Each maps a collector to the
+# Understanding domains its evidence can improve.
 ACTIONS = {
     "acquire_official_website": {
         "collector": "sara.website",
@@ -45,6 +50,13 @@ ACTIONS = {
             "offerings", "business_model",
         }),
     },
+    # v7: retained-review extraction is local (no network) — it turns
+    # reviews already retained in the Maps snapshot raw evidence into
+    # observations, which is what reputation assessments consume.
+    "extract_retained_reviews": {
+        "collector": "sara.reviews.maps_snapshot",
+        "improves_domains": frozenset({"reputation"}),
+    },
 }
 
 #: Deficiencies the allowlisted actions cannot address. Deciding on one
@@ -52,7 +64,7 @@ ACTIONS = {
 #: collector.
 UNSUPPORTED_DOMAINS = frozenset({
     "competitive_context", "customer_journey", "customer_market",
-    "identity", "locations", "classification", "reputation",
+    "identity", "locations", "classification",
     "marketing", "technology", "people", "operations", "change",
     "scale", "unknowns", "provenance",
 })
@@ -167,9 +179,11 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     lineage = _entity_lineage(conn, entity_id)
     lineage_marks = ",".join("?" for _ in lineage)
     rows = conn.execute(
+        # v7: cooldown streaks and retry ceilings are entity-level: a
+        # failing session from any collector means the target is
+        # unhealthy, not that one collector is.
         f"SELECT status, started_at, target_subject_id FROM acquisition_sessions "
-        f"WHERE target_subject_id IN ({lineage_marks}) "
-        f"AND collector_name='sara.website'",
+        f"WHERE target_subject_id IN ({lineage_marks})",
         tuple(lineage),
     ).fetchall()
     # started_at is plain TEXT: lexical SQL ordering is wrong across
@@ -214,9 +228,12 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
         if when >= retry_floor:
             partials_in_window += 1
     in_flight_rows = conn.execute(
+        # v7: any active session on the lineage holds planning,
+        # regardless of collector — the planner schedules at most one
+        # acquisition per entity at a time.
         f"SELECT started_at FROM acquisition_sessions "
         f"WHERE target_subject_id IN ({lineage_marks}) "
-        f"AND collector_name='sara.website' AND status IN ('planned','running')",
+        f"AND status IN ('planned','running')",
         tuple(lineage),
     ).fetchall()
     in_flight = len(in_flight_rows)
@@ -246,9 +263,11 @@ def _session_history(conn: sqlite3.Connection, entity_id: str, *, now: str) -> d
     # alone — a session that started before an assessment but finished
     # after it leaves unassessed evidence behind.
     terminal_rows = conn.execute(
+        # v7: evidence currency is per-entity, not per-collector: a
+        # review extraction finishing after the seal leaves just as
+        # much unassessed evidence behind as a website crawl does.
         f"SELECT started_at, finished_at FROM acquisition_sessions "
         f"WHERE target_subject_id IN ({lineage_marks}) "
-        f"AND collector_name='sara.website' "
         f"AND status IN ('complete','partial')",
         tuple(lineage),
     ).fetchall()
@@ -489,17 +508,24 @@ def plan_next_acquisition(
                for item in assessment.get("domains", ())}
     blocking_current = [d for d in blocking if domains.get(d) not in READY_STATES]
 
-    action_spec = ACTIONS["acquire_official_website"]
-    improvable = sorted(d for d in blocking_current
-                        if d in action_spec["improves_domains"])
+    improvable = sorted(
+        d for d in blocking_current
+        if any(d in spec["improves_domains"] for spec in ACTIONS.values()))
     unsupported = sorted(d for d in blocking_current
                          if d in UNSUPPORTED_DOMAINS)
 
     if improvable:
+        # v7 multi-action selection: the lexically first improvable
+        # domain is the target, and among the actions improving it
+        # the lexically first name wins — the schedule stays
+        # deterministic and replay-stable.
         target = improvable[0]
-        return decide("acquire_official_website", None,
+        action_name = sorted(
+            name for name, spec in ACTIONS.items()
+            if target in spec["improves_domains"])[0]
+        return decide(action_name, None,
                       "deficient_domain_supported_by_collector", target,
-                      {"collector": action_spec["collector"],
+                      {"collector": ACTIONS[action_name]["collector"],
                        "blocking": sorted(blocking_current)}, assessment_id)
 
     return decide(None, STOP_UNSUPPORTED, "no_allowlisted_action_for_deficiency",

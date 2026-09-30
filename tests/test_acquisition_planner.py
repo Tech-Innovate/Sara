@@ -75,7 +75,8 @@ MENU_SITE = {
 }
 
 
-def prepared(path: Path, *, website: str = "https://seed.example"):
+def prepared(path: Path, *, website: str = "https://seed.example",
+             reviews: list | None = None):
     conn = connect(path)
     assert apply_migrations(conn) == (1, 2, 3, 4)
     seed_business_understanding_vocabulary(conn)
@@ -98,6 +99,7 @@ def prepared(path: Path, *, website: str = "https://seed.example"):
                 "title": "Business seed", "category": "Restaurant", "address": "Seed Street",
                 "latitude": 21.55, "longitude": 39.18, "phone": "+966500000000",
                 "website": website, "review_rating": 4.4, "review_count": 120,
+                **({} if reviews is None else {"user_reviews": reviews}),
                 "status": "Open", "link": "https://maps.example/seed",
             }],
             finalize_run=("complete", 0, None),
@@ -1271,7 +1273,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_older", entity, "2026-09-26T14:00:00+03:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v6",
+         "acquisition-planner-v7",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": {"max_decisions": 99,
                                         "session_history": {}}},
@@ -1283,7 +1285,7 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
         ") VALUES (?,?,?,?,?,?,?,?,?,?)",
         ("plan_lex_newer", entity, "2026-09-26T12:10:00+00:00",
          "acquire_official_website", None, "probe", "offerings",
-         "acquisition-planner-v6",
+         "acquisition-planner-v7",
          json.dumps({"assessment_id": result.assessment_id,
                      "planner_inputs": matching_inputs},
                     sort_keys=True), "2026-09-26T12:10:00+00:00"))
@@ -1299,3 +1301,68 @@ def test_ceiling_replay_selects_newest_by_instant_not_lexically(tmp_path: Path, 
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload.get("replayed") is True
     assert payload["decision_id"] == "plan_lex_newer"
+
+
+def test_planner_maps_reputation_to_review_extraction(tmp_path: Path) -> None:
+    """A reputation-deficient dossier yields the review-extraction action."""
+    from unittest.mock import patch as mock_patch
+    from sara.dossier import assessment as assessment_module
+    from sara.dossier.assessment_policy import derive_domain_assessments
+
+    conn = prepared(tmp_path / "planner-reputation.sqlite", reviews=[REVIEW_SIMPLE])
+    entity = business_entity_id_for_maps_business(1)
+
+    def reputation_only_deficient(dossier):
+        return tuple(
+            {"domain": item["domain"],
+             "state": ("partial" if item["domain"] == "reputation" else "sufficient"),
+             "reason": {"derivation_version": "test", "rule": "forced"},
+             "fact_count": item.get("fact_count", 0),
+             "fresh_fact_count": item.get("fresh_fact_count", 0),
+             "unresolved_count": item.get("unresolved_count", 0)}
+            for item in derive_domain_assessments(dossier)
+        )
+
+    with mock_patch.object(assessment_module, "derive_domain_assessments",
+                           reputation_only_deficient):
+        persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:10:00+00:00")
+        # The fingerprint recomputes inputs over live state, so the
+        # forced derivation must stay active during planning.
+        decision = plan_next_acquisition(conn, entity_id=entity,
+                                         now="2026-09-26T12:10:30+00:00")
+    assert decision.action == "extract_retained_reviews"
+    assert decision.target_domain == "reputation"
+    assert decision.stop_reason is None
+    conn.close()
+
+
+REVIEW_SIMPLE = {
+    "review_id": "rev-p1", "source": "Google", "Rating": 4,
+    "Description": "Good", "language": "en",
+    "posted_at_unix_micros": 1_758_758_400_000_000,
+}
+
+
+def test_review_running_session_suppresses_any_action(tmp_path: Path) -> None:
+    """A running review-extraction session stops the planner (collector-agnostic)."""
+    conn = prepared(tmp_path / "planner-inflight.sqlite", reviews=[])
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path)
+    _ensure_website_source(conn)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("acq_review_running", entity, "src_google_maps",
+         "sara.reviews.maps_snapshot", "1",
+         "{}", "y" * 64, "running", "2026-09-26T12:29:00+00:00",
+         None, None, None, 0, 0))
+    conn.commit()
+    decision = plan_next_acquisition(conn, entity_id=entity,
+                                     now="2026-09-26T12:30:00+00:00")
+    assert decision.stop_reason in ("acquisition_in_progress",)
+    assert decision.action is None
+    conn.close()

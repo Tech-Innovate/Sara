@@ -46,6 +46,7 @@ class ReviewExtractionStats:
     observations_created: int
     duplicate_source_records_collapsed: int
     already_extracted: bool
+    status: str = "complete"
 
 
 def canonical_json(value: Any) -> str:

@@ -353,6 +353,7 @@ def _stats(
     evidence_items_created: int,
     observations_created: int,
     already_extracted: bool,
+    status: str = "complete",
 ) -> ReviewExtractionStats:
     return ReviewExtractionStats(
         session_id=session_id,
@@ -368,6 +369,7 @@ def _stats(
         observations_created=observations_created,
         duplicate_source_records_collapsed=source_review_records - len(reviews),
         already_extracted=already_extracted,
+        status=status,
     )
 
 
@@ -458,6 +460,7 @@ def _verify_existing(
         evidence_items_created=0,
         observations_created=0,
         already_extracted=True,
+        status="unavailable" if not reviews else "complete",
     )
 
 
@@ -506,6 +509,13 @@ def extract_retained_reviews(
             source_review_records=source_review_records,
             review_evidence_records=len(reviews),
         )
+        # The zero-review OUTCOME is part of the session's frozen
+        # configuration: enrich it before the deterministic id and the
+        # idempotency verification so replays compare identical bytes.
+        outcome_status = "complete" if reviews else "unavailable"
+        config_with_outcome = json.loads(config_json)
+        config_with_outcome["extraction_outcome"] = outcome_status
+        config_json = canonical_json(config_with_outcome)
         source_location_id = str(source_evidence["frozen_location_id"])
         session_id = opaque_id(
             "acq",
@@ -543,11 +553,19 @@ def extract_retained_reviews(
             raise ReviewIntelligenceError(
                 f"deterministic review extraction session collision: {session_id}"
             )
+        # Zero retained reviews is a distinct bounded OUTCOME, not a
+        # lifecycle state: the extraction ran to completion (session
+        # 'complete'), found nothing to acquire, and deliberately creates
+        # no absence fact. The outcome is surfaced explicitly via the
+        # stats status ('unavailable') and the session metadata rather
+        # than a new session-status vocabulary value, because extending
+        # the session CHECK requires an FK-off table rebuild that the
+        # migration framework's FK-ON transaction forbids.
         conn.execute(
             "INSERT INTO acquisition_sessions("
             "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
             "status,started_at,finished_at,error,legacy_run_id,evidence_count,observation_count"
-            ") VALUES (?,?,?,?,?,?,?,'complete',?,?,NULL,NULL,?,?)",
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 session_id,
                 source_location_id,
@@ -556,8 +574,11 @@ def extract_retained_reviews(
                 COLLECTOR_VERSION,
                 config_json,
                 sha256_text(config_json),
+                "complete",
                 extracted_at,
                 extracted_at,
+                None,
+                None,
                 len(rows),
                 len(rows),
             ),
@@ -625,6 +646,7 @@ def extract_retained_reviews(
             evidence_items_created=len(reviews),
             observations_created=len(reviews),
             already_extracted=False,
+            status=outcome_status,
         )
         conn.commit()
         return stats
