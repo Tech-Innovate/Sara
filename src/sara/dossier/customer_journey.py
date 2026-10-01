@@ -308,11 +308,12 @@ def _load_website_evidence(
     session_status_by_id: dict[str, str] = {}
     session_version_by_id: dict[str, str] = {}
     session_target_by_id: dict[str, str] = {}
+    session_start_url_by_id: dict[str, str] = {}
 
     cursor = conn.execute(
         "SELECT id,target_subject_id,source_id,legacy_run_id,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
-        "evidence_count,observation_count "
+        "evidence_count,observation_count,child_seal_sha256 "
         "FROM acquisition_sessions "
         "WHERE collector_name=? AND status IN ('complete','partial') "
         "ORDER BY id",
@@ -390,6 +391,19 @@ def _load_website_evidence(
             invalid = True
         if int(session["observation_count"] or 0) != actual_observation_count:
             invalid = True
+        # XJ-01: the session must carry a child seal, and the seal must
+        # match the digest recomputed over the LIVE child set — shape
+        # verification is not membership verification. Sealing happens at
+        # producer finalization; the migration's triggers make the child
+        # set immutable once sealed, and this recompute catches anything
+        # that predates or circumvents them.
+        from ..storage import session_child_seal_digest
+
+        stored_seal = session["child_seal_sha256"]
+        if not isinstance(stored_seal, str) or not stored_seal:
+            invalid = True
+        elif stored_seal != session_child_seal_digest(conn, session_id):
+            invalid = True
         if invalid:
             issues.append(
                 {"code": "customer_journey_website_session_invalid",
@@ -400,6 +414,9 @@ def _load_website_evidence(
         session_status_by_id[session_id] = str(session["status"])
         session_version_by_id[session_id] = str(session["collector_version"])
         session_target_by_id[session_id] = target
+        # XJ-02: retain the VERIFIED config start_url per session; every
+        # row's metadata start_url must bind to it exactly.
+        session_start_url_by_id[session_id] = str(config.get("start_url"))
 
     rows: list[dict[str, Any]] = []
     if not admitted_session_ids:
@@ -437,6 +454,13 @@ def _load_website_evidence(
             if not _WEBSITE_EVIDENCE_REQUIRED_METADATA_KEYS <= set(metadata):
                 row_invalid = True
             if metadata.get("acquisition_kind") != "bounded_official_website":
+                row_invalid = True
+            # XJ-02: the row's source-time site identity binds to the
+            # session's VERIFIED config start_url exactly — an unbound
+            # metadata value could manufacture external hand-offs.
+            if str(metadata.get("start_url")) != session_start_url_by_id.get(
+                row_session_id
+            ):
                 row_invalid = True
             # RCJ-02: the row binds to the session's SOURCE-TIME entity,
             # exactly — not merely somewhere in the lineage.
@@ -556,7 +580,7 @@ def _load_website_evidence(
             row_invalid = True
         start_url = metadata.get("start_url")
         if not isinstance(start_url, str) or not start_url:
-            row_invalid = True
+            row_invalid = True  # binding below also requires it
         if row_invalid:
             issues.append(
                 {"code": "customer_journey_website_evidence_invalid",
@@ -588,6 +612,9 @@ def _load_website_evidence(
                 "business_wide_scope_eligible": scope_eligible,
                 "crawl_frontier_exhausted": frontier_exhausted,
                 "start_url": start_url,
+                "session_start_url": session_start_url_by_id.get(
+                    row_session_id
+                ),
                 "current": 0 <= age_days <= _JOURNEY_EVIDENCE_FRESHNESS_DAYS,
             }
         )
@@ -1018,12 +1045,45 @@ def reconstruct_customer_journey(
     # EVERY retained row reports business-wide scope eligibility and
     # frontier exhaustion (the producer writes these flags per row,
     # constant across one crawl).
+    # XJ-03: bounded not_observed is the result of the COMPLETE bounded
+    # attempt, so the entire supporting session must be trustworthy:
+    # every evidence child of the session must have passed row
+    # verification (no invalid rows, none outside the
+    # official/usable envelope), and all surviving rows must report
+    # scope eligibility and frontier exhaustion.
+    sessions_with_row_issues = {
+        str(issue.get("session_id"))
+        for issue in issues
+    }
+    sessions_with_invalid_rows: set[str] = set()
+    for session_id in sorted({
+        row["acquisition_session_id"] for row in website_evidence
+    } | {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT e.acquisition_session_id FROM evidence_items e "
+            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "WHERE a.collector_name=?", (_WEBSITE_COLLECTOR_NAME,)
+        )
+    }):
+        total_children = int(conn.execute(
+            "SELECT COUNT(*) FROM evidence_items WHERE acquisition_session_id=?",
+            (session_id,),
+        ).fetchone()[0])
+        admitted_children = sum(
+            1 for row in website_evidence
+            if row["acquisition_session_id"] == session_id
+        )
+        if total_children != admitted_children:
+            sessions_with_invalid_rows.add(session_id)
     absence_safe_sessions = frozenset(
         session_id
         for session_id in sorted({
             row["acquisition_session_id"] for row in website_evidence
         })
-        if all(
+        if session_id not in sessions_with_invalid_rows
+        and session_id not in sessions_with_row_issues
+        and all(
             row["acquisition_status"] == "complete"
             and row["business_wide_scope_eligible"]
             and row["crawl_frontier_exhausted"]
@@ -1076,7 +1136,16 @@ def reconstruct_customer_journey(
             # SOURCE-TIME site (producer start_url), never today's
             # website fact — a later domain move must not reclassify a
             # historical same-site action link as an external hand-off.
-            source_time_host = _host_of(row.get("start_url"))
+            from ..website.parser import normalize_http_url
+
+            bound_start = row.get("session_start_url")
+            normalized_start = (
+                normalize_http_url(bound_start)
+                if isinstance(bound_start, str) else None
+            )
+            source_time_host = _host_of(normalized_start) or _host_of(
+                bound_start
+            )
             target_host = _host_of(candidate.get("url"))
             if source_time_host and target_host:
                 if target_host == source_time_host:

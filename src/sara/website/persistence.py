@@ -490,15 +490,18 @@ def ingest_crawl_result(
         if result.canonical_home_url is None:
             partial_reasons.append("canonical home page was not established")
         error = None if status == "complete" else "; ".join(partial_reasons)[:4000]
+        from ..storage import session_child_seal_digest
+
         cursor = conn.execute(
             "UPDATE acquisition_sessions SET status=?,finished_at=?,error=?,evidence_count=?,"
-            "observation_count=? WHERE id=? AND status='running'",
+            "observation_count=?,child_seal_sha256=? WHERE id=? AND status='running'",
             (
                 status,
                 finished_at,
                 error,
                 evidence_created,
                 observations_created,
+                session_child_seal_digest(conn, session_id),
                 session_id,
             ),
         )

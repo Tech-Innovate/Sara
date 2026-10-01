@@ -83,7 +83,7 @@ MENU_SITE = {
 def prepared(path: Path, *, website: str = "https://seed.example",
              reviews: list | None = None):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2, 3, 4)
+    assert apply_migrations(conn) == (1, 2, 3, 4, 5)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
@@ -389,7 +389,7 @@ def test_cli_persists_decision_and_replay_is_idempotent(tmp_path: Path, capsys) 
         "SELECT COUNT(*) FROM planner_decisions WHERE id=?", (decision_id,)
     ).fetchone()[0]
     assert rows == 1  # deterministic replay inserted once
-    assert current_schema_version(conn2) == 4
+    assert current_schema_version(conn2) == 5
     fk = conn2.execute("PRAGMA foreign_key_check").fetchall()
     assert fk == []
     conn2.close()
@@ -1607,6 +1607,11 @@ def _website_session_row(
         (session_id, entity, "src_official_web", "sara.website",
          COLLECTOR_VERSION, config, config_hash, status,
          started_at, finished_at, None, None, 0, 0))
+    from sara.storage import session_child_seal_digest
+
+    conn.execute(
+        "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
+        (session_child_seal_digest(conn, session_id), session_id))
     return session_id
 
 

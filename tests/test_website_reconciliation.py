@@ -9,7 +9,7 @@ from sara.website.reconcile import reconcile_observation_group
 
 def setup_fact_db(path: Path, *, current_value: bool, valid_from: str):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2, 3, 4)
+    assert apply_migrations(conn) == (1, 2, 3, 4, 5)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO knowledge_subjects(id,kind,created_at,updated_at) VALUES ('be','business_entity',?,?)",
