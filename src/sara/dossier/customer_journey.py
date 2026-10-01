@@ -1055,27 +1055,33 @@ def reconstruct_customer_journey(
         str(issue.get("session_id"))
         for issue in issues
     }
-    sessions_with_invalid_rows: set[str] = set()
-    for session_id in sorted({
+    # YJ-02: integrity accounting is scoped to THIS entity's admitted
+    # sessions only (the sole candidates for absence safety) and uses
+    # ONE grouped query — no database-wide session scan, no N+1.
+    admitted_session_ids = sorted({
         row["acquisition_session_id"] for row in website_evidence
-    } | {
-        str(row[0])
+    })
+    total_children_by_session = {
+        str(row[0]): int(row[1])
         for row in conn.execute(
-            "SELECT DISTINCT e.acquisition_session_id FROM evidence_items e "
-            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
-            "WHERE a.collector_name=?", (_WEBSITE_COLLECTOR_NAME,)
+            "SELECT acquisition_session_id, COUNT(*) FROM evidence_items "
+            f"WHERE acquisition_session_id IN ({','.join('?' for _ in admitted_session_ids)}) "
+            "GROUP BY acquisition_session_id",
+            tuple(admitted_session_ids),
         )
-    }):
-        total_children = int(conn.execute(
-            "SELECT COUNT(*) FROM evidence_items WHERE acquisition_session_id=?",
-            (session_id,),
-        ).fetchone()[0])
-        admitted_children = sum(
-            1 for row in website_evidence
-            if row["acquisition_session_id"] == session_id
+    } if admitted_session_ids else {}
+    admitted_children_by_session: dict[str, int] = {}
+    for row in website_evidence:
+        key = row["acquisition_session_id"]
+        admitted_children_by_session[key] = (
+            admitted_children_by_session.get(key, 0) + 1
         )
-        if total_children != admitted_children:
-            sessions_with_invalid_rows.add(session_id)
+    sessions_with_invalid_rows = {
+        session_id
+        for session_id in admitted_session_ids
+        if total_children_by_session.get(session_id, 0)
+        != admitted_children_by_session.get(session_id, 0)
+    }
     absence_safe_sessions = frozenset(
         session_id
         for session_id in sorted({

@@ -469,16 +469,18 @@ def _forge_website_session(
         for candidate in candidate_list
         if candidate["channel_type"] in action_predicates
     )
+    # YJ-01/YJ-03: the real producer lifecycle — running, children,
+    # then ONE finalization UPDATE carrying status, lifecycle, counters,
+    # and the child seal together. Born-terminal website sessions are
+    # rejected by migration v5.
     conn.execute(
         "INSERT INTO acquisition_sessions("
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
         (session_id, entity, "src_official_web", "sara.website",
-         COLLECTOR_VERSION, config, config_hash, "complete",
-         started_at, started_at, None, None, len(pages),
-         total_observations))
+         COLLECTOR_VERSION, config, config_hash, started_at))
     for index, (final_url, content, channels) in enumerate(pages):
         content_sha = wsha(content)
         evidence_id = wopaque("ev", session_id, final_url, content_sha)
@@ -541,8 +543,11 @@ def _forge_website_session(
     from sara.storage import session_child_seal_digest
 
     conn.execute(
-        "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-        (session_child_seal_digest(conn, session_id), session_id))
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=?, observation_count=?, child_seal_sha256=? "
+        "WHERE id=? AND status='running'",
+        (started_at, len(pages), total_observations,
+         session_child_seal_digest(conn, session_id), session_id))
     conn.commit()
     return session_id
 
@@ -1036,15 +1041,16 @@ def test_unsupported_website_version_is_silently_out_of_scope(tmp_path: Path) ->
         "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
         "VALUES ('src_official_web','official_website','Official website',NULL,"
         "'2026-01-01T00:00:00+00:00',1)")
+    # The full real lifecycle at version 4: the session is structurally
+    # perfect — exclusion is attributable to VERSION alone.
     conn.execute(
         "INSERT INTO acquisition_sessions("
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
         (session_id, entity, "src_official_web", "sara.website", "4",
-         config, wsha(config), "complete", started_at, started_at,
-         None, None, 0, 0))
+         config, wsha(config), started_at))
     conn.commit()
     # R4: the v4 session carries a UNIQUE booking endpoint; exclusion is
     # asserted through acquisition_session_id (the reviewer-corrected
@@ -1109,9 +1115,13 @@ def test_unsupported_website_version_is_silently_out_of_scope(tmp_path: Path) ->
          observation_json, observation_json, wsha(observation_json),
          "detected_capability", started_at, started_at, "heuristic",
          "sara.website", "4", 0.8, started_at))
+    from sara.storage import session_child_seal_digest
+
     conn.execute(
-        "UPDATE acquisition_sessions SET evidence_count=1, observation_count=1 "
-        "WHERE id=?", (session_id,))
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=1, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (started_at, session_child_seal_digest(conn, session_id), session_id))
     conn.commit()
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
@@ -1183,10 +1193,9 @@ def test_future_version_with_extra_config_keys_stays_admissible(tmp_path: Path) 
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
         (session_id, entity, "src_official_web", "sara.website", "6",
-         config, wsha(config), "complete", started_at, started_at,
-         None, None, 0, 0))
+         config, wsha(config), started_at))
     booking_channel = [{
         "channel_type": "booking",
         "identifier": "https://booksy.com/future",
@@ -1244,15 +1253,13 @@ def test_future_version_with_extra_config_keys_stays_admissible(tmp_path: Path) 
          value_json, value_json, wsha(value_json), "detected_capability",
          started_at, started_at, "heuristic", "sara.website", "6",
          0.8, started_at))
-    conn.execute(
-        "UPDATE acquisition_sessions SET evidence_count=1, observation_count=1 "
-        "WHERE id=?",
-        (session_id,))
     from sara.storage import session_child_seal_digest
 
     conn.execute(
-        "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-        (session_child_seal_digest(conn, session_id), session_id))
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=1, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (started_at, session_child_seal_digest(conn, session_id), session_id))
     conn.commit()
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
@@ -1370,10 +1377,19 @@ def test_source_time_identity_forgeries_are_invalid(tmp_path: Path) -> None:
             "id,target_subject_id,source_id,collector_name,collector_version,"
             "config_json,config_hash,status,started_at,finished_at,error,"
             "legacy_run_id,evidence_count,observation_count"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,?,0,0)",
             (session_id, target, source_id, "sara.website", "5",
-             config, wsha(config), "complete", started_at, started_at,
-             None, legacy_run_id, 0, 0))
+             config, wsha(config), started_at, legacy_run_id))
+        # Finalize without children (blocked/complete): the empty-set
+        # seal keeps the lifecycle honest for complete.
+        from sara.storage import session_child_seal_digest
+
+        conn.execute(
+            "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+            "error=NULL, evidence_count=0, observation_count=0, "
+            "child_seal_sha256=? WHERE id=? AND status='running'",
+            (started_at, session_child_seal_digest(conn, session_id),
+             session_id))
         return session_id
 
     if conn.execute(
@@ -1411,23 +1427,34 @@ def test_source_time_identity_forgeries_are_invalid(tmp_path: Path) -> None:
     conn.close()
 
 
-def test_unsealed_and_wrong_digest_sessions_rejected_by_reader(tmp_path: Path) -> None:
-    """XJ-01 (reader side): an unsealed session and a session sealed with
-    a digest that does not match its live child set are both rejected —
-    the seal recompute closes the producer-side gap the triggers cannot
-    check (the seal-set trigger verifies terminal status, not content)."""
+def test_terminal_lifecycle_decisive_set(tmp_path: Path) -> None:
+    """YJ-01 decisive regressions: the seal is bound to the terminal
+    transition. Born-terminal website sessions are rejected at insert;
+    a terminal transition without the seal fails; the legitimate
+    running->children->complete+counters+seal lifecycle succeeds; a
+    pre-v5-style terminal-unsealed session can never be sealed after
+    the fact; post-seal mutation stays blocked; and a producer-side
+    wrong-digest lie is caught by the reader recompute."""
+    import sqlite3
+
     from sara.storage import session_child_seal_digest
     from sara.website.model import canonical_json as wcanonical
     from sara.website.model import opaque_id as wopaque, sha256_text as wsha
 
-    conn = prepared(tmp_path / "sealverify.sqlite")
+    conn = prepared(tmp_path / "lifecycle.sqlite")
     entity = business_entity_id_for_maps_business(1)
+    if conn.execute(
+        "SELECT 1 FROM sources WHERE id='src_official_web'"
+    ).fetchone() is None:
+        conn.execute(
+            "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
+            "VALUES ('src_official_web','official_website','Official website',NULL,"
+            "'2026-01-01T00:00:00+00:00',1)")
 
-    def _build_session(suffix, started_at, seal_mode):
-        config = wcanonical(
+    def _config(start_url="https://seed.example/"):
+        return wcanonical(
             {
-                "entity_id": entity,
-                "start_url": "https://forged.example/",
+                "entity_id": entity, "start_url": start_url,
                 "page_limit": 8, "depth_limit": 2,
                 "max_response_bytes": 1048576, "timeout_seconds": 10.0,
                 "request_interval_seconds": 1.0,
@@ -1436,76 +1463,159 @@ def test_unsealed_and_wrong_digest_sessions_rejected_by_reader(tmp_path: Path) -
                 "retry_max_delay_seconds": 30.0,
                 "retry_delay_budget_seconds": 60.0,
                 "user_agent": "SaraBusinessUnderstanding/1.0",
-                "obey_robots": True,
-                "evidence_root": "/tmp/ev",
+                "obey_robots": True, "evidence_root": "/tmp/ev",
             }
         )
-        session_id = wopaque("acq", entity, started_at, wsha(config))
+
+    def _insert_running(session_id, started_at, config):
+        conn.execute(
+            "INSERT INTO acquisition_sessions("
+            "id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at,finished_at,error,"
+            "legacy_run_id,evidence_count,observation_count"
+            ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
+            (session_id, entity, "src_official_web", "sara.website", "5",
+             config, wsha(config), started_at))
+
+    # (1) Direct terminal insertion is rejected outright.
+    config_a = _config()
+    started_a = "2026-09-26T12:01:00+00:00"
+    sid_a = wopaque("acq", entity, started_a, wsha(config_a))
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="finalized from running",
+    ):
         conn.execute(
             "INSERT INTO acquisition_sessions("
             "id,target_subject_id,source_id,collector_name,collector_version,"
             "config_json,config_hash,status,started_at,finished_at,error,"
             "legacy_run_id,evidence_count,observation_count"
             ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (session_id, entity, "src_official_web", "sara.website", "5",
-             config, wsha(config), "complete", started_at, started_at,
-             None, None, 1, 0))
-        page_url = f"https://forged.example/{suffix}"
-        content_sha = wsha(suffix)
-        evidence_id = wopaque("ev", session_id, page_url, content_sha)
-        metadata = wcanonical(
-            {
-                "acquisition_kind": "bounded_official_website",
-                "entity_id": entity,
-                "start_url": "https://forged.example/",
-                "requested_url": page_url,
-                "final_url": page_url,
-                "crawl_depth": 0,
-                "page_role": "other",
-                "home_page": False,
-                "business_wide_scope_eligible": True,
-                "crawl_frontier_exhausted": True,
-                "title": None,
-                "canonical_url": page_url,
-                "channels": [],
-                "observation_ids": [],
-            }
-        )
+            (sid_a, entity, "src_official_web", "sara.website", "5",
+             config_a, wsha(config_a), "complete", started_a, started_a,
+             None, None, 0, 0))
+
+    # (2) running -> complete WITHOUT the seal fails.
+    config_b = _config("https://seed.example/b/")
+    started_b = "2026-09-26T12:02:00+00:00"
+    sid_b = wopaque("acq", entity, started_b, wsha(config_b))
+    _insert_running(sid_b, started_b, config_b)
+    with pytest.raises(
+        sqlite3.IntegrityError, match="requires its child seal"
+    ):
+        conn.execute(
+            "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+            "error=NULL, evidence_count=0, observation_count=0 "
+            "WHERE id=? AND status='running'",
+            (started_b, sid_b))
+
+    # (3) The legitimate lifecycle succeeds: running -> children ->
+    # complete + counters + seal in one UPDATE.
+    config_c = _config("https://seed.example/c/")
+    started_c = "2026-09-26T12:03:00+00:00"
+    sid_c = wopaque("acq", entity, started_c, wsha(config_c))
+    _insert_running(sid_c, started_c, config_c)
+    page_url = "https://seed.example/c/home"
+    content_sha = wsha("home page")
+    evidence_id = wopaque("ev", sid_c, page_url, content_sha)
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (evidence_id, sid_c, "src_official_web", page_url, "official",
+         started_c, content_sha, wcanonical(
+             {
+                 "acquisition_kind": "bounded_official_website",
+                 "entity_id": entity,
+                 "start_url": "https://seed.example/c/",
+                 "requested_url": page_url, "final_url": page_url,
+                 "crawl_depth": 0, "page_role": "home", "home_page": True,
+                 "business_wide_scope_eligible": True,
+                 "crawl_frontier_exhausted": True, "title": None,
+                 "canonical_url": page_url, "channels": [],
+                 "observation_ids": [],
+             }), started_c))
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=0, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (started_c, session_child_seal_digest(conn, sid_c), sid_c))
+    # Post-seal child append and counter mutation remain blocked.
+    with pytest.raises(
+        sqlite3.IntegrityError, match="sealed acquisition session"
+    ):
         conn.execute(
             "INSERT INTO evidence_items("
             "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
             "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
-            ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
-            (evidence_id, session_id, "src_official_web", page_url,
-             "official", started_at, content_sha, metadata, started_at))
-        if seal_mode == "none":
-            return session_id
-        if seal_mode == "wrong":
-            # A digest over a DIFFERENT child set: the seal-set trigger
-            # verifies terminal status only, so this stores; the reader
-            # recompute must reject it.
-            conn.execute(
-                "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-                (wsha("not-the-child-set"), session_id))
-            return session_id
+            ") VALUES (?,?,?,'https://seed.example/c/x','official','usable',"
+            "?,NULL,NULL,'text/html',?,NULL,'{}',?)",
+            (wopaque("ev", sid_c, "https://seed.example/c/x", "x"),
+             sid_c, "src_official_web", started_c, "x", started_c))
+    with pytest.raises(
+        sqlite3.IntegrityError, match="counters are immutable"
+    ):
         conn.execute(
-            "UPDATE acquisition_sessions SET evidence_count=1 "
-            "WHERE id=?", (session_id,))
+            "UPDATE acquisition_sessions SET evidence_count=2 WHERE id=?",
+            (sid_c,))
+    # Retro-sealing a terminal session is rejected: the OLD status is
+    # already terminal, so the seal-set trigger refuses (pre-v5 history
+    # is permanently unsealable).
+    config_d = _config("https://seed.example/d/")
+    started_d = "2026-09-26T12:04:00+00:00"
+    sid_d = wopaque("acq", entity, started_d, wsha(config_d))
+    # Simulate pre-v5 terminal history with a non-website collector
+    # (schema-legal), then attempt to seal it: terminal OLD status is
+    # refused by the seal-set trigger.
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (sid_d, entity, "src_official_web", "sara.other", "1",
+         config_d, wsha(config_d), "complete", started_d, started_d,
+         None, None, 0, 0))
+    with pytest.raises(
+        sqlite3.IntegrityError, match="never afterward"
+    ):
         conn.execute(
             "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-            (session_child_seal_digest(conn, session_id), session_id))
-        return session_id
+            (session_child_seal_digest(conn, sid_d), sid_d))
 
-    if conn.execute(
-        "SELECT 1 FROM sources WHERE id='src_official_web'"
-    ).fetchone() is None:
-        conn.execute(
-            "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
-            "VALUES ('src_official_web','official_website','Official website',NULL,"
-            "'2026-01-01T00:00:00+00:00',1)")
-    sid_unsealed = _build_session("u1", "2026-09-26T12:10:00+00:00", "none")
-    sid_wrong = _build_session("w1", "2026-09-26T12:11:00+00:00", "wrong")
-    sid_good = _build_session("g1", "2026-09-26T12:12:00+00:00", "good")
+    # (4) Producer-side wrong-digest lie: sealed via the legitimate
+    # lifecycle with a fabricated digest; the reader recompute rejects.
+    config_e = _config("https://seed.example/e/")
+    started_e = "2026-09-26T12:05:00+00:00"
+    sid_e = wopaque("acq", entity, started_e, wsha(config_e))
+    _insert_running(sid_e, started_e, config_e)
+    page_e = "https://seed.example/e/home"
+    sha_e = wsha("e home")
+    ev_e = wopaque("ev", sid_e, page_e, sha_e)
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (ev_e, sid_e, "src_official_web", page_e, "official",
+         started_e, sha_e, wcanonical(
+             {
+                 "acquisition_kind": "bounded_official_website",
+                 "entity_id": entity,
+                 "start_url": "https://seed.example/e/",
+                 "requested_url": page_e, "final_url": page_e,
+                 "crawl_depth": 0, "page_role": "home", "home_page": True,
+                 "business_wide_scope_eligible": True,
+                 "crawl_frontier_exhausted": True, "title": None,
+                 "canonical_url": page_e, "channels": [],
+                 "observation_ids": [],
+             }), started_e))
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=0, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (started_e, wsha("a producer-side lie"), sid_e))
     conn.commit()
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
@@ -1514,19 +1624,15 @@ def test_unsealed_and_wrong_digest_sessions_rejected_by_reader(tmp_path: Path) -
         for issue in dossier["integrity_issues"]
         if issue["code"] == "customer_journey_website_session_invalid"
     }
-    assert sid_unsealed in invalid
-    assert sid_wrong in invalid
-    assert sid_good not in invalid
+    assert sid_e in invalid  # wrong digest caught by reader recompute
+    assert sid_c not in invalid  # legitimate lifecycle clean
     used_sessions = {
         entry["acquisition_session_id"]
         for stage in dossier["customer_journey"]["stages"]
         for entry in stage["evidence"]
     }
-    # The good session carries a neutral 'other' role with no channels,
-    # so it contributes no stage evidence — its cleanliness is asserted
-    # through the absence of an integrity flag, not through usage.
-    assert sid_unsealed not in used_sessions
-    assert sid_wrong not in used_sessions
+    assert sid_c in used_sessions  # home row serves discover/evaluate
+    assert sid_e not in used_sessions
     conn.close()
 
 def test_day45_phone_channel_and_maps_evidence_retained(tmp_path: Path) -> None:
@@ -1717,32 +1823,98 @@ def test_full_shape_booking_child_with_empty_observations_invalid(tmp_path: Path
             (forged_id, session_id, "src_official_web",
              "2026-09-26T12:00:09+00:00", forged_sha, metadata,
              "2026-09-26T12:00:09+00:00"))
-    # Hand-built variant: booking channel without its capability
-    # observation is impossible producer output and the row seal rejects.
-    hand_session = _forge_website_session(
-        conn, entity=entity, session_suffix="hand",
-        started_at="2026-09-26T12:15:00+00:00",
-        pages=[("https://hand.example/book", "booking page", [{
-            "channel_type": "booking",
-            "identifier": "https://booksy.com/hand",
-            "normalized_identifier": "https://booksy.com/hand",
-            "url": "https://booksy.com/hand",
-            "extraction": "action_link",
-        }])],
+    # Reader semantic seal (independent of membership): a booking
+    # channel with ZERO attached observations is impossible producer
+    # output. The row is sealed through the LEGITIMATE lifecycle
+    # (running -> children -> complete+counters+seal) so membership
+    # passes — only the semantic check can reject it.
+    from sara.storage import session_child_seal_digest
+
+    config = wcanonical(
+        {
+            "entity_id": entity, "start_url": "https://hand.example/",
+            "page_limit": 8, "depth_limit": 2,
+            "max_response_bytes": 1048576, "timeout_seconds": 10.0,
+            "request_interval_seconds": 1.0,
+            "max_policy_delay_seconds": 30.0, "retry_attempt_limit": 4,
+            "retry_base_delay_seconds": 1.0, "retry_max_delay_seconds": 30.0,
+            "retry_delay_budget_seconds": 60.0,
+            "user_agent": "SaraBusinessUnderstanding/1.0",
+            "obey_robots": True, "evidence_root": "/tmp/ev",
+        }
     )
-    # Strip the channel's observation to simulate the impossible shape:
-    # blocked by the seal, so instead re-open by clearing seal is
-    # impossible — the semantic seal is verified by the reader on a
-    # freshly-built unsealed row set below.
+    hand_started = "2026-09-26T12:15:00+00:00"
+    hand_session = wopaque("acq", entity, hand_started, wsha(config))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
+        (hand_session, entity, "src_official_web", "sara.website", "5",
+         config, wsha(config), hand_started))
+    hand_url = "https://hand.example/book"
+    hand_sha = wsha("hand booking page")
+    hand_ev = wopaque("ev", hand_session, hand_url, hand_sha)
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (hand_ev, hand_session, "src_official_web", hand_url, "official",
+         hand_started, hand_sha, wcanonical(
+             {
+                 "acquisition_kind": "bounded_official_website",
+                 "entity_id": entity,
+                 "start_url": "https://hand.example/",
+                 "requested_url": hand_url, "final_url": hand_url,
+                 "crawl_depth": 0, "page_role": "booking",
+                 "home_page": False, "business_wide_scope_eligible": True,
+                 "crawl_frontier_exhausted": True, "title": None,
+                 "canonical_url": hand_url,
+                 "channels": [{
+                     "channel_type": "booking",
+                     "identifier": "https://booksy.com/hand",
+                     "normalized_identifier": "https://booksy.com/hand",
+                     "url": "https://booksy.com/hand",
+                     "extraction": "action_link",
+                     "canonicalized_channel_id": None,
+                     "canonicalized_scope": None,
+                 }],
+                 "observation_ids": [],
+             }), hand_started))
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=0, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (hand_started, session_child_seal_digest(conn, hand_session),
+         hand_session))
+    conn.commit()
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    # Membership passed (no session-level flag); the SEMANTIC seal flags
+    # the row itself.
+    assert not any(
+        i["code"] == "customer_journey_website_session_invalid"
+        and i["session_id"] == hand_session
+        for i in dossier["integrity_issues"]
+    )
+    semantic_issue = next(
+        (i for i in dossier["integrity_issues"]
+         if i["code"] == "customer_journey_website_evidence_invalid"
+         and i["evidence_id"] == hand_ev), None)
+    assert semantic_issue is not None
     channels = {
         (c["identifier"], c["normalized_identifier"])
         for stage in dossier["customer_journey"]["stages"]
         for c in stage["channels"]
     }
-    assert ("https://booksy.com/forged3", "https://booksy.com/forged3") not in (
+    assert ("https://booksy.com/hand", "https://booksy.com/hand") not in (
         channels
+    )
+    assert not any(
+        h["evidence_id"] == hand_ev
+        for h in dossier["customer_journey"]["handoffs"]
     )
     conn.close()
 
@@ -1797,10 +1969,9 @@ def test_absence_on_complete_nonexhausted_session_not_bounded(tmp_path: Path) ->
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
         (forged_session, entity, "src_official_web", "sara.website", "5",
-         config, wsha(config), "complete", started_at, started_at,
-         None, None, 1, 0))
+         config, wsha(config), started_at))
     page_url = "https://seed.example/"
     content_sha = wsha("home")
     evidence_id = wopaque("ev", forged_session, page_url, content_sha)
@@ -1832,8 +2003,11 @@ def test_absence_on_complete_nonexhausted_session_not_bounded(tmp_path: Path) ->
     from sara.storage import session_child_seal_digest
 
     conn.execute(
-        "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-        (session_child_seal_digest(conn, forged_session), forged_session))
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=0, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (started_at, session_child_seal_digest(conn, forged_session),
+         forged_session))
     conn.commit()
 
     facts = [dict(f) for f in dossier["facts"]]
@@ -1908,10 +2082,9 @@ def test_domain_move_never_reclassifies_old_same_site_link(tmp_path: Path) -> No
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
         (old_session, entity, "src_official_web", "sara.website", "5",
-         config, wsha(config), "complete", started_at, started_at,
-         None, None, 1, 1))
+         config, wsha(config), started_at))
     page_url = "https://old.example/book"
     content_sha = wsha("old booking page")
     evidence_id = wopaque("ev", old_session, page_url, content_sha)
@@ -1963,14 +2136,14 @@ def test_domain_move_never_reclassifies_old_same_site_link(tmp_path: Path) -> No
          observation_json, observation_json, wsha(observation_json),
          "detected_capability", started_at, started_at, "heuristic",
          "sara.website", "5", 0.8, started_at))
-    conn.execute(
-        "UPDATE acquisition_sessions SET evidence_count=1, observation_count=1 "
-        "WHERE id=?", (old_session,))
     from sara.storage import session_child_seal_digest
 
     conn.execute(
-        "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-        (session_child_seal_digest(conn, old_session), old_session))
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=1, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (started_at, session_child_seal_digest(conn, old_session),
+         old_session))
     conn.commit()
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")

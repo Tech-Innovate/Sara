@@ -1441,9 +1441,33 @@ BUSINESS_UNDERSTANDING_V5 = (
       AND OLD.child_seal_sha256 IS NULL
     BEGIN
       SELECT CASE
+        WHEN OLD.status IN ('complete','partial','blocked','failed','cancelled')
+        THEN RAISE(ABORT, 'child seal is granted only at the terminal transition, never afterward')
+      END;
+      SELECT CASE
         WHEN NEW.status NOT IN ('complete','partial','blocked','failed','cancelled')
         THEN RAISE(ABORT, 'child seal requires a terminal acquisition session')
       END;
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_website_terminal_requires_seal
+    BEFORE UPDATE OF status ON acquisition_sessions
+    WHEN OLD.status IN ('planned','running')
+      AND NEW.status IN ('complete','partial')
+      AND NEW.collector_name = 'sara.website'
+      AND NEW.child_seal_sha256 IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'website acquisition finalization requires its child seal');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_website_no_terminal_insert
+    BEFORE INSERT ON acquisition_sessions
+    WHEN NEW.collector_name = 'sara.website'
+      AND NEW.status IN ('complete','partial','blocked','failed','cancelled')
+    BEGIN
+      SELECT RAISE(ABORT, 'website acquisition sessions are finalized from running, not born terminal');
     END
     """,
     """

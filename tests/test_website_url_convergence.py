@@ -116,8 +116,8 @@ def _official_observation(
     conn.execute(
         "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,evidence_count,observation_count) "
-        "VALUES ('web','be',?,'sara.website','3',?,?,'complete',?,?,1,1)",
-        (OFFICIAL_WEB_SOURCE_ID, config_json, config_hash, OBSERVED, OBSERVED),
+        "VALUES ('web','be',?,'sara.website','3',?,?,'running',?,NULL,0,0)",
+        (OFFICIAL_WEB_SOURCE_ID, config_json, config_hash, OBSERVED),
     )
     conn.execute(
         "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,"
@@ -132,6 +132,13 @@ def _official_observation(
         "'deterministic_parser','sara.website','3',1.0,?)",
         (value_json, value_json, value_hash, OBSERVED, OBSERVED, OBSERVED),
     )
+    from sara.storage import session_child_seal_digest
+
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, error=NULL, "
+        "evidence_count=1, observation_count=1, child_seal_sha256=? "
+        "WHERE id='web' AND status='running'",
+        (OBSERVED, session_child_seal_digest(conn, "web")))
     conn.commit()
     return {
         "id": "obs_web",

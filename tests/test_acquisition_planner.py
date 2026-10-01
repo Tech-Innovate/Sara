@@ -520,16 +520,10 @@ def test_mixed_offset_session_ordering_does_not_falsely_cool_down(tmp_path: Path
     # (= 10:00Z). Lexical DESC ordering would place the blocked session
     # "newest" and count it as a streak; instant ordering correctly puts
     # the complete session newest, so the streak is zero.
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_mixed_offset_probe", entity, "src_official_web", "sara.website", "5",
-         "{}", "x" * 64, "blocked", "2026-09-26T12:00:00+03:00",
-         "2026-09-26T12:00:05+03:00", "robots policy disallows", None, 0, 0),
-    )
+    _website_session_row(
+        conn, entity=entity, status="blocked",
+        started_at="2026-09-26T12:00:00+03:00",
+        finished_at="2026-09-26T12:00:05+03:00")
     conn.commit()
     # The acquire() session completed at ~12:00+00:00 (Clock start), i.e.
     # 10:00Z-scale later than the probe's 09:00Z.
@@ -700,16 +694,10 @@ def test_merged_predecessor_history_survives(tmp_path: Path) -> None:
         "'2026-09-26T12:00:00+00:00','2026-09-25T00:00:00+00:00','2026-09-26T12:00:00+00:00')",
         (entity,))
     for i in range(3):
-        conn.execute(
-            "INSERT INTO acquisition_sessions("
-            "id,target_subject_id,source_id,collector_name,collector_version,"
-            "config_json,config_hash,status,started_at,finished_at,error,"
-            "legacy_run_id,evidence_count,observation_count"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"acq_old_{i}", "be_old", "src_official_web", "sara.website", "5",
-             "{}", "x" * 64, "blocked",
-             f"2026-09-26T12:1{i}:00+00:00", f"2026-09-26T12:1{i}:05+00:00",
-             "robots policy disallows", None, 0, 0))
+        _website_session_row(
+            conn, entity="be_old", status="blocked",
+            started_at=f"2026-09-26T12:1{i}:00+00:00",
+            finished_at=f"2026-09-26T12:1{i}:05+00:00")
     conn.commit()
     # v8: mine the snapshot first (F-03); the cooldown under test is
     # the predecessor lineage's website history.
@@ -800,16 +788,10 @@ def test_stale_check_mixed_offset_finished_at(tmp_path: Path) -> None:
     _ensure_website_source(conn)
     # 12:00+03:00 is 09:00Z — EARLIER than the assessment watermark, so a
     # lexical comparison (12:... > 10:...) would wrongly call it stale.
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_offset", entity, "src_official_web", "sara.website", "5",
-         "{}", "x" * 64, "complete",
-         "2026-09-26T08:00:00+03:00", "2026-09-26T12:00:00+03:00",
-         None, None, 0, 0))
+    _website_session_row(
+        conn, entity=entity, status="complete",
+        started_at="2026-09-26T08:00:00+03:00",
+        finished_at="2026-09-26T12:00:00+03:00")
     conn.commit()
     decision = plan_next_acquisition(conn, entity_id=entity,
                                      now="2026-09-26T12:30:00+00:00")
@@ -1030,16 +1012,10 @@ def test_two_valid_terminal_rows_report_zero_corrupt(tmp_path: Path) -> None:
     entity = business_entity_id_for_maps_business(1)
     acquire(conn, tmp_path)  # terminal row #1
     _ensure_website_source(conn)
-    conn.execute(
-        "INSERT INTO acquisition_sessions("
-        "id,target_subject_id,source_id,collector_name,collector_version,"
-        "config_json,config_hash,status,started_at,finished_at,error,"
-        "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("acq_valid_second", entity, "src_official_web", "sara.website", "5",
-         "{}", "x" * 64, "complete",
-         "2026-09-26T12:20:00+00:00", "2026-09-26T12:20:30+00:00",
-         None, None, 0, 0))  # terminal row #2, valid
+    _website_session_row(
+        conn, entity=entity, status="complete",
+        started_at="2026-09-26T12:20:00+00:00",
+        finished_at="2026-09-26T12:20:30+00:00")  # terminal row #2, valid
     conn.commit()
     decision = plan_next_acquisition(
         conn, entity_id=entity, now="2026-09-26T12:30:00+00:00")
@@ -1603,15 +1579,17 @@ def _website_session_row(
         "id,target_subject_id,source_id,collector_name,collector_version,"
         "config_json,config_hash,status,started_at,finished_at,error,"
         "legacy_run_id,evidence_count,observation_count"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
         (session_id, entity, "src_official_web", "sara.website",
-         COLLECTOR_VERSION, config, config_hash, status,
-         started_at, finished_at, None, None, 0, 0))
+         COLLECTOR_VERSION, config, config_hash, started_at))
     from sara.storage import session_child_seal_digest
 
     conn.execute(
-        "UPDATE acquisition_sessions SET child_seal_sha256=? WHERE id=?",
-        (session_child_seal_digest(conn, session_id), session_id))
+        "UPDATE acquisition_sessions SET status=?, finished_at=?, "
+        "error=NULL, evidence_count=0, observation_count=0, "
+        "child_seal_sha256=? WHERE id=? AND status='running'",
+        (status, finished_at, session_child_seal_digest(conn, session_id),
+         session_id))
     return session_id
 
 
@@ -1639,16 +1617,10 @@ def test_website_cooldown_does_not_suppress_review_extraction(tmp_path: Path) ->
     acquire(conn, tmp_path)
     _ensure_website_source(conn)
     for i in range(3):
-        conn.execute(
-            "INSERT INTO acquisition_sessions("
-            "id,target_subject_id,source_id,collector_name,collector_version,"
-            "config_json,config_hash,status,started_at,finished_at,error,"
-            "legacy_run_id,evidence_count,observation_count"
-            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"acq_cross_blk{i}", entity, "src_official_web", "sara.website", "5",
-             "{}", "x" * 64, "blocked", f"2026-09-26T12:1{i}:00+00:00",
-             f"2026-09-26T12:1{i}:05+00:00", "robots", None, 0, 0),
-        )
+        _website_session_row(
+            conn, entity=entity, status="blocked",
+            started_at=f"2026-09-26T12:1{i}:00+00:00",
+            finished_at=f"2026-09-26T12:1{i}:05+00:00")
     conn.commit()
     with mock_patch.object(assessment_module, "derive_domain_assessments",
                            _reputation_only_deficient):

@@ -55,6 +55,22 @@ def setup_fact_db(path: Path, *, current_value: bool, valid_from: str):
     return conn
 
 
+def _finalize_website_session(
+    conn, session_id, *, started_at, finished_at,
+    evidence_count=0, observation_count=0,
+) -> None:
+    """Finalize a fabricated website session through the real lifecycle
+    (the schema forbids born-terminal website sessions)."""
+    from sara.storage import session_child_seal_digest
+
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, error=NULL, "
+        "evidence_count=?, observation_count=?, child_seal_sha256=? "
+        "WHERE id=? AND status='running'",
+        (finished_at, evidence_count, observation_count,
+         session_child_seal_digest(conn, session_id), session_id))
+
+
 def insert_official_observation(conn, *, value: bool, observed_at: str, observation_id: str = "obs_web"):
     value_json = canonical_json(value)
     value_hash = sha256_text(value_json)
@@ -63,8 +79,8 @@ def insert_official_observation(conn, *, value: bool, observed_at: str, observat
     config_hash = sha256_text("{}")
     conn.execute(
         "INSERT INTO acquisition_sessions(id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,status,started_at,finished_at) "
-        "VALUES (?,?,?,'sara.website','1','{}',?,'complete',?,?)",
-        (acquisition_id, "be", OFFICIAL_WEB_SOURCE_ID, config_hash, observed_at, observed_at),
+        "VALUES (?,?,?,'sara.website','1','{}',?,'running',?,NULL)",
+        (acquisition_id, "be", OFFICIAL_WEB_SOURCE_ID, config_hash, observed_at),
     )
     conn.execute(
         "INSERT INTO evidence_items(id,acquisition_session_id,source_id,source_role,status,retrieved_at,metadata_json,created_at) "
@@ -76,6 +92,9 @@ def insert_official_observation(conn, *, value: bool, observed_at: str, observat
         "VALUES (?,'be','capability.online_booking',?,?,?,?, 'detected_capability',?,?,'deterministic_parser','sara.website','1',1.0,?)",
         (observation_id, evidence_id, value_json, value_json, value_hash, observed_at, observed_at, observed_at),
     )
+    _finalize_website_session(
+        conn, acquisition_id, started_at=observed_at, finished_at=observed_at,
+        evidence_count=1, observation_count=1)
     conn.commit()
     return {
         "id": observation_id,

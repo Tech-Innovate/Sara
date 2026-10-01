@@ -277,8 +277,8 @@ def test_website_session_integrity_verifies_artifact_bytes(tmp_path: Path) -> No
         "id,target_subject_id,source_id,collector_name,collector_version,config_json,config_hash,"
         "status,started_at,finished_at,evidence_count,observation_count"
         ") VALUES ('sess','be1','src_official_web','sara.website','3',?,?,"
-        "'complete',?,?,1,0)",
-        (config_json, config_hash, created, created),
+        "'running',?,NULL,0,0)",
+        (config_json, config_hash, created),
     )
     conn.execute(
         "INSERT INTO evidence_items("
@@ -287,6 +287,13 @@ def test_website_session_integrity_verifies_artifact_bytes(tmp_path: Path) -> No
         ") VALUES ('ev','sess','src_official_web','official','usable',?,'text/html',?,?, '{}',?)",
         (created, content_hash, str(artifact), created),
     )
+    from sara.storage import session_child_seal_digest
+
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, error=NULL, "
+        "evidence_count=1, observation_count=0, child_seal_sha256=? "
+        "WHERE id='sess' AND status='running'",
+        (created, session_child_seal_digest(conn, "sess")))
     conn.commit()
 
     result = _website_session_integrity_check(
