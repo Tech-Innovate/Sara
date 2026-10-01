@@ -699,19 +699,26 @@ def _public_surface_coverage(
     acquisition tables.
 
     States:
-    - ``evaluation_observed``: the evaluate stage is currently observed;
-      ``evidence_ids`` are its admitted evidence identities.
-    - ``bounded_inspection_no_evaluation``: no current evaluate evidence,
-      but at least one absence-safe website session (complete,
-      business-wide-scope-eligible, frontier-exhausted on every admitted
-      row) of the entity's CURRENT official website remains current
-      across its ENTIRE admitted row set. PCJ-01: every supporting row
-      must be current and the row set non-empty — one stale row,
-      evaluative or not, disqualifies the session, so stale positive
-      evaluation evidence can never convert into a current negative
-      coverage judgment. SR-02: the session's verified source-time
-      start_url must be same-site (crawler host semantics, so verified
+    - ``evaluation_observed``: the evaluate stage is currently observed
+      from ADMISSIBLE evidence. SR-03: website-derived evaluate rows
+      must be same-site (crawler host semantics, so verified
       root->deep redirects on one host qualify) with a CURRENT
+      business.website.official fact — an evaluate page from a
+      superseded site cannot cover a different current site.
+      Non-website evaluate evidence (e.g. a producer-verified offering
+      fact) deliberately satisfies this branch regardless of site
+      identity: it speaks for the business, not for a site.
+      ``evidence_ids`` are the admissible entries' identities.
+    - ``bounded_inspection_no_evaluation``: no admissible current
+      evaluate evidence, but at least one absence-safe website session
+      (complete, business-wide-scope-eligible, frontier-exhausted on
+      every admitted row) of the entity's CURRENT official website
+      remains current across its ENTIRE admitted row set. PCJ-01: every
+      supporting row must be current and the row set non-empty — one
+      stale row, evaluative or not, disqualifies the session, so stale
+      positive evaluation evidence can never convert into a current
+      negative coverage judgment. SR-02: the session's verified
+      source-time start_url must be same-site with a CURRENT
       business.website.official fact — a bounded crawl of a superseded
       site must not establish coverage for a different current site,
       and with no current website identity the branch fails closed.
@@ -723,38 +730,6 @@ def _public_surface_coverage(
     coverage evidence that belongs to no journey stage and generated no
     fact (PCJ-02).
     """
-    evaluate_stage = next(
-        (stage for stage in stages if str(stage.get("stage")) == "evaluate"),
-        None,
-    )
-    if (
-        evaluate_stage is not None
-        and evaluate_stage.get("evidence_state") == "observed"
-    ):
-        entries = list(evaluate_stage.get("evidence", ()))
-        return {
-            "state": "evaluation_observed",
-            "evidence_ids": sorted(
-                {
-                    str(entry.get("evidence_id"))
-                    for entry in entries
-                }
-            ),
-            "session_ids": [],
-            "support": sorted(
-                (
-                    {
-                        "evidence_id": str(entry.get("evidence_id")),
-                        "acquisition_session_id": str(
-                            entry.get("acquisition_session_id")
-                        ),
-                        "retrieved_at": str(entry.get("retrieved_at")),
-                    }
-                    for entry in entries
-                ),
-                key=lambda item: item["evidence_id"],
-            ),
-        }
     rows_by_session: dict[str, list[dict[str, Any]]] = {}
     for row in website_evidence:
         rows_by_session.setdefault(
@@ -773,22 +748,66 @@ def _public_surface_coverage(
         host = _host_of(normalized) or _host_of(value)
         if host:
             current_site_hosts.add(host)
-    if not current_site_hosts:
-        # SR-02: without a current official-website identity, no bounded
-        # crawl can speak for today's public surface.
-        return {
-            "state": "not_covered",
-            "evidence_ids": [],
-            "session_ids": [],
-            "support": [],
-        }
 
-    def _session_site(rows: list[dict[str, Any]]) -> str | None:
+    session_site_by_id: dict[str, str | None] = {}
+    for session_id, rows in rows_by_session.items():
         start = rows[0].get("session_start_url")
         normalized = (
             normalize_http_url(start) if isinstance(start, str) else None
         )
-        return _host_of(normalized) or _host_of(start)
+        session_site_by_id[session_id] = (
+            _host_of(normalized) or _host_of(start)
+        )
+
+    def _admissible(entry: dict[str, Any]) -> bool:
+        if str(entry.get("source_id")) != _OFFICIAL_WEB_SOURCE_ID:
+            return True
+        host = session_site_by_id.get(
+            str(entry.get("acquisition_session_id"))
+        )
+        return host is not None and host in current_site_hosts
+
+    evaluate_stage = next(
+        (stage for stage in stages if str(stage.get("stage")) == "evaluate"),
+        None,
+    )
+    if (
+        evaluate_stage is not None
+        and evaluate_stage.get("evidence_state") == "observed"
+    ):
+        entries = [
+            entry
+            for entry in evaluate_stage.get("evidence", ())
+            if _admissible(entry)
+        ]
+        if entries:
+            return {
+                "state": "evaluation_observed",
+                "evidence_ids": sorted(
+                    {
+                        str(entry.get("evidence_id"))
+                        for entry in entries
+                    }
+                ),
+                "session_ids": [],
+                "support": sorted(
+                    (
+                        {
+                            "evidence_id": str(entry.get("evidence_id")),
+                            "acquisition_session_id": str(
+                                entry.get("acquisition_session_id")
+                            ),
+                            "retrieved_at": str(entry.get("retrieved_at")),
+                        }
+                        for entry in entries
+                    ),
+                    key=lambda item: item["evidence_id"],
+                ),
+            }
+        # SR-03: evaluate is observed only from superseded-site website
+        # evidence (or evidence with no current site identity) — fall
+        # through to the bounded branch, which applies its own
+        # current-site binding.
 
     bounded_current = sorted(
         session_id
@@ -798,7 +817,8 @@ def _public_surface_coverage(
             row.get("current")
             for row in rows_by_session[session_id]
         )
-        and _session_site(rows_by_session[session_id]) in current_site_hosts
+        and session_site_by_id.get(session_id) is not None
+        and session_site_by_id[session_id] in current_site_hosts
     )
     if bounded_current:
         support_rows = [

@@ -2695,3 +2695,97 @@ def test_sr02_bounded_coverage_bound_to_current_site(tmp_path: Path) -> None:
     assert journey_domain["reason"]["unmet_conditions"] == [
         "public_surface_coverage"]
     conn.close()
+
+
+# SR-03: positive evaluation coverage is site-aware — an evaluate page
+# from a superseded site cannot cover a different current site.
+def test_sr03_positive_coverage_bound_to_current_site(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "sr03.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+
+    def domain_state():
+        dossier = build_business_dossier(
+            conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+        coverage = dossier["customer_journey"]["public_surface_coverage"]
+        assessments = {
+            str(a["domain"]): a
+            for a in derive_domain_assessments(dossier)
+        }
+        return coverage, assessments["customer_journey"]
+
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "evaluation_observed"
+    assert journey_domain["state"] == "sufficient"
+
+    # same site, different host spelling and path: still covered
+    _supersede_website_fact(
+        conn, entity, "https://www.seed.example/landing/elsewhere",
+        at="2026-09-26T11:00:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "evaluation_observed"
+    assert journey_domain["state"] == "sufficient"
+
+    # different-host site B, never crawled, A's evaluate page still
+    # fresh: the superseded site no longer covers the public surface
+    _supersede_website_fact(
+        conn, entity, "https://other.example/",
+        at="2026-09-26T11:30:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "not_covered"
+    assert coverage["evidence_ids"] == [] and coverage["support"] == []
+    assert journey_domain["state"] == "partial"
+    assert journey_domain["reason"]["unmet_conditions"] == [
+        "public_surface_coverage"]
+    conn.close()
+
+
+# SR-03 unit contract for the positive-branch evidence filter: website
+# rows are site-bound, non-website evaluate evidence deliberately is not.
+def test_sr03_coverage_evidence_filter_semantics() -> None:
+    from sara.dossier.customer_journey import _public_surface_coverage
+
+    maps_entry = {
+        "evidence_id": "ev_maps", "source_id": "src_google_maps",
+        "acquisition_session_id": "acq_maps",
+        "retrieved_at": "2026-09-26T10:00:00+00:00",
+    }
+    superseded_web_entry = {
+        "evidence_id": "ev_web_old", "source_id": "src_official_web",
+        "acquisition_session_id": "acq_web_old",
+        "retrieved_at": "2026-09-26T12:00:00+00:00",
+    }
+    stages = [{
+        "stage": "evaluate", "evidence_state": "observed",
+        "channels": [], "handoffs": [],
+        "evidence": [maps_entry, superseded_web_entry],
+        "missing_knowledge": [],
+    }]
+    website_evidence = [{
+        "evidence_id": "ev_web_old",
+        "acquisition_session_id": "acq_web_old",
+        "retrieved_at": "2026-09-26T12:00:00+00:00",
+        "current": True,
+        "session_start_url": "https://old.example/",
+    }]
+    website_facts = [{
+        "status": "single_source",
+        "freshness": {"is_stale": False},
+        "value": "https://new.example/",
+    }]
+
+    # the superseded-site website row is filtered; the Maps evidence
+    # entry still covers the business
+    coverage = _public_surface_coverage(
+        stages, website_evidence, frozenset(), website_facts)
+    assert coverage["state"] == "evaluation_observed"
+    assert coverage["evidence_ids"] == ["ev_maps"]
+    assert [item["evidence_id"] for item in coverage["support"]] == [
+        "ev_maps"]
+
+    # website-only evidence from the superseded site: no coverage
+    stages[0]["evidence"] = [superseded_web_entry]
+    coverage = _public_surface_coverage(
+        stages, website_evidence, frozenset(), website_facts)
+    assert coverage["state"] == "not_covered"
+    assert coverage["evidence_ids"] == [] and coverage["support"] == []
