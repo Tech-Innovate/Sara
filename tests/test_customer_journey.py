@@ -833,8 +833,11 @@ def test_maps_only_stale_journey_is_stale_not_vanished(tmp_path: Path) -> None:
 
 
 def test_mixed_freshness_observed_stage_shows_current_surface_only(tmp_path: Path) -> None:
-    """CJ-04: with a fresh and a stale crawl of the same site, an observed
-    stage exposes only the current crawl's channels and evidence."""
+    """RCJ-04: with a fresh and a stale crawl of the same site, an observed
+    stage exposes only current surface — WITHOUT re-aging fact evidence
+    against a second universal window. Website metadata channels cite the
+    current crawl; a current phone fact keeps its (older) Maps evidence;
+    no stale-crawl WEBSITE rows appear in observed stages."""
     conn = prepared(tmp_path / "mixed.sqlite")
     entity = business_entity_id_for_maps_business(1)
     clock = Clock()
@@ -853,9 +856,9 @@ def test_mixed_freshness_observed_stage_shows_current_surface_only(tmp_path: Pat
             "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
             "WHERE a.collector_name='sara.website'").fetchall()
     }
-    stale_rows = first_rows
-    fresh_rows = all_rows - first_rows
-    assert fresh_rows
+    stale_website_rows = first_rows
+    fresh_website_rows = all_rows - first_rows
+    assert fresh_website_rows
     evaluated = "2026-11-10T12:00:00+00:00"  # 5 days after the second crawl
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at=evaluated)
@@ -864,28 +867,55 @@ def test_mixed_freshness_observed_stage_shows_current_surface_only(tmp_path: Pat
         s for s in journey["stages"] if s["evidence_state"] == "observed"
     ]
     assert observed
+    maps_rows = {
+        row[0] for row in conn.execute(
+            "SELECT e.id FROM evidence_items e WHERE e.source_id='src_google_maps'"
+        ).fetchall()
+    }
+    current_fact_evidence = {
+        str(support["evidence_id"])
+        for fact in dossier["facts"]
+        if fact["status"] in {"confirmed", "single_source"}
+        and not bool(fact["freshness"]["is_stale"])
+        for support in fact["observation_support"]
+        if support.get("support_role") == "supports"
+        and support.get("evidence_status") == "usable"
+    }
     for stage in observed:
+        # Stale-crawl website rows may appear ONLY as supporting
+        # observations of CURRENT facts (RCJ-04: fact currency follows
+        # the fact, its confirming observations are not re-aged). They
+        # must never arrive through the metadata path — channels and
+        # hand-offs below pin that.
         used = {entry["evidence_id"] for entry in stage["evidence"]}
-        assert used <= fresh_rows, stage["stage"]
+        for evidence_id in used & stale_website_rows:
+            assert evidence_id in current_fact_evidence, (
+                stage["stage"], evidence_id,
+                "stale website row outside current-fact support")
+        # Current fact evidence (e.g. the 60-day phone fact citing older
+        # Maps rows) legitimately remains — it was never re-aged.
+        if stage["stage"] == "contact":
+            assert used & maps_rows, "phone fact Maps evidence retained"
+        # Website metadata channels cite only current-crawl rows...
         for channel in stage["channels"]:
-            assert channel["evidence_id"] in fresh_rows
+            if channel["evidence_id"] in all_rows:
+                assert channel["evidence_id"] in fresh_website_rows
+        # ...and current hand-offs likewise.
         for handoff in stage["handoffs"]:
-            assert handoff["evidence_id"] in fresh_rows
-    # Website-side hand-offs must cite the current crawl's rows. The
-    # Maps->website hand-off cites MAPS evidence, whose currency follows
-    # the official-website fact's own freshness window — assert it
-    # exists (the fact is fresh) without forcing it into fresh_rows.
+            if handoff["from"] == "official_website":
+                assert handoff["evidence_id"] in fresh_website_rows
+                assert handoff["current"] is True
     for handoff in journey["handoffs"]:
         if handoff["from"] == "official_website":
-            assert handoff["evidence_id"] in fresh_rows
+            assert handoff["evidence_id"] in fresh_website_rows
+    # The maps->website hand-off cites Maps evidence whose currency
+    # follows the official-website fact's 90-day window — present here.
     assert any(
         handoff["from"] == "maps_listing"
         for handoff in journey["handoffs"]
     )
-    assert stale_rows
+    assert stale_website_rows
     conn.close()
-
-
 def test_preview_consistent_with_reconstruction(tmp_path: Path) -> None:
     """CJ-05: the read-only preview reads the reconstruction — never
     contradicting it and never claiming sufficiency."""
@@ -935,6 +965,571 @@ def test_preview_consistent_with_reconstruction(tmp_path: Path) -> None:
     assert _preview_for(
         {"stages": []})["customer_journey"] == "not_started"
     assert _preview_for(None)["customer_journey"] == "not_started"
+    conn.close()
+
+
+
+# ---- RCJ acceptance regressions (frozen review 5375391470) ----
+
+def test_unsupported_website_version_is_silently_out_of_scope(tmp_path: Path) -> None:
+    """RCJ-01: a producer-valid session at a version the journey simply
+    does not know is NOT an integrity failure — durable history must not
+    be poisoned by collector version evolution."""
+    conn = prepared(tmp_path / "v4.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    from sara.website.model import (
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    config = wcanonical(
+        {
+            "entity_id": entity,
+            "start_url": "https://legacy.example/",
+            "page_limit": 8,
+            "depth_limit": 2,
+            "max_response_bytes": 1048576,
+            "timeout_seconds": 10.0,
+            "request_interval_seconds": 1.0,
+            "max_policy_delay_seconds": 30.0,
+            "retry_attempt_limit": 4,
+            "retry_base_delay_seconds": 1.0,
+            "retry_max_delay_seconds": 30.0,
+            "retry_delay_budget_seconds": 60.0,
+            "user_agent": "SaraBusinessUnderstanding/1.0",
+            "obey_robots": True,
+            "evidence_root": "/tmp/legacy-ev",
+        }
+    )
+    started_at = "2026-09-26T12:15:00+00:00"
+    session_id = wopaque("acq", entity, started_at, wsha(config))
+    conn.execute(
+        "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
+        "VALUES ('src_official_web','official_website','Official website',NULL,"
+        "'2026-01-01T00:00:00+00:00',1)")
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, entity, "src_official_web", "sara.website", "4",
+         config, wsha(config), "complete", started_at, started_at,
+         None, None, 0, 0))
+    conn.commit()
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "customer_journey_website_session_invalid" not in codes
+    assert "customer_journey_website_evidence_invalid" not in codes
+    # Out of scope means not used, not flagged.
+    used = {
+        entry["evidence_id"]
+        for stage in dossier["customer_journey"]["stages"]
+        for entry in stage["evidence"]
+    }
+    assert session_id not in used
+    conn.close()
+
+
+def test_future_version_with_extra_config_keys_stays_admissible(tmp_path: Path) -> None:
+    """RCJ-01: a session at a FUTURE version whose config adds keys beyond
+    the required contract remains admissible — version bumps must not
+    poison durable history."""
+    conn = prepared(tmp_path / "v6.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    from sara.website.model import (
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    config_dict = {
+        "entity_id": entity,
+        "start_url": "https://seed.example/",
+        "page_limit": 8,
+        "depth_limit": 2,
+        "max_response_bytes": 1048576,
+        "timeout_seconds": 10.0,
+        "request_interval_seconds": 1.0,
+        "max_policy_delay_seconds": 30.0,
+        "retry_attempt_limit": 4,
+        "retry_base_delay_seconds": 1.0,
+        "retry_max_delay_seconds": 30.0,
+        "retry_delay_budget_seconds": 60.0,
+        "user_agent": "SaraBusinessUnderstanding/1.0",
+        "obey_robots": True,
+        "evidence_root": "/tmp/future-ev",
+        "screenshot": True,  # a hypothetical v6 addition
+    }
+    config = wcanonical(config_dict)
+    started_at = "2026-09-26T12:15:00+00:00"
+    session_id = wopaque("acq", entity, started_at, wsha(config))
+    conn.execute(
+        "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
+        "VALUES ('src_official_web','official_website','Official website',NULL,"
+        "'2026-01-01T00:00:00+00:00',1)")
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, entity, "src_official_web", "sara.website", "6",
+         config, wsha(config), "complete", started_at, started_at,
+         None, None, 0, 0))
+    booking_channel = [{
+        "channel_type": "booking",
+        "identifier": "https://booksy.com/future",
+        "normalized_identifier": "https://booksy.com/future",
+        "url": "https://booksy.com/future",
+        "extraction": "action_link",
+        "canonicalized_channel_id": None,
+        "canonicalized_scope": None,
+    }]
+    page_url = "https://seed.example/booking"
+    content = "future booking page"
+    content_sha = wsha(content)
+    evidence_id = wopaque("ev", session_id, page_url, content_sha)
+    metadata = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://seed.example/",
+            "requested_url": page_url,
+            "final_url": page_url,
+            "crawl_depth": 0,
+            "page_role": "booking",
+            "home_page": False,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": None,
+            "canonical_url": page_url,
+            "channels": booking_channel,
+            "observation_ids": [],
+            "screenshot_ref": "x",  # hypothetical v6 metadata addition
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (evidence_id, session_id, "src_official_web", page_url, "official",
+         started_at, content_sha, metadata, started_at))
+    conn.execute(
+        "UPDATE acquisition_sessions SET evidence_count=1 WHERE id=?",
+        (session_id,))
+    conn.commit()
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "customer_journey_website_session_invalid" not in codes
+    assert "customer_journey_website_evidence_invalid" not in codes
+    book_order = next(
+        s for s in dossier["customer_journey"]["stages"]
+        if s["stage"] == "book_order")
+    assert book_order["evidence_state"] == "observed"
+    assert any(
+        c["normalized_identifier"] == "https://booksy.com/future"
+        for c in book_order["channels"]
+    )
+    conn.close()
+
+
+def test_absence_from_old_version_or_foreign_source_not_bounded(tmp_path: Path) -> None:
+    """RCJ-01: bounded not-observed requires absence support from the
+    WEBSITE collector at an absence-safe version (>= v5, when frontier
+    semantics became trustworthy). Pre-v5 or non-website absence support
+    leaves the stage unknown."""
+    from sara.dossier.customer_journey import reconstruct_customer_journey
+
+    conn = prepared(tmp_path / "absence.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)  # v5 absence facts exist
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    # Unit-level: same fact, absence support downgraded to v4 or a
+    # foreign source/collector, must NOT establish bounded not-observed.
+    base_fact = next(
+        fact for fact in dossier["facts"]
+        if fact["predicate"] == "capability.online_booking"
+        and fact["status"] == "not_observed")
+
+    def _variant(source_id, collector_name, version):
+        fact = json.loads(json.dumps(base_fact))
+        for support in fact["acquisition_support"]:
+            support["source_id"] = source_id
+            support["collector_name"] = collector_name
+            support["collector_version"] = version
+        return fact
+
+    facts_v4 = [dict(f) for f in dossier["facts"]]
+    for index, fact in enumerate(facts_v4):
+        if fact["id"] == base_fact["id"]:
+            facts_v4[index] = _variant(
+                "src_official_web", "sara.website", "4")
+    doc_v4, _ = reconstruct_customer_journey(
+        conn, entity_id=entity, facts=facts_v4, evidence=dossier["evidence"],
+        evaluated_at="2026-09-26T12:30:00+00:00")
+    stage_v4 = next(
+        s for s in doc_v4["stages"] if s["stage"] == "book_order")
+    assert stage_v4["evidence_state"] == "unknown"
+
+    facts_foreign = [dict(f) for f in dossier["facts"]]
+    for index, fact in enumerate(facts_foreign):
+        if fact["id"] == base_fact["id"]:
+            facts_foreign[index] = _variant(
+                "src_google_maps", "sara.maps_sync", "2")
+    doc_foreign, _ = reconstruct_customer_journey(
+        conn, entity_id=entity, facts=facts_foreign,
+        evidence=dossier["evidence"],
+        evaluated_at="2026-09-26T12:30:00+00:00")
+    stage_foreign = next(
+        s for s in doc_foreign["stages"] if s["stage"] == "book_order")
+    assert stage_foreign["evidence_state"] == "unknown"
+    conn.close()
+
+
+def test_source_time_identity_forgeries_are_invalid(tmp_path: Path) -> None:
+    """RCJ-02: source_id, legacy_run_id, and target==config-entity are
+    part of the producer contract. Forging any of them invalidates the
+    session even when config bytes, hash, and id are self-consistent."""
+    conn = prepared(tmp_path / "identity.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    # Predecessor entity whose sessions are lineage-admissible.
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
+        "merged_at,created_at,updated_at) "
+        "VALUES ('be_old','business_entity','merged',?,"
+        "'2026-09-26T11:00:00+00:00','2026-09-25T00:00:00+00:00','2026-09-26T11:00:00+00:00')",
+        (entity,))
+    from sara.website.model import (
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    def _session(target, config_entity, *, legacy_run_id=None,
+                 source_id="src_official_web", suffix=""):
+        config = wcanonical(
+            {
+                "entity_id": config_entity,
+                "start_url": "https://seed.example/",
+                "page_limit": 8, "depth_limit": 2,
+                "max_response_bytes": 1048576, "timeout_seconds": 10.0,
+                "request_interval_seconds": 1.0,
+                "max_policy_delay_seconds": 30.0,
+                "retry_attempt_limit": 4,
+                "retry_base_delay_seconds": 1.0,
+                "retry_max_delay_seconds": 30.0,
+                "retry_delay_budget_seconds": 60.0,
+                "user_agent": "SaraBusinessUnderstanding/1.0",
+                "obey_robots": True,
+                "evidence_root": "/tmp/x",
+            }
+        )
+        started_at = f"2026-09-26T12:1{suffix}:00+00:00"
+        session_id = wopaque(
+            "acq", config_entity, started_at, wsha(config))
+        conn.execute(
+            "INSERT INTO acquisition_sessions("
+            "id,target_subject_id,source_id,collector_name,collector_version,"
+            "config_json,config_hash,status,started_at,finished_at,error,"
+            "legacy_run_id,evidence_count,observation_count"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (session_id, target, source_id, "sara.website", "5",
+             config, wsha(config), "complete", started_at, started_at,
+             None, legacy_run_id, 0, 0))
+        return session_id
+
+    if conn.execute(
+        "SELECT 1 FROM sources WHERE id='src_official_web'"
+    ).fetchone() is None:
+        conn.execute(
+            "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
+            "VALUES ('src_official_web','official_website','Official website',NULL,"
+            "'2026-01-01T00:00:00+00:00',1)")
+    # A dedicated run row so legacy_run_id is FK-valid yet unused by any
+    # real session (the insert collision guard rejects duplicates).
+    conn.execute(
+        "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
+        "config_json,raw_path,status,started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        ("rx", "test", '{"max_lat":22,"max_lon":40,"min_lat":21,"min_lon":39}',
+         2.0, 1, '["restaurant"]', "img", "{}", "/e/rx.jsonl", "complete",
+         "2026-09-26T12:00:00+00:00"))
+    # target=canonical, config=predecessor: both in lineage, but the
+    # source-time identity disagrees — invalid (RCJ-02).
+    sid_mismatch = _session(entity, "be_old", suffix="1")
+    # producer contract violations:
+    sid_legacy = _session(entity, entity, legacy_run_id="rx", suffix="2")
+    sid_source = _session(
+        entity, entity, source_id="src_google_maps", suffix="3")
+    conn.commit()
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    invalid_sessions = {
+        issue["session_id"] for issue in dossier["integrity_issues"]
+        if issue["code"] == "customer_journey_website_session_invalid"
+    }
+    assert sid_mismatch in invalid_sessions
+    assert sid_legacy in invalid_sessions
+    assert sid_source in invalid_sessions
+    conn.close()
+
+
+def test_forged_child_with_corrected_counters_still_sealed(tmp_path: Path) -> None:
+    """RCJ-03: appending a child AND correcting the stored counters is no
+    longer enough — the forged row must still carry the full producer
+    metadata contract and observation bindings, and fails on them."""
+    from sara.website.model import canonical_json as wcanonical
+    from sara.website.model import opaque_id as wopaque, sha256_text as wsha
+
+    conn = prepared(tmp_path / "forged2.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=BOOKING_SITE)
+    session_id = stats.session_id
+    stored = conn.execute(
+        "SELECT evidence_count, observation_count FROM acquisition_sessions "
+        "WHERE id=?", (session_id,)).fetchone()
+    forged_url = "https://seed.example/forged2"
+    forged_content = "forged body"
+    forged_sha = wsha(forged_content)
+    forged_id = wopaque("ev", session_id, forged_url, forged_sha)
+    # Case A: metadata omits required producer keys (no crawl_depth,
+    # no observation_ids) — counters corrected, deterministic id correct.
+    meta_a = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://seed.example/",
+            "requested_url": forged_url,
+            "final_url": forged_url,
+            "page_role": "booking",
+            "home_page": False,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": None,
+            "canonical_url": forged_url,
+            "channels": [{
+                "channel_type": "booking",
+                "identifier": "https://booksy.com/forged2",
+                "normalized_identifier": "https://booksy.com/forged2",
+                "url": "https://booksy.com/forged2",
+                "extraction": "action_link",
+                "canonicalized_channel_id": None,
+                "canonicalized_scope": None,
+            }],
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,'https://seed.example/forged2','official','usable',"
+        "?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (forged_id, session_id, "src_official_web",
+         "2026-09-26T12:00:09+00:00", forged_sha, meta_a,
+         "2026-09-26T12:00:09+00:00"))
+    conn.execute(
+        "UPDATE acquisition_sessions SET evidence_count=? WHERE id=?",
+        (stored[0] + 1, session_id))
+    conn.commit()
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    issues = dossier["integrity_issues"]
+    assert any(
+        i["code"] == "customer_journey_website_evidence_invalid"
+        and i["evidence_id"] == forged_id
+        for i in issues
+    ) or any(
+        i["code"] == "customer_journey_website_session_invalid"
+        and i["session_id"] == session_id
+        for i in issues
+    )
+    journey = dossier["customer_journey"]
+    all_channels = {
+        (c["identifier"], c["normalized_identifier"])
+        for stage in journey["stages"]
+        for c in stage["channels"]
+    }
+    assert ("https://booksy.com/forged2", "https://booksy.com/forged2") not in (
+        all_channels
+    )
+
+    # Case B: evidence rows are append-only — a SECOND forged row (full
+    # metadata contract, but observation_ids do not match the actual zero
+    # attached observations) with the counter accounting for both.
+    forged_url_b = "https://seed.example/forged2b"
+    forged_id_b = wopaque("ev", session_id, forged_url_b, forged_sha)
+    meta_b = json.loads(meta_a)
+    meta_b["crawl_depth"] = 0
+    meta_b["observation_ids"] = ["obs_forged_ghost"]
+    meta_b["requested_url"] = forged_url_b
+    meta_b["final_url"] = forged_url_b
+    meta_b["canonical_url"] = forged_url_b
+    meta_b_json = wcanonical(meta_b)
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,'https://seed.example/forged2b','official','usable',"
+        "?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (forged_id_b, session_id, "src_official_web",
+         "2026-09-26T12:00:09+00:00", forged_sha, meta_b_json,
+         "2026-09-26T12:00:09+00:00"))
+    conn.execute(
+        "UPDATE acquisition_sessions SET evidence_count=? WHERE id=?",
+        (stored[0] + 2, session_id))
+    conn.commit()
+    dossier_b = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    assert any(
+        i["code"] == "customer_journey_website_evidence_invalid"
+        and i["evidence_id"] == forged_id_b
+        for i in dossier_b["integrity_issues"]
+    )
+    channels_b = {
+        (c["identifier"], c["normalized_identifier"])
+        for stage in dossier_b["customer_journey"]["stages"]
+        for c in stage["channels"]
+    }
+    assert ("https://booksy.com/forged2", "https://booksy.com/forged2") not in (
+        channels_b
+    )
+    conn.close()
+
+
+def test_day45_phone_channel_and_maps_evidence_retained(tmp_path: Path) -> None:
+    """RCJ-04: at day 45 the phone fact (60-day window) is current; its
+    channel and supporting Maps evidence must NOT be re-aged out by a
+    universal 30-day window."""
+    conn = prepared(tmp_path / "day45.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    evaluated = "2026-11-10T12:00:00+00:00"  # 45 days after Maps ingest
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at=evaluated)
+    journey = dossier["customer_journey"]
+    contact = next(s for s in journey["stages"] if s["stage"] == "contact")
+    # phone fact: 60-day window → still fresh → contact observed.
+    assert contact["evidence_state"] == "observed"
+    phone_channel = next(
+        c for c in contact["channels"] if c["channel_type"] == "phone")
+    maps_rows = {
+        row[0] for row in conn.execute(
+            "SELECT e.id FROM evidence_items e "
+            "WHERE e.source_id='src_google_maps'").fetchall()
+    }
+    assert phone_channel["evidence_id"] in maps_rows
+    used = {entry["evidence_id"] for entry in contact["evidence"]}
+    assert used & maps_rows, "Maps evidence retained for current phone fact"
+    # The official-website fact carries a 90-day window: discover is
+    # observed at day 45 through it — per-predicate windows, not one
+    # universal clock.
+    discover = next(s for s in journey["stages"] if s["stage"] == "discover")
+    assert discover["evidence_state"] == "observed"
+    conn.close()
+
+
+def test_stale_stage_keeps_historical_handoffs(tmp_path: Path) -> None:
+    """RCJ-05: a stale stage keeps its full historical surface, including
+    booking/ordering/WhatsApp hand-offs, each flagged current=False."""
+    conn = prepared(tmp_path / "stale-handoff.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=BOOKING_SITE)
+    evaluated = "2027-01-15T12:00:00+00:00"  # everything aged out
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at=evaluated)
+    journey = dossier["customer_journey"]
+    book_order = next(s for s in journey["stages"] if s["stage"] == "book_order")
+    assert book_order["evidence_state"] == "stale"
+    booking_handoffs = [
+        h for h in book_order["handoffs"] if h["to"] in ("booking", "ordering")
+    ]
+    assert booking_handoffs, "historical hand-offs retained on stale stage"
+    for handoff in booking_handoffs:
+        assert handoff["current"] is False
+    doc_booking = [
+        h for h in journey["handoffs"]
+        if h["from"] == "official_website" and h["to"] in ("booking", "ordering")
+    ]
+    assert doc_booking
+    assert all(h["current"] is False for h in doc_booking)
+    # Sufficiency must not count historical hand-offs (policy filters
+    # current=True) — the domain is stale here regardless.
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: evaluated)
+    state = conn.execute(
+        "SELECT state FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='customer_journey'",
+        (seal.assessment_id,)).fetchone()[0]
+    assert state == "stale"
+    conn.close()
+
+
+def test_maps_anchor_aggregation_not_fact_id_ordering(tmp_path: Path) -> None:
+    """RCJ-06: discover currency follows whether ANY current Maps anchor
+    exists — never opaque fact-id ordering. A stale name fact with a
+    fresh phone fact yields observed regardless of id order."""
+    from sara.dossier.customer_journey import reconstruct_customer_journey
+
+    conn = prepared(tmp_path / "anchors.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    facts = [dict(f) for f in dossier["facts"]]
+    # Make name/address/lat/lon stale (90d window, aged out) while phone
+    # (60d) stays fresh — mixed anchor freshness.
+    stale_predicates = {
+        "business.name.trading", "location.address",
+        "location.latitude", "location.longitude",
+    }
+    for fact in facts:
+        if fact["predicate"] in stale_predicates:
+            fact["freshness"] = dict(fact["freshness"], is_stale=True)
+    doc, issues = reconstruct_customer_journey(
+        conn, entity_id=entity, facts=facts, evidence=dossier["evidence"],
+        evaluated_at="2026-09-26T12:30:00+00:00")
+    discover = next(s for s in doc["stages"] if s["stage"] == "discover")
+    assert discover["evidence_state"] == "observed"
+    assert issues == []
+    # And the mirror: only-stale anchors → stale, never unknown.
+    facts_all_stale = [dict(f) for f in facts]
+    for fact in facts_all_stale:
+        if fact["predicate"] in stale_predicates | {
+            "location.phone", "business.website.official",
+        }:
+            fact["freshness"] = dict(fact["freshness"], is_stale=True)
+    doc2, _ = reconstruct_customer_journey(
+        conn, entity_id=entity, facts=facts_all_stale,
+        evidence=dossier["evidence"],
+        evaluated_at="2026-09-26T12:30:00+00:00")
+    discover2 = next(s for s in doc2["stages"] if s["stage"] == "discover")
+    assert discover2["evidence_state"] == "stale"
+    conn.close()
+
+
+def test_explicit_stale_status_fact_remains_contribution(tmp_path: Path) -> None:
+    """Schema edge: a value-bearing status='stale' fact is history Sara
+    stands behind — it contributes with current=False, marking the stage
+    stale rather than unknown."""
+    from sara.dossier.customer_journey import reconstruct_customer_journey
+
+    conn = prepared(tmp_path / "stale-status.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    facts = [dict(f) for f in dossier["facts"]]
+    for fact in facts:
+        if fact["predicate"] == "location.phone":
+            fact["status"] = "stale"
+    doc, _ = reconstruct_customer_journey(
+        conn, entity_id=entity, facts=facts, evidence=dossier["evidence"],
+        evaluated_at="2026-09-26T12:30:00+00:00")
+    contact = next(s for s in doc["stages"] if s["stage"] == "contact")
+    assert contact["evidence_state"] == "stale"
+    assert contact["evidence"], "historical surface retained"
     conn.close()
 
 

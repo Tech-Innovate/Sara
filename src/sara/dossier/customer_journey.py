@@ -36,9 +36,41 @@ _STAGE_LABELS = {
     "return": "return",
 }
 
-#: Website-evidence currency window for journey purposes (days). Matches
-#: the vocabulary's website/capability freshness windows.
+#: Website-evidence currency window for journey METADATA contributions
+#: (page roles, channel candidates) — the only journey inputs with no
+#: predicate freshness policy of their own. Fact-derived contributions
+#: inherit their fact's per-predicate freshness window instead (RCJ-04).
 _JOURNEY_EVIDENCE_FRESHNESS_DAYS = 30
+
+#: Session-config keys the website producer has written since the journey
+#: contract was defined. Verification requires these keys (canonical
+#: bytes, hash, deterministic id); EXTRA keys from later collector
+#: versions are tolerated so a version bump does not invalidate durable
+#: historical sessions (RCJ-01).
+_WEBSITE_SESSION_REQUIRED_CONFIG_KEYS = frozenset({
+    "entity_id", "start_url", "page_limit", "depth_limit",
+    "max_response_bytes", "timeout_seconds", "request_interval_seconds",
+    "max_policy_delay_seconds", "retry_attempt_limit",
+    "retry_base_delay_seconds", "retry_max_delay_seconds",
+    "retry_delay_budget_seconds", "user_agent", "obey_robots",
+    "evidence_root",
+})
+
+#: Evidence-metadata keys the producer writes per retained page. Required
+#: as above; extras tolerated for forward compatibility (RCJ-01/RCJ-03).
+_WEBSITE_EVIDENCE_REQUIRED_METADATA_KEYS = frozenset({
+    "acquisition_kind", "entity_id", "start_url", "requested_url",
+    "final_url", "crawl_depth", "page_role", "home_page",
+    "business_wide_scope_eligible", "crawl_frontier_exhausted",
+    "title", "canonical_url", "channels", "observation_ids",
+})
+
+#: The website collector version at which frontier-exhaustion semantics
+#: became safe for bounded absence claims (v5; pre-v5 depth semantics
+#: could report exhaustion with whole surfaces uninspected). Absence
+#: support from older sessions must not establish journey bounded
+#: not-observed (RCJ-01).
+_ABSENCE_SAFE_WEBSITE_VERSION = 5
 
 _SOCIAL_CHANNEL_TYPES = {
     "instagram", "facebook", "linkedin", "x", "tiktok", "youtube",
@@ -83,15 +115,26 @@ def _supported_fact(fact: dict[str, Any]) -> bool:
 
     CJ-03: stale facts remain journey contributions with current=False —
     an aged-out Maps phone fact must mark the contact stage stale, not
-    make the stage vanish into unknown/not_started.
+    make the stage vanish into unknown/not_started. The explicit
+    value-bearing status="stale" the schema and assessment policy
+    recognize is included: it is history Sara stands behind, aged out.
     """
-    return fact["status"] in {"confirmed", "single_source"}
+    return fact["status"] in {"confirmed", "single_source", "stale"}
 
 
 def _fresh_fact(fact: dict[str, Any]) -> bool:
     return (
         fact["status"] in {"confirmed", "single_source"}
         and not bool(fact["freshness"]["is_stale"])
+    )
+
+
+def _fact_current(fact: dict[str, Any]) -> bool:
+    """A supported fact's currency: within its per-predicate window AND
+    not explicitly marked stale by reconciliation."""
+    return (
+        not bool(fact["freshness"]["is_stale"])
+        and fact["status"] != "stale"
     )
 
 
@@ -117,9 +160,13 @@ def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
 
 
 def _bounded_absence_current(fact: dict[str, Any]) -> bool:
-    """Mirror of the assessment policy's bounded-absence check: the value
-    was not observed, the inspection is current, and a complete bounded
-    acquisition session supports the absence claim. never absence."""
+    """Bounded not-observed for the journey: the value was not observed,
+    the inspection is current, and a complete bounded acquisition session
+    of the WEBSITE collector at an absence-safe version (>= v5, when
+    frontier-exhaustion semantics became trustworthy) supports the
+    absence claim. never absence. (RCJ-01: pre-v5 exhaustion and
+    non-website acquisitions cannot establish journey bounded
+    not-observed.)"""
     return (
         fact["status"] == "not_observed"
         and not bool(fact["freshness"]["is_stale"])
@@ -127,9 +174,20 @@ def _bounded_absence_current(fact: dict[str, Any]) -> bool:
             support["support_role"] == "supports_absence"
             and support.get("status") == "complete"
             and support.get("target_subject_id") == fact["subject_id"]
+            and str(support.get("source_id")) == _OFFICIAL_WEB_SOURCE_ID
+            and str(support.get("collector_name")) == _WEBSITE_COLLECTOR_NAME
+            and _absence_safe_version(support.get("collector_version"))
             for support in fact["acquisition_support"]
         )
     )
+
+
+def _absence_safe_version(version: object) -> bool:
+    try:
+        parsed = int(str(version))
+    except (TypeError, ValueError):
+        return False
+    return parsed >= _ABSENCE_SAFE_WEBSITE_VERSION
 
 
 def _fact_evidence(fact: dict[str, Any], evidence_by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -165,6 +223,27 @@ def _fact_evidence(fact: dict[str, Any], evidence_by_id: dict[str, dict[str, Any
     return sorted(merged.values(), key=lambda item: item["evidence_id"])
 
 
+def _freshest_evidence(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The freshest entry by retrieval instant (tie-break: evidence id).
+
+    RCJ-04: a current fact confirmed by multiple observations should
+    surface its FRESHEST supporting evidence on channel entries, never a
+    lexically-first stale row.
+    """
+    if not entries:
+        return None
+    return max(
+        entries,
+        key=lambda entry: (
+            _parse_instant(
+                entry.get("retrieved_at"),
+                field=f"journey evidence {entry.get('evidence_id')} retrieved_at",
+            ) or datetime.min.replace(tzinfo=timezone.utc),
+            entry["evidence_id"],
+        ),
+    )
+
+
 def _load_website_evidence(
     conn: sqlite3.Connection, *, entity_id: str, evaluated_at: datetime
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -178,21 +257,25 @@ def _load_website_evidence(
     scope — they are neither used nor turned into integrity failures for
     this Entity.
 
-    Verification (producer-grade provenance): every admitted session must
-    satisfy the website collector's own contract — current collector
-    version, the canonical 15-key crawl config with matching hash and
-    deterministic session id, present lifecycle timestamps, a clean error
-    state for complete sessions, and stored child counts equal to the
-    actual evidence/observation rows. Every evidence row must then bind:
-    producer metadata shape, entity binding within the lineage, a valid
-    page role and channel candidates, the DETERMINISTIC evidence id over
+    Verification (producer-grade provenance, RCJ-01/02/03): every
+    admitted session must satisfy the website producer's contract —
+    src_official_web source, NULL legacy run id, the source-time Entity
+    identical in acquisition target and config, the canonical crawl
+    config with ALL required keys (extras tolerated so collector version
+    bumps do not poison durable history), matching hash and
+    deterministic session id, present lifecycle timestamps, a clean
+    error state for complete sessions, and stored child counts equal to
+    the actual evidence/observation rows. Every evidence row must then
+    bind: the producer metadata contract (all required keys), the
+    session's source-time entity exactly, a valid page role and channel
+    candidates, metadata observation_ids EXACTLY equal to the actual
+    attached producer observations, the DETERMINISTIC evidence id over
     (session, final_url, content_sha256), and final_url equal to the
     stored source locator. Failures surface as integrity issues and the
-    session/row is never used. A well-shaped row appended under a
-    terminal session breaks the stored-vs-actual count contract and
-    invalidates that session's evidence entirely.
+    session/row is never used. An appended child whose counters were
+    corrected must still forge the full metadata contract and exact
+    observation bindings.
     """
-    from ..website.model import COLLECTOR_VERSION as WEBSITE_COLLECTOR_VERSION
     from ..website.model import canonical_json as website_canonical_json
     from ..website.model import opaque_id as website_opaque_id
     from ..website.model import sha256_text as website_sha256_text
@@ -204,10 +287,12 @@ def _load_website_evidence(
     admitted_session_ids: list[str] = []
     session_status_by_id: dict[str, str] = {}
     session_version_by_id: dict[str, str] = {}
+    session_target_by_id: dict[str, str] = {}
 
     cursor = conn.execute(
-        "SELECT id,target_subject_id,collector_version,config_json,config_hash,"
-        "status,started_at,finished_at,error,evidence_count,observation_count "
+        "SELECT id,target_subject_id,source_id,legacy_run_id,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "evidence_count,observation_count "
         "FROM acquisition_sessions "
         "WHERE collector_name=? AND status IN ('complete','partial') "
         "ORDER BY id",
@@ -222,8 +307,15 @@ def _load_website_evidence(
         target = str(session["target_subject_id"] or "")
         if target not in lineage_set:
             continue  # CJ-01: another Entity's acquisition — not ours
+        # RCJ-02: source-time acquisition identity. The producer writes
+        # source_id=src_official_web, legacy_run_id=NULL, and the SAME
+        # source-time Entity into target and config. Convergence admits
+        # the session through the lineage; it must never weaken the
+        # original acquisition identity itself.
         invalid = False
-        if str(session["collector_version"]) != str(WEBSITE_COLLECTOR_VERSION):
+        if str(session["source_id"]) != _OFFICIAL_WEB_SOURCE_ID:
+            invalid = True
+        if session["legacy_run_id"] is not None:
             invalid = True
         try:
             config = json.loads(str(session["config_json"]))
@@ -233,16 +325,14 @@ def _load_website_evidence(
             config = None
             invalid = True
         if config is not None:
-            expected_keys = {
-                "entity_id", "start_url", "page_limit", "depth_limit",
-                "max_response_bytes", "timeout_seconds",
-                "request_interval_seconds", "max_policy_delay_seconds",
-                "retry_attempt_limit", "retry_base_delay_seconds",
-                "retry_max_delay_seconds", "retry_delay_budget_seconds",
-                "user_agent", "obey_robots", "evidence_root",
-            }
-            if set(config) != expected_keys:
+            # RCJ-01: REQUIRED keys (not exact-set): later collector
+            # versions may add config keys without invalidating durable
+            # historical sessions. Every required key present, canonical
+            # bytes, hash, and the deterministic id still bind the row.
+            if not _WEBSITE_SESSION_REQUIRED_CONFIG_KEYS <= set(config):
                 invalid = True
+            elif str(config.get("entity_id")) != target:
+                invalid = True  # RCJ-02: config Entity == acquisition target
             elif str(config.get("entity_id")) not in lineage_set:
                 invalid = True
             elif website_canonical_json(config) != str(session["config_json"]):
@@ -285,6 +375,7 @@ def _load_website_evidence(
         admitted_session_ids.append(session_id)
         session_status_by_id[session_id] = str(session["status"])
         session_version_by_id[session_id] = str(session["collector_version"])
+        session_target_by_id[session_id] = target
 
     rows: list[dict[str, Any]] = []
     if not admitted_session_ids:
@@ -316,9 +407,18 @@ def _load_website_evidence(
             metadata = None
             row_invalid = True
         if metadata is not None:
+            # RCJ-03: the exact producer metadata contract — every
+            # required key the journey consumes must be present (extras
+            # tolerated for forward compatibility, RCJ-01).
+            if not _WEBSITE_EVIDENCE_REQUIRED_METADATA_KEYS <= set(metadata):
+                row_invalid = True
             if metadata.get("acquisition_kind") != "bounded_official_website":
                 row_invalid = True
-            if str(metadata.get("entity_id")) not in lineage_set:
+            # RCJ-02: the row binds to the session's SOURCE-TIME entity,
+            # exactly — not merely somewhere in the lineage.
+            if str(metadata.get("entity_id")) != session_target_by_id.get(
+                row_session_id
+            ):
                 row_invalid = True
         final_url = metadata.get("final_url") if metadata else None
         if not isinstance(final_url, str) or not final_url:
@@ -366,6 +466,25 @@ def _load_website_evidence(
                         ),
                     }
                 )
+        else:
+            row_invalid = True
+        # RCJ-03: output seal — the metadata's observation_ids must be
+        # EXACTLY the observation rows actually attached to this evidence
+        # (sorted producer ids). An appended child that fixes counters
+        # must still forge matching observation bindings.
+        declared_observation_ids = metadata.get("observation_ids") if metadata else None
+        if isinstance(declared_observation_ids, list) and all(
+            isinstance(value, str) for value in declared_observation_ids
+        ):
+            actual_observation_ids = sorted(
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT o.id FROM observations o WHERE o.evidence_id=?",
+                    (evidence_id,),
+                ).fetchall()
+            )
+            if sorted(declared_observation_ids) != actual_observation_ids:
+                row_invalid = True
         else:
             row_invalid = True
         retrieved_at = _parse_instant(
@@ -560,14 +679,14 @@ def reconstruct_customer_journey(
             continue
         contributions["discover"].append(
             {
-                "current": not bool(fact["freshness"]["is_stale"]),
+                "current": _fact_current(fact),
                 "channels": [
                     _channel_entry(
                         channel_type="website",
                         identifier=value,
                         normalized_identifier=value,
                         scope="business_entity",
-                        evidence_id=fact_evidence[0]["evidence_id"],
+                        evidence_id=_freshest_evidence(fact_evidence)["evidence_id"],
                     )
                 ],
                 "evidence": fact_evidence,
@@ -590,8 +709,11 @@ def reconstruct_customer_journey(
         ),
         key=lambda fact: str(fact["id"]),
     )
-    if maps_anchor_facts:
-        anchor = maps_anchor_facts[0]
+    for anchor in maps_anchor_facts:
+        # RCJ-06: EVERY supported Maps anchor contributes; the stage is
+        # current when ANY current anchor exists, never because of opaque
+        # fact-id ordering. Evidence is deduplicated per anchor fact.
+        anchor_is_current = _fact_current(anchor)
         maps_evidence = _fact_evidence(anchor, evidence_by_id)
         maps_evidence = [
             entry for entry in maps_evidence
@@ -600,14 +722,17 @@ def reconstruct_customer_journey(
         if maps_evidence:
             contributions["discover"].append(
                 {
-                    "current": not bool(anchor["freshness"]["is_stale"]),
+                    "current": anchor_is_current,
                     "channels": [
                         _channel_entry(
                             channel_type="maps_listing",
                             identifier=None,
                             normalized_identifier=None,
                             scope="location",
-                            evidence_id=maps_evidence[0]["evidence_id"],
+                            evidence_id=(
+                                _freshest_evidence(maps_evidence)
+                                or maps_evidence[0]
+                            )["evidence_id"],
                         )
                     ],
                     "evidence": maps_evidence,
@@ -657,7 +782,7 @@ def reconstruct_customer_journey(
         if fact_evidence:
             contributions["evaluate"].append(
                 {
-                    "current": not bool(fact["freshness"]["is_stale"]),
+                    "current": _fact_current(fact),
                     "channels": [],
                     "evidence": fact_evidence,
                 }
@@ -685,14 +810,14 @@ def reconstruct_customer_journey(
             continue
         contributions["contact"].append(
             {
-                "current": not bool(fact["freshness"]["is_stale"]),
+                "current": _fact_current(fact),
                 "channels": [
                     _channel_entry(
                         channel_type="phone",
                         identifier=value,
                         normalized_identifier=value,
                         scope="location",
-                        evidence_id=fact_evidence[0]["evidence_id"],
+                        evidence_id=_freshest_evidence(fact_evidence)["evidence_id"],
                     )
                 ],
                 "evidence": fact_evidence,
@@ -706,14 +831,14 @@ def reconstruct_customer_journey(
             continue
         contributions["contact"].append(
             {
-                "current": not bool(fact["freshness"]["is_stale"]),
+                "current": _fact_current(fact),
                 "channels": [
                     _channel_entry(
                         channel_type="whatsapp",
                         identifier=None,
                         normalized_identifier=None,
                         scope="business_entity",
-                        evidence_id=fact_evidence[0]["evidence_id"],
+                        evidence_id=_freshest_evidence(fact_evidence)["evidence_id"],
                     )
                 ],
                 "evidence": fact_evidence,
@@ -760,14 +885,14 @@ def reconstruct_customer_journey(
                 continue
             contributions["book_order"].append(
                 {
-                    "current": not bool(fact["freshness"]["is_stale"]),
+                    "current": _fact_current(fact),
                     "channels": [
                         _channel_entry(
                             channel_type=channel_type,
                             identifier=None,
                             normalized_identifier=None,
                             scope="business_entity",
-                            evidence_id=fact_evidence[0]["evidence_id"],
+                            evidence_id=_freshest_evidence(fact_evidence)["evidence_id"],
                         )
                     ],
                     "evidence": fact_evidence,
@@ -782,7 +907,7 @@ def reconstruct_customer_journey(
             continue
         contributions["book_order"].append(
             {
-                "current": not bool(fact["freshness"]["is_stale"]),
+                "current": _fact_current(fact),
                 "channels": [],
                 "evidence": fact_evidence,
             }
@@ -853,16 +978,21 @@ def reconstruct_customer_journey(
 
     # ---- hand-offs (directly observed only) ---------------------------
     handoffs: list[dict[str, Any]] = []
+    handoff_currency: dict[tuple[str, str, str], bool] = {}
     website_handoff_channels: dict[str, list[dict[str, Any]]] = {
         "book_order": [], "contact": [],
     }
+    website_handoff_channel_currency: dict[tuple[str, str], bool] = {}
     for channel_type, stage in (
         ("booking", "book_order"),
         ("ordering", "book_order"),
         ("whatsapp", "contact"),
     ):
+        # RCJ-05: hand-offs are constructed over ALL retained website
+        # evidence, each carrying its currency. Observed stages keep
+        # current hand-offs; stale stages keep their historical ones.
         for candidate, row in _website_channel_candidates(
-            website_evidence, channel_type=channel_type, current_only=True
+            website_evidence, channel_type=channel_type, current_only=False
         ):
             target_host = None
             if isinstance(candidate.get("url"), str) and candidate["url"]:
@@ -885,15 +1015,27 @@ def reconstruct_customer_journey(
                     "from": "official_website",
                     "to": channel_type,
                     "evidence_id": row["evidence_id"],
+                    "current": row["current"],
                 }
             )
+            handoff_currency[
+                ("official_website", channel_type, row["evidence_id"])
+            ] = row["current"]
             website_handoff_channels[stage].append((candidate, row))
+            website_handoff_channel_currency[
+                (candidate["normalized_identifier"], row["evidence_id"])
+            ] = row["current"]
     maps_to_website: list[dict[str, Any]] = []
-    current_website_facts = [
-        fact for fact in website_facts
-        if not bool(fact["freshness"]["is_stale"])
-    ]
-    for fact in current_website_facts:
+    maps_to_website_current = False
+    # Prefer a CURRENT website fact for the hand-off; fall back to the
+    # freshest supported stale fact so a stale discover stage keeps its
+    # historical Maps->website transition (RCJ-05).
+    ordered_website_facts = sorted(
+        website_facts,
+        key=lambda fact: (_fact_current(fact), str(fact["id"])),
+        reverse=True,
+    )
+    for fact in ordered_website_facts:
         maps_support = [
             support
             for support in fact["observation_support"]
@@ -908,13 +1050,25 @@ def reconstruct_customer_journey(
                 if entry["source_id"] == _GOOGLE_MAPS_SOURCE_ID
             ]
             if maps_to_website:
+                maps_to_website_current = _fact_current(fact)
+                maps_handoff_entry = (
+                    _freshest_evidence(maps_to_website) or maps_to_website[0]
+                )
                 handoffs.append(
                     {
                         "from": "maps_listing",
                         "to": "official_website",
-                        "evidence_id": maps_to_website[0]["evidence_id"],
+                        "evidence_id": maps_handoff_entry["evidence_id"],
+                        "current": maps_to_website_current,
                     }
                 )
+                handoff_currency[
+                    (
+                        "maps_listing",
+                        "official_website",
+                        maps_handoff_entry["evidence_id"],
+                    )
+                ] = maps_to_website_current
             break
 
     # ---- stage assembly ------------------------------------------------
@@ -993,7 +1147,20 @@ def reconstruct_customer_journey(
                     existing["observation_ids"] = merged_ids
 
         if stage == "book_order":
-            for candidate, row in website_handoff_channels.get("book_order", []):
+            # RCJ-05: observed stages merge only CURRENT hand-off
+            # channels; stale stages keep their historical ones.
+            handoff_candidates = [
+                (candidate, row)
+                for candidate, row in website_handoff_channels.get(
+                    "book_order", []
+                )
+                if evidence_state != "observed"
+                or website_handoff_channel_currency.get(
+                    (candidate["normalized_identifier"], row["evidence_id"]),
+                    False,
+                )
+            ]
+            for candidate, row in handoff_candidates:
                 channel = _channel_entry(
                     channel_type=candidate["channel_type"],
                     identifier=candidate["identifier"],
@@ -1017,7 +1184,18 @@ def reconstruct_customer_journey(
                     row["evidence_id"], _website_evidence_entry(row)
                 )
         if stage == "contact":
-            for candidate, row in website_handoff_channels.get("contact", []):
+            handoff_candidates = [
+                (candidate, row)
+                for candidate, row in website_handoff_channels.get(
+                    "contact", []
+                )
+                if evidence_state != "observed"
+                or website_handoff_channel_currency.get(
+                    (candidate["normalized_identifier"], row["evidence_id"]),
+                    False,
+                )
+            ]
+            for candidate, row in handoff_candidates:
                 channel = _channel_entry(
                     channel_type="whatsapp",
                     identifier=candidate["identifier"],
@@ -1054,30 +1232,43 @@ def reconstruct_customer_journey(
             for entry in maps_to_website:
                 evidence_entries.setdefault(entry["evidence_id"], entry)
 
-        # CJ-04 (evidence currency): an observed stage's EVIDENCE list is
-        # also current-only — a fresh fact confirmed by an older
-        # observation keeps the stage observed but the aged evidence row
-        # is not presented as current surface.
+        # RCJ-04: no independent evidence re-aging. A contribution's
+        # currency follows its SOURCE policy — fact-derived entries
+        # inherit the fact's per-predicate freshness window (a 60-day
+        # phone fact keeps day-45 Maps evidence current); metadata-derived
+        # entries use the journey window. The observed-stage filter below
+        # already kept only current contributions, so their evidence,
+        # channels, and hand-offs are current BY CONSTRUCTION and are not
+        # re-aged against a second universal window.
         if evidence_state == "observed":
-            current_entries: dict[str, dict[str, Any]] = {}
-            for entry_id, entry in evidence_entries.items():
-                entry_instant = _parse_instant(
-                    entry.get("retrieved_at"),
-                    field=f"journey evidence {entry_id} retrieved_at",
+            retained_ids = {
+                entry_id
+                for item in stage_contributions
+                for entry_id in (
+                    entry["evidence_id"] for entry in item["evidence"]
                 )
-                if entry_instant is None:
-                    continue
-                entry_age = (evaluation - entry_instant).total_seconds() / 86400
-                if 0 <= entry_age <= _JOURNEY_EVIDENCE_FRESHNESS_DAYS:
-                    current_entries[entry_id] = entry
-            evidence_entries = current_entries
+            }
             channels = [
                 channel for channel in channels
-                if channel["evidence_id"] in evidence_entries
+                if channel["evidence_id"] in retained_ids
+                or website_handoff_channel_currency.get(
+                    (
+                        channel["normalized_identifier"],
+                        channel["evidence_id"],
+                    ),
+                    False,
+                )
             ]
             stage_handoffs = [
                 handoff for handoff in stage_handoffs
-                if handoff["evidence_id"] in evidence_entries
+                if handoff_currency.get(
+                    (
+                        handoff["from"],
+                        handoff["to"],
+                        handoff["evidence_id"],
+                    ),
+                    False,
+                )
             ]
 
 

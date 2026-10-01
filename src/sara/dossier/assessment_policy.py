@@ -600,9 +600,13 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
             extra={"observed_stage_count": journey.get("observed_stage_count")},
         )
     handoffs = journey.get("handoffs") or []
+    # RCJ-05: hand-offs now carry a currency flag (historical ones are
+    # retained on stale stages). Sufficiency counts CURRENT hand-offs
+    # only — a historical booking hand-off is not a live route.
     external_action_handoff = any(
         str(handoff.get("from")) == "official_website"
         and str(handoff.get("to")) in ("booking", "ordering")
+        and bool(handoff.get("current"))
         for handoff in handoffs
     )
     unmet = [

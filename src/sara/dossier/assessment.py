@@ -658,6 +658,7 @@ def _customer_journey_signature(journey: dict[str, Any]) -> dict[str, Any]:
                         "from": handoff.get("from"),
                         "to": handoff.get("to"),
                         "evidence_id": handoff.get("evidence_id"),
+                        "current": handoff.get("current"),
                     }
                     for handoff in stage.get("handoffs", ())
                 ],
@@ -674,6 +675,7 @@ def _customer_journey_signature(journey: dict[str, Any]) -> dict[str, Any]:
                 "from": handoff.get("from"),
                 "to": handoff.get("to"),
                 "evidence_id": handoff.get("evidence_id"),
+                "current": handoff.get("current"),
             }
             for handoff in journey.get("handoffs", ())
         ],
