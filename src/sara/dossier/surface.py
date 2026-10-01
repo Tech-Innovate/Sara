@@ -150,6 +150,7 @@ def build_business_dossier(
                     integrity_issues,
                     customer_voice,
                     evaluation,
+                    customer_journey=customer_journey_doc,
                 ),
             },
         },

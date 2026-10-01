@@ -418,20 +418,100 @@ def test_conflicted_facts_propagate_conflicted(tmp_path: Path) -> None:
 
 
 # 12. malformed journey provenance produces an integrity issue
+def _forge_website_session(
+    conn, *, entity, session_suffix, started_at, pages, bad_metadata=False
+):
+    """Insert a PRODUCER-VALID website session (config identity, counts)
+    whose evidence rows may carry malformed metadata."""
+    from sara.website.model import (
+        COLLECTOR_VERSION,
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    if conn.execute(
+        "SELECT 1 FROM sources WHERE id='src_official_web'"
+    ).fetchone() is None:
+        conn.execute(
+            "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
+            "VALUES ('src_official_web','official_website','Official website',NULL,"
+            "'2026-01-01T00:00:00+00:00',1)")
+    config = wcanonical(
+        {
+            "entity_id": entity,
+            "start_url": "https://forged.example/",
+            "page_limit": 8,
+            "depth_limit": 2,
+            "max_response_bytes": 1048576,
+            "timeout_seconds": 10.0,
+            "request_interval_seconds": 1.0,
+            "max_policy_delay_seconds": 30.0,
+            "retry_attempt_limit": 4,
+            "retry_base_delay_seconds": 1.0,
+            "retry_max_delay_seconds": 30.0,
+            "retry_delay_budget_seconds": 60.0,
+            "user_agent": "SaraBusinessUnderstanding/1.0",
+            "obey_robots": True,
+            "evidence_root": "/tmp/forged-ev",
+        }
+    )
+    config_hash = wsha(config)
+    session_id = wopaque("acq", entity, started_at, config_hash)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (session_id, entity, "src_official_web", "sara.website",
+         COLLECTOR_VERSION, config, config_hash, "complete",
+         started_at, started_at, None, None, len(pages), 0))
+    for index, (final_url, content, channels) in enumerate(pages):
+        content_sha = wsha(content)
+        evidence_id = wopaque("ev", session_id, final_url, content_sha)
+        metadata = (
+            "not-json-at-all"
+            if bad_metadata and index == 0
+            else wcanonical(
+                {
+                    "acquisition_kind": "bounded_official_website",
+                    "entity_id": entity,
+                    "start_url": "https://forged.example/",
+                    "requested_url": final_url,
+                    "final_url": final_url,
+                    "crawl_depth": 0,
+                    "page_role": "home",
+                    "home_page": index == 0,
+                    "business_wide_scope_eligible": True,
+                    "crawl_frontier_exhausted": True,
+                    "title": None,
+                    "canonical_url": final_url,
+                    "channels": channels,
+                    "observation_ids": [],
+                }
+            )
+        )
+        conn.execute(
+            "INSERT INTO evidence_items("
+            "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+            "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+            ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+            (evidence_id, session_id, "src_official_web", final_url,
+             "official", started_at, content_sha, metadata, started_at))
+    conn.commit()
+    return session_id
+
+
 def test_malformed_website_metadata_produces_integrity_issue(tmp_path: Path) -> None:
     conn = prepared(tmp_path / "malformed.sqlite")
     entity = business_entity_id_for_maps_business(1)
-    stats = acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
-    session_id = stats.session_id
-    conn.execute(
-        "INSERT INTO evidence_items("
-        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
-        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
-        ") VALUES (?,?,?,'https://seed.example/broken','official','usable',?,NULL,NULL,"
-        "'text/html',?,NULL,'not-json-at-all',?)",
-        ("ev_broken_journey", session_id, "src_official_web",
-         "2026-09-26T12:00:03+00:00", "0" * 64, "2026-09-26T12:00:03+00:00"))
-    conn.commit()
+    _forge_website_session(
+        conn, entity=entity, session_suffix="badmeta",
+        started_at="2026-09-26T12:10:00+00:00",
+        pages=[("https://forged.example/", "page-one", [])],
+        bad_metadata=True,
+    )
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
     codes = {i["code"] for i in dossier["integrity_issues"]}
@@ -439,13 +519,13 @@ def test_malformed_website_metadata_produces_integrity_issue(tmp_path: Path) -> 
     issue = next(
         i for i in dossier["integrity_issues"]
         if i["code"] == "customer_journey_website_evidence_invalid")
-    assert issue["evidence_id"] == "ev_broken_journey"
+    assert issue["evidence_id"].startswith("ev_")
     used = {
         entry["evidence_id"]
         for stage in dossier["customer_journey"]["stages"]
         for entry in stage["evidence"]
     }
-    assert "ev_broken_journey" not in used
+    assert issue["evidence_id"] not in used
     conn.close()
 
 
@@ -538,6 +618,323 @@ def test_no_gap_or_quality_vocabulary(tmp_path: Path) -> None:
     blob = json.dumps(journey).lower()
     for word in forbidden:
         assert word not in blob, word
+    conn.close()
+
+
+
+# ---- CJ acceptance regressions (frozen review 5372679339) ----
+
+def test_two_entity_isolation(tmp_path: Path) -> None:
+    """CJ-01: another canonical Entity's website evidence is neither used
+    nor an integrity failure while reading this Entity."""
+    conn = prepared(tmp_path / "isolation.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+    before = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    # A second, unrelated canonical Entity with its own producer-valid
+    # website session (booking link, malformed-free).
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,created_at,updated_at) "
+        "VALUES ('be_other','business_entity','active',"
+        "'2026-09-25T00:00:00+00:00','2026-09-26T00:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO business_entities(id,display_name,entity_type,lifecycle_status,"
+        "created_at,updated_at) VALUES (?,?,?,?,?,?)",
+        ("be_other", "Other", "independent_business", "operating",
+         "2026-09-25T00:00:00+00:00", "2026-09-26T00:00:00+00:00"))
+    booking_channel = [{
+        "channel_type": "booking",
+        "identifier": "https://booksy.com/other",
+        "normalized_identifier": "https://booksy.com/other",
+        "url": "https://booksy.com/other",
+        "extraction": "action_link",
+        "canonicalized_channel_id": None,
+        "canonicalized_scope": None,
+    }]
+    _forge_website_session(
+        conn, entity="be_other", session_suffix="other",
+        started_at="2026-09-26T12:20:00+00:00",
+        pages=[("https://other.example/", "other-home", booking_channel)])
+    after = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    assert after["integrity_issues"] == before["integrity_issues"]
+    assert after["customer_journey"] == before["customer_journey"]
+    used = {
+        entry["evidence_id"]
+        for stage in after["customer_journey"]["stages"]
+        for entry in stage["evidence"]
+    }
+    other_rows = {
+        row[0] for row in conn.execute(
+            "SELECT e.id FROM evidence_items e "
+            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "WHERE a.target_subject_id='be_other'").fetchall()
+    }
+    assert not (used & other_rows)
+    conn.close()
+
+
+def test_predecessor_entity_convergence_admits_evidence(tmp_path: Path) -> None:
+    """CJ-01: evidence acquired under a predecessor Entity before the
+    merge remains the same business's history after convergence."""
+    conn = prepared(tmp_path / "convergence.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    conn.execute(
+        "INSERT INTO knowledge_subjects(id,kind,record_state,merged_into_subject_id,"
+        "merged_at,created_at,updated_at) "
+        "VALUES ('be_old','business_entity','merged',?,"
+        "'2026-09-26T11:00:00+00:00','2026-09-25T00:00:00+00:00','2026-09-26T11:00:00+00:00')",
+        (entity,))
+    booking_channel = [{
+        "channel_type": "booking",
+        "identifier": "https://booksy.com/legacy",
+        "normalized_identifier": "https://booksy.com/legacy",
+        "url": "https://booksy.com/legacy",
+        "extraction": "action_link",
+        "canonicalized_channel_id": None,
+        "canonicalized_scope": None,
+    }]
+    _forge_website_session(
+        conn, entity="be_old", session_suffix="legacy",
+        started_at="2026-09-26T10:30:00+00:00",
+        pages=[("https://legacy.example/", "legacy-home", booking_channel)])
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    codes = {i["code"] for i in dossier["integrity_issues"]}
+    assert "customer_journey_website_session_invalid" not in codes
+    assert "customer_journey_website_evidence_invalid" not in codes
+    book_order = next(
+        s for s in dossier["customer_journey"]["stages"]
+        if s["stage"] == "book_order")
+    assert book_order["evidence_state"] == "observed"
+    assert any(c["channel_type"] == "booking" for c in book_order["channels"])
+    conn.close()
+
+
+def test_forged_child_under_terminal_session_invalidates_session(tmp_path: Path) -> None:
+    """CJ-02: a perfectly-shaped evidence row appended beneath a
+    completed website session breaks the stored-vs-actual count contract;
+    the session is invalid and NONE of its evidence is used."""
+    from sara.website.model import canonical_json as wcanonical
+    from sara.website.model import opaque_id as wopaque, sha256_text as wsha
+
+    conn = prepared(tmp_path / "forged.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=BOOKING_SITE)
+    session_id = stats.session_id
+    stored_counts = conn.execute(
+        "SELECT evidence_count, observation_count FROM acquisition_sessions "
+        "WHERE id=?", (session_id,)).fetchone()
+    # Forge: producer-perfect metadata, correct deterministic id, correct
+    # entity binding, locator==final_url. ONLY the count drift betrays it.
+    forged_url = "https://seed.example/forged"
+    forged_content = "forged page body"
+    forged_sha = wsha(forged_content)
+    forged_id = wopaque("ev", session_id, forged_url, forged_sha)
+    forged_meta = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://seed.example/",
+            "requested_url": forged_url,
+            "final_url": forged_url,
+            "crawl_depth": 0,
+            "page_role": "booking",
+            "home_page": False,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": None,
+            "canonical_url": forged_url,
+            "channels": [{
+                "channel_type": "booking",
+                "identifier": "https://booksy.com/forged",
+                "normalized_identifier": "https://booksy.com/forged",
+                "url": "https://booksy.com/forged",
+                "extraction": "action_link",
+                "canonicalized_channel_id": None,
+                "canonicalized_scope": None,
+            }],
+            "observation_ids": [],
+        })
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,'https://seed.example/forged','official','usable',"
+        "?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (forged_id, session_id, "src_official_web",
+         "2026-09-26T12:00:09+00:00", forged_sha, forged_meta,
+         "2026-09-26T12:00:09+00:00"))
+    conn.commit()
+    actual = conn.execute(
+        "SELECT COUNT(*) FROM evidence_items WHERE acquisition_session_id=?",
+        (session_id,)).fetchone()[0]
+    assert actual == stored_counts[0] + 1
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    issues = dossier["integrity_issues"]
+    session_issue = next(
+        (i for i in issues
+         if i["code"] == "customer_journey_website_session_invalid"), None)
+    assert session_issue is not None
+    assert session_issue["session_id"] == session_id
+    journey = dossier["customer_journey"]
+    used = {
+        entry["evidence_id"]
+        for stage in journey["stages"]
+        for entry in stage["evidence"]
+    }
+    assert forged_id not in used
+    # The manufacturing vector is closed: no channel or hand-off in the
+    # document may originate from the invalidated session's metadata —
+    # in particular the forged booking endpoint never appears.
+    all_channel_ids = {
+        (channel["identifier"], channel["normalized_identifier"])
+        for stage in journey["stages"]
+        for channel in stage["channels"]
+    }
+    assert ("https://booksy.com/forged", "https://booksy.com/forged") not in (
+        all_channel_ids
+    )
+    # Fact provenance legitimately survives: booking/ordering capability
+    # and transaction-type facts were reconciled from the REAL crawl's
+    # observations, which the appended row cannot add or alter. The stage
+    # therefore remains observed through fact evidence.
+    book_order = next(
+        s for s in journey["stages"] if s["stage"] == "book_order")
+    assert book_order["evidence_state"] == "observed"
+    assert book_order["evidence"]
+    for handoff in journey["handoffs"]:
+        assert handoff["evidence_id"] != forged_id
+    conn.close()
+
+
+def test_maps_only_stale_journey_is_stale_not_vanished(tmp_path: Path) -> None:
+    """CJ-03: Maps-only evidence that ages out marks its stages stale —
+    previously observed stages never collapse to unknown/not_started."""
+    conn = prepared(tmp_path / "maps-stale.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    far_future = "2027-01-15T12:00:00+00:00"
+    _, journey = _journey(conn, entity, evaluated_at=far_future)
+    states = _states(journey)
+    assert states["discover"] == "stale"
+    assert states["contact"] == "stale"
+    assert journey["observed_stage_count"] >= 2
+    assert journey["current_stage_count"] == 0
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: far_future)
+    state = conn.execute(
+        "SELECT state FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='customer_journey'",
+        (seal.assessment_id,)).fetchone()[0]
+    assert state == "stale"
+    conn.close()
+
+
+def test_mixed_freshness_observed_stage_shows_current_surface_only(tmp_path: Path) -> None:
+    """CJ-04: with a fresh and a stale crawl of the same site, an observed
+    stage exposes only the current crawl's channels and evidence."""
+    conn = prepared(tmp_path / "mixed.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    clock = Clock()
+    acquire(conn, tmp_path, pages=BOOKING_SITE, clock=clock)
+    first_rows = {
+        row[0] for row in conn.execute(
+            "SELECT e.id FROM evidence_items e "
+            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "WHERE a.collector_name='sara.website'").fetchall()
+    }
+    clock.current += timedelta(days=40)
+    acquire(conn, tmp_path, pages=BOOKING_SITE, clock=clock)
+    all_rows = {
+        row[0] for row in conn.execute(
+            "SELECT e.id FROM evidence_items e "
+            "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
+            "WHERE a.collector_name='sara.website'").fetchall()
+    }
+    stale_rows = first_rows
+    fresh_rows = all_rows - first_rows
+    assert fresh_rows
+    evaluated = "2026-11-10T12:00:00+00:00"  # 5 days after the second crawl
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at=evaluated)
+    journey = dossier["customer_journey"]
+    observed = [
+        s for s in journey["stages"] if s["evidence_state"] == "observed"
+    ]
+    assert observed
+    for stage in observed:
+        used = {entry["evidence_id"] for entry in stage["evidence"]}
+        assert used <= fresh_rows, stage["stage"]
+        for channel in stage["channels"]:
+            assert channel["evidence_id"] in fresh_rows
+        for handoff in stage["handoffs"]:
+            assert handoff["evidence_id"] in fresh_rows
+    # Website-side hand-offs must cite the current crawl's rows. The
+    # Maps->website hand-off cites MAPS evidence, whose currency follows
+    # the official-website fact's own freshness window — assert it
+    # exists (the fact is fresh) without forcing it into fresh_rows.
+    for handoff in journey["handoffs"]:
+        if handoff["from"] == "official_website":
+            assert handoff["evidence_id"] in fresh_rows
+    assert any(
+        handoff["from"] == "maps_listing"
+        for handoff in journey["handoffs"]
+    )
+    assert stale_rows
+    conn.close()
+
+
+def test_preview_consistent_with_reconstruction(tmp_path: Path) -> None:
+    """CJ-05: the read-only preview reads the reconstruction — never
+    contradicting it and never claiming sufficiency."""
+    from sara.dossier.status import preview_domains
+
+    conn = prepared(tmp_path / "preview.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=SUPPORT_SITE)
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    preview = {
+        item["domain"]: item["state"]
+        for item in dossier["dossier_status"]["read_only_preview"]["domains"]
+    }
+    # The real assessment is sufficient; the preview must agree that
+    # stages exist WITHOUT promoting to sufficient.
+    assert preview["customer_journey"] == "partial"
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:30:00+00:00")
+    assert "customer_journey" not in seal.blocking_mandatory_domains
+
+    # Unit contract for the mapping itself: sufficient reconstruction
+    # previews partial; stale previews stale; empty previews not_started.
+    from datetime import datetime as _dt, timezone as _tz
+    evaluation = _dt(2026, 9, 26, tzinfo=_tz.utc)
+
+    def _preview_for(journey):
+        return {
+            item["domain"]: item["state"]
+            for item in preview_domains(
+                [], [], [], [], evaluation, customer_journey=journey)
+        }
+
+    observed_stage = {
+        "stage": "discover", "evidence_state": "observed",
+        "channels": [], "handoffs": [], "evidence": [],
+        "missing_knowledge": [],
+    }
+    stale_stage = dict(observed_stage, evidence_state="stale")
+    conflicted_stage = dict(observed_stage, evidence_state="conflicted")
+    assert _preview_for(
+        {"stages": [observed_stage]})["customer_journey"] == "partial"
+    assert _preview_for(
+        {"stages": [stale_stage]})["customer_journey"] == "stale"
+    assert _preview_for(
+        {"stages": [conflicted_stage]})["customer_journey"] == "conflicted"
+    assert _preview_for(
+        {"stages": []})["customer_journey"] == "not_started"
+    assert _preview_for(None)["customer_journey"] == "not_started"
     conn.close()
 
 

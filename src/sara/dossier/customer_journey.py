@@ -78,11 +78,42 @@ def _parse_instant(value: object, *, field: str) -> datetime | None:
         return None
 
 
+def _supported_fact(fact: dict[str, Any]) -> bool:
+    """A fact Sara currently stands behind, regardless of freshness.
+
+    CJ-03: stale facts remain journey contributions with current=False —
+    an aged-out Maps phone fact must mark the contact stage stale, not
+    make the stage vanish into unknown/not_started.
+    """
+    return fact["status"] in {"confirmed", "single_source"}
+
+
 def _fresh_fact(fact: dict[str, Any]) -> bool:
     return (
         fact["status"] in {"confirmed", "single_source"}
         and not bool(fact["freshness"]["is_stale"])
     )
+
+
+def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
+    """The canonical Entity plus every business_entity that merged into it.
+
+    CJ-01: journey evidence admission is scoped to this set. A crawl run
+    against a predecessor Entity before convergence is the same business's
+    history; another canonical Entity's evidence is simply not ours and
+    must neither be used nor flagged.
+    """
+    rows = conn.execute(
+        "WITH RECURSIVE lineage(id) AS ("
+        "SELECT ? "
+        "UNION "
+        "SELECT ks.id FROM knowledge_subjects ks "
+        "JOIN lineage l ON ks.merged_into_subject_id=l.id "
+        "WHERE ks.kind='business_entity' AND ks.record_state='merged'"
+        ") SELECT id FROM lineage ORDER BY id",
+        (entity_id,),
+    ).fetchall()
+    return [str(row[0]) for row in rows]
 
 
 def _bounded_absence_current(fact: dict[str, Any]) -> bool:
@@ -139,67 +170,175 @@ def _load_website_evidence(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Validated official-website evidence with parsed journey metadata.
 
-    Every retained page from a complete-or-partial bounded website
-    acquisition is a candidate; each row's metadata must carry the
-    producer's shape and bind to this entity. Malformed rows surface as
-    integrity issues and are never used.
+    CJ-01/CJ-02 — admission and verification are two explicit stages:
+
+    Admission (entity isolation): only website acquisition sessions whose
+    acquisition target sits in the canonical Entity's merge lineage are
+    considered. Another canonical Entity's sessions are silently out of
+    scope — they are neither used nor turned into integrity failures for
+    this Entity.
+
+    Verification (producer-grade provenance): every admitted session must
+    satisfy the website collector's own contract — current collector
+    version, the canonical 15-key crawl config with matching hash and
+    deterministic session id, present lifecycle timestamps, a clean error
+    state for complete sessions, and stored child counts equal to the
+    actual evidence/observation rows. Every evidence row must then bind:
+    producer metadata shape, entity binding within the lineage, a valid
+    page role and channel candidates, the DETERMINISTIC evidence id over
+    (session, final_url, content_sha256), and final_url equal to the
+    stored source locator. Failures surface as integrity issues and the
+    session/row is never used. A well-shaped row appended under a
+    terminal session breaks the stored-vs-actual count contract and
+    invalidates that session's evidence entirely.
     """
-    cursor = conn.execute(
-        "SELECT e.id,e.source_locator,e.retrieved_at,e.content_sha256,"
-        "e.acquisition_session_id,e.metadata_json,a.collector_version,"
-        "a.status AS session_status,a.finished_at "
-        "FROM evidence_items e "
-        "JOIN acquisition_sessions a ON a.id=e.acquisition_session_id "
-        "WHERE e.source_id=? AND e.source_role='official' "
-        "AND e.status='usable' AND a.collector_name=? "
-        "AND a.status IN ('complete','partial') "
-        "ORDER BY e.id",
-        (_OFFICIAL_WEB_SOURCE_ID, _WEBSITE_COLLECTOR_NAME),
-    )
-    rows: list[dict[str, Any]] = []
+    from ..website.model import COLLECTOR_VERSION as WEBSITE_COLLECTOR_VERSION
+    from ..website.model import canonical_json as website_canonical_json
+    from ..website.model import opaque_id as website_opaque_id
+    from ..website.model import sha256_text as website_sha256_text
+
+    lineage = _entity_lineage(conn, entity_id)
+    lineage_set = set(lineage)
+
     issues: list[dict[str, Any]] = []
+    admitted_session_ids: list[str] = []
+    session_status_by_id: dict[str, str] = {}
+    session_version_by_id: dict[str, str] = {}
+
+    cursor = conn.execute(
+        "SELECT id,target_subject_id,collector_version,config_json,config_hash,"
+        "status,started_at,finished_at,error,evidence_count,observation_count "
+        "FROM acquisition_sessions "
+        "WHERE collector_name=? AND status IN ('complete','partial') "
+        "ORDER BY id",
+        (_WEBSITE_COLLECTOR_NAME,),
+    )
     for raw in cursor.fetchall():
-        item = {
+        session = {
             description[0]: raw[index]
             for index, description in enumerate(cursor.description or ())
         }
+        session_id = str(session["id"])
+        target = str(session["target_subject_id"] or "")
+        if target not in lineage_set:
+            continue  # CJ-01: another Entity's acquisition — not ours
+        invalid = False
+        if str(session["collector_version"]) != str(WEBSITE_COLLECTOR_VERSION):
+            invalid = True
+        try:
+            config = json.loads(str(session["config_json"]))
+            if not isinstance(config, dict):
+                raise ValueError("config is not a JSON object")
+        except ValueError:
+            config = None
+            invalid = True
+        if config is not None:
+            expected_keys = {
+                "entity_id", "start_url", "page_limit", "depth_limit",
+                "max_response_bytes", "timeout_seconds",
+                "request_interval_seconds", "max_policy_delay_seconds",
+                "retry_attempt_limit", "retry_base_delay_seconds",
+                "retry_max_delay_seconds", "retry_delay_budget_seconds",
+                "user_agent", "obey_robots", "evidence_root",
+            }
+            if set(config) != expected_keys:
+                invalid = True
+            elif str(config.get("entity_id")) not in lineage_set:
+                invalid = True
+            elif website_canonical_json(config) != str(session["config_json"]):
+                invalid = True
+            elif website_sha256_text(str(session["config_json"])) != str(
+                session["config_hash"]
+            ):
+                invalid = True
+            elif session_id != website_opaque_id(
+                "acq", str(config["entity_id"]),
+                str(session["started_at"]), str(session["config_hash"]),
+            ):
+                invalid = True
+        if not isinstance(session["started_at"], str) or not session["started_at"]:
+            invalid = True
+        if not isinstance(session["finished_at"], str) or not session["finished_at"]:
+            invalid = True
+        if str(session["status"]) == "complete" and session["error"] not in (None, ""):
+            invalid = True
+        actual_evidence_count = int(conn.execute(
+            "SELECT COUNT(*) FROM evidence_items WHERE acquisition_session_id=?",
+            (session_id,),
+        ).fetchone()[0])
+        actual_observation_count = int(conn.execute(
+            "SELECT COUNT(*) FROM observations o "
+            "JOIN evidence_items e ON e.id=o.evidence_id "
+            "WHERE e.acquisition_session_id=?",
+            (session_id,),
+        ).fetchone()[0])
+        if int(session["evidence_count"] or 0) != actual_evidence_count:
+            invalid = True
+        if int(session["observation_count"] or 0) != actual_observation_count:
+            invalid = True
+        if invalid:
+            issues.append(
+                {"code": "customer_journey_website_session_invalid",
+                 "session_id": session_id}
+            )
+            continue
+        admitted_session_ids.append(session_id)
+        session_status_by_id[session_id] = str(session["status"])
+        session_version_by_id[session_id] = str(session["collector_version"])
+
+    rows: list[dict[str, Any]] = []
+    if not admitted_session_ids:
+        return rows, issues
+    marks = ",".join("?" for _ in admitted_session_ids)
+    evidence_cursor = conn.execute(
+        f"SELECT e.id,e.acquisition_session_id,e.source_locator,e.retrieved_at,"
+        f"e.content_sha256,e.metadata_json "
+        f"FROM evidence_items e "
+        f"WHERE e.acquisition_session_id IN ({marks}) "
+        f"AND e.source_id=? AND e.source_role='official' "
+        f"AND e.status='usable' "
+        f"ORDER BY e.id",
+        (*admitted_session_ids, _OFFICIAL_WEB_SOURCE_ID),
+    )
+    for raw in evidence_cursor.fetchall():
+        item = {
+            description[0]: raw[index]
+            for index, description in enumerate(evidence_cursor.description or ())
+        }
         evidence_id = str(item["id"])
+        row_session_id = str(item["acquisition_session_id"])
+        row_invalid = False
         try:
             metadata = json.loads(str(item["metadata_json"]))
             if not isinstance(metadata, dict):
                 raise ValueError("metadata is not a JSON object")
         except ValueError:
-            issues.append(
-                {"code": "customer_journey_website_evidence_invalid",
-                 "evidence_id": evidence_id}
-            )
-            continue
-        if metadata.get("acquisition_kind") != "bounded_official_website":
-            issues.append(
-                {"code": "customer_journey_website_evidence_invalid",
-                 "evidence_id": evidence_id}
-            )
-            continue
-        if str(metadata.get("entity_id")) != entity_id:
-            issues.append(
-                {"code": "customer_journey_website_evidence_invalid",
-                 "evidence_id": evidence_id}
-            )
-            continue
-        page_role = metadata.get("page_role")
+            metadata = None
+            row_invalid = True
+        if metadata is not None:
+            if metadata.get("acquisition_kind") != "bounded_official_website":
+                row_invalid = True
+            if str(metadata.get("entity_id")) not in lineage_set:
+                row_invalid = True
+        final_url = metadata.get("final_url") if metadata else None
+        if not isinstance(final_url, str) or not final_url:
+            row_invalid = True
+        else:
+            if final_url != str(item["source_locator"]):
+                row_invalid = True
+            if evidence_id != website_opaque_id(
+                "ev", row_session_id, final_url, str(item["content_sha256"])
+            ):
+                row_invalid = True
+        page_role = metadata.get("page_role") if metadata else None
         if not isinstance(page_role, str) or not page_role:
-            issues.append(
-                {"code": "customer_journey_website_evidence_invalid",
-                 "evidence_id": evidence_id}
-            )
-            continue
-        raw_channels = metadata.get("channels")
+            row_invalid = True
+        raw_channels = metadata.get("channels") if metadata else None
         channels: list[dict[str, Any]] = []
-        channels_valid = isinstance(raw_channels, list)
-        if channels_valid:
+        if isinstance(raw_channels, list):
             for candidate in raw_channels:
                 if not isinstance(candidate, dict):
-                    channels_valid = False
+                    row_invalid = True
                     break
                 if not all(
                     isinstance(candidate.get(key), str) and candidate[key]
@@ -210,7 +349,7 @@ def _load_website_evidence(
                         "extraction",
                     )
                 ):
-                    channels_valid = False
+                    row_invalid = True
                     break
                 channels.append(
                     {
@@ -227,16 +366,15 @@ def _load_website_evidence(
                         ),
                     }
                 )
-        if not channels_valid:
-            issues.append(
-                {"code": "customer_journey_website_evidence_invalid",
-                 "evidence_id": evidence_id}
-            )
-            continue
+        else:
+            row_invalid = True
         retrieved_at = _parse_instant(
-            item["retrieved_at"], field=f"website evidence {evidence_id} retrieved_at"
+            item["retrieved_at"],
+            field=f"website evidence {evidence_id} retrieved_at",
         )
         if retrieved_at is None:
+            row_invalid = True
+        if row_invalid:
             issues.append(
                 {"code": "customer_journey_website_evidence_invalid",
                  "evidence_id": evidence_id}
@@ -251,10 +389,14 @@ def _load_website_evidence(
                 "content_sha256": item["content_sha256"],
                 "retrieved_at": str(item["retrieved_at"]),
                 "retrieved_instant": retrieved_at,
-                "acquisition_session_id": str(item["acquisition_session_id"]),
+                "acquisition_session_id": row_session_id,
                 "collector_name": _WEBSITE_COLLECTOR_NAME,
-                "collector_version": str(item["collector_version"]),
-                "acquisition_status": str(item["session_status"]),
+                "collector_version": session_version_by_id.get(
+                    row_session_id, ""
+                ),
+                "acquisition_status": session_status_by_id.get(
+                    row_session_id, ""
+                ),
                 "page_role": page_role,
                 "channels": channels,
                 "current": 0 <= age_days <= _JOURNEY_EVIDENCE_FRESHNESS_DAYS,
@@ -298,7 +440,8 @@ def _channel_entry(
 def _official_site_host(facts: list[dict[str, Any]]) -> str | None:
     from urllib.parse import urlsplit
 
-    for fact in facts:
+    supported = [fact for fact in facts if _supported_fact(fact)]
+    for fact in supported:
         if fact["predicate"] != "business.website.official":
             continue
         value = fact.get("value")
@@ -381,9 +524,11 @@ def reconstruct_customer_journey(
     }
 
     def _fresh_facts(predicate: str) -> list[dict[str, Any]]:
+        # CJ-03: supported facts remain contributions regardless of
+        # freshness; the fact's own freshness flag then decides currency.
         return [
             fact for fact in facts_by_predicate.get(predicate, [])
-            if _fresh_fact(fact)
+            if _supported_fact(fact)
         ]
 
     def _conflicted_facts(predicates: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -435,7 +580,7 @@ def reconstruct_customer_journey(
             fact
             for predicate in _MAPS_ANCHOR_PREDICATES
             for fact in facts_by_predicate.get(predicate, [])
-            if _fresh_fact(fact)
+            if _supported_fact(fact)
             and any(
                 support.get("support_role") == "supports"
                 and support.get("source_id") == _GOOGLE_MAPS_SOURCE_ID
@@ -744,7 +889,11 @@ def reconstruct_customer_journey(
             )
             website_handoff_channels[stage].append((candidate, row))
     maps_to_website: list[dict[str, Any]] = []
-    for fact in website_facts:
+    current_website_facts = [
+        fact for fact in website_facts
+        if not bool(fact["freshness"]["is_stale"])
+    ]
+    for fact in current_website_facts:
         maps_support = [
             support
             for support in fact["observation_support"]
@@ -802,6 +951,13 @@ def reconstruct_customer_journey(
         else:
             evidence_state = "unknown"
 
+        # CJ-04: an observed stage exposes only its CURRENT surface —
+        # current channels, hand-offs, and evidence. A stale stage keeps
+        # its historical surface, qualified by the stage state itself.
+        if evidence_state == "observed":
+            stage_contributions = [
+                item for item in stage_contributions if item["current"]
+            ]
         channels: list[dict[str, Any]] = []
         seen_channels: set[tuple[str, str | None, str]] = set()
         evidence_entries: dict[str, dict[str, Any]] = {}
@@ -897,6 +1053,33 @@ def reconstruct_customer_journey(
         if stage == "discover" and maps_to_website:
             for entry in maps_to_website:
                 evidence_entries.setdefault(entry["evidence_id"], entry)
+
+        # CJ-04 (evidence currency): an observed stage's EVIDENCE list is
+        # also current-only — a fresh fact confirmed by an older
+        # observation keeps the stage observed but the aged evidence row
+        # is not presented as current surface.
+        if evidence_state == "observed":
+            current_entries: dict[str, dict[str, Any]] = {}
+            for entry_id, entry in evidence_entries.items():
+                entry_instant = _parse_instant(
+                    entry.get("retrieved_at"),
+                    field=f"journey evidence {entry_id} retrieved_at",
+                )
+                if entry_instant is None:
+                    continue
+                entry_age = (evaluation - entry_instant).total_seconds() / 86400
+                if 0 <= entry_age <= _JOURNEY_EVIDENCE_FRESHNESS_DAYS:
+                    current_entries[entry_id] = entry
+            evidence_entries = current_entries
+            channels = [
+                channel for channel in channels
+                if channel["evidence_id"] in evidence_entries
+            ]
+            stage_handoffs = [
+                handoff for handoff in stage_handoffs
+                if handoff["evidence_id"] in evidence_entries
+            ]
+
 
         missing_knowledge: list[str] = []
         if evidence_state == "unknown" and stage in _MISSING_KNOWLEDGE:

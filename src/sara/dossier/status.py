@@ -111,6 +111,7 @@ def preview_domains(
     integrity_issues: list[dict[str, Any]],
     customer_voice: list[dict[str, Any]] | None,
     evaluated_at: datetime,
+    customer_journey: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     customer_voice = customer_voice or []
     current_customer_voice = _current_customer_voice(customer_voice, evaluated_at)
@@ -167,6 +168,32 @@ def preview_domains(
             else:
                 state, reasons = "partial", [
                     "some_current_evidence_exists_but_read_only_preview_does_not_promote_sufficiency"
+                ]
+        elif seed.name == "customer_journey" and customer_journey is not None:
+            # CJ-05: the preview reads the deterministic reconstruction so
+            # it can no longer contradict it, but it never claims
+            # sufficiency — the read-only preview keeps no promotion
+            # authority. A sufficient reconstruction previews as partial.
+            journey_states = [
+                str(stage.get("evidence_state"))
+                for stage in customer_journey.get("stages", ())
+            ]
+            if "conflicted" in journey_states:
+                state, reasons = "conflicted", [
+                    "one_or_more_journey_stages_are_conflicted"
+                ]
+            elif "observed" in journey_states:
+                state, reasons = "partial", [
+                    "current_journey_stages_reconstructed_"
+                    "but_preview_never_claims_sufficiency"
+                ]
+            elif "stale" in journey_states:
+                state, reasons = "stale", [
+                    "journey_evidence_exists_but_no_current_stage_support_remains"
+                ]
+            else:
+                state, reasons = "not_started", [
+                    "no_customer_journey_reconstruction_evidence"
                 ]
         elif not domain_facts:
             state, reasons = "not_started", ["no_current_facts_in_domain"]

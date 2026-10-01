@@ -211,7 +211,8 @@ def test_build_business_dossier_surfaces_independent_integrity_findings(monkeypa
     monkeypatch.setattr(surface, "controlled_unknowns", lambda *_args: [])
     monkeypatch.setattr(surface, "persisted_assessment", lambda *_args: assessment)
     monkeypatch.setattr(surface, "maps_businesses", lambda *_args: [])
-    monkeypatch.setattr(surface, "preview_domains", lambda *_args: [])
+    monkeypatch.setattr(
+        surface, "preview_domains", lambda *_args, **_kwargs: [])
     # PR #22: the journey reconstruction is another read collaborator; this
     # unit test exercises surface's integrity plumbing with every read
     # stubbed and a bare in-memory connection, so stub it the same way.
