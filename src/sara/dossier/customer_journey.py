@@ -674,6 +674,69 @@ def _website_channel_candidates(
     )
 
 
+def _public_surface_coverage(
+    stages: list[dict[str, Any]],
+    website_evidence: list[dict[str, Any]],
+    absence_safe_sessions: frozenset[str],
+) -> dict[str, Any]:
+    """Deterministic public-surface coverage judgment over the admitted
+    website surface. The reconstruction — not the assessment policy —
+    owns this decision, so sufficiency mapping never reaches back into
+    acquisition tables.
+
+    States:
+    - ``evaluation_observed``: the evaluate stage is currently observed;
+      ``evidence_ids`` are its admitted evidence identities.
+    - ``bounded_inspection_no_evaluation``: no current evaluate evidence,
+      but at least one absence-safe website session (complete,
+      business-wide-scope-eligible, frontier-exhausted on every admitted
+      row) carries current evidence — a bounded inspection of the public
+      surface that found nothing evaluative. ``session_ids`` are those
+      sessions. A stale bounded inspection does not count: the surface
+      may have grown evaluative content since, mirroring the
+      bounded-absence currency contract.
+    - ``not_covered``: neither holds; sufficiency must fail closed.
+    """
+    evaluate_stage = next(
+        (stage for stage in stages if str(stage.get("stage")) == "evaluate"),
+        None,
+    )
+    if (
+        evaluate_stage is not None
+        and evaluate_stage.get("evidence_state") == "observed"
+    ):
+        return {
+            "state": "evaluation_observed",
+            "evidence_ids": sorted(
+                {
+                    str(entry.get("evidence_id"))
+                    for entry in evaluate_stage.get("evidence", ())
+                }
+            ),
+            "session_ids": [],
+        }
+    rows_by_session: dict[str, list[dict[str, Any]]] = {}
+    for row in website_evidence:
+        rows_by_session.setdefault(
+            str(row["acquisition_session_id"]), []
+        ).append(row)
+    bounded_current = sorted(
+        session_id
+        for session_id in absence_safe_sessions
+        if any(
+            row.get("current")
+            for row in rows_by_session.get(session_id, ())
+        )
+    )
+    if bounded_current:
+        return {
+            "state": "bounded_inspection_no_evaluation",
+            "evidence_ids": [],
+            "session_ids": bounded_current,
+        }
+    return {"state": "not_covered", "evidence_ids": [], "session_ids": []}
+
+
 def reconstruct_customer_journey(
     conn: sqlite3.Connection,
     *,
@@ -1498,6 +1561,9 @@ def reconstruct_customer_journey(
             "handoffs": handoffs,
             "observed_stage_count": observed_stage_count,
             "current_stage_count": current_stage_count,
+            "public_surface_coverage": _public_surface_coverage(
+                stages, website_evidence, absence_safe_sessions
+            ),
         },
         issues,
     )

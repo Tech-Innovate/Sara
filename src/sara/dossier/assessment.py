@@ -634,11 +634,22 @@ def understanding_state_fingerprint(
 
 def _customer_journey_signature(journey: dict[str, Any]) -> dict[str, Any]:
     """Bounded sealing view of the journey reconstruction: stage states,
-    evidence-backed channels and hand-offs, evidence identities, and the
-    fixed missing-knowledge vocabulary. Every material journey input is
-    sealed, so changed channel/page evidence invalidates the assessment."""
+    evidence-backed channels and hand-offs, evidence identities, the
+    public-surface coverage judgment, and the fixed missing-knowledge
+    vocabulary. Every material journey input is sealed, so changed
+    channel/page evidence or coverage state invalidates the assessment."""
+    coverage = journey.get("public_surface_coverage") or {}
     return {
         "reconstruction_version": journey.get("reconstruction_version"),
+        "public_surface_coverage": {
+            "state": coverage.get("state"),
+            "evidence_ids": sorted(
+                str(item) for item in coverage.get("evidence_ids", ())
+            ),
+            "session_ids": sorted(
+                str(item) for item in coverage.get("session_ids", ())
+            ),
+        },
         "stages": [
             {
                 "stage": stage.get("stage"),

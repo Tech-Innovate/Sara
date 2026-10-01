@@ -10,7 +10,14 @@ from .core import parse_timestamp
 # deterministic observable-journey reconstruction (identity-affecting:
 # the reason objects seal this version, so old persisted assessments
 # cannot masquerade as the new interpretation).
-DERIVATION_VERSION = "dossier-assessment-v2"
+# v3: the third sufficiency condition is public-surface coverage (current
+# evaluate evidence, or a sealed bounded website inspection that found no
+# evaluate surface) instead of a later-stage/hand-off requirement — later
+# stages are unreachable from public evidence for most businesses, and a
+# booking/ordering hand-off is evidence, not a promotion gate. Later
+# stages keep their independent evidence states and are never inferred
+# from contact/book_order. Identity-affecting for the same reason as v2.
+DERIVATION_VERSION = "dossier-assessment-v3"
 _VALUE_STATUSES = frozenset({"confirmed", "single_source"})
 _CAPABILITY_PREDICATES = (
     "capability.online_booking",
@@ -563,7 +570,15 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
     invariants carried by the reconstruction: ordering never implies
     payment, booking/order never implies receipt, and reviews never
     establish operational stages. No `strong` or `not_applicable` is
-    emitted in v2 — no evidence-backed definition exists for either.
+    emitted — no evidence-backed definition exists for either.
+
+    v3 sufficiency: an entry/evaluation stage, a customer-action stage,
+    and public-surface coverage. Coverage is owned by the reconstruction
+    (``public_surface_coverage``): current evaluate evidence, or a sealed
+    bounded website inspection that found no evaluate surface. Later
+    stages (pay/receive/support/return) and external booking/ordering
+    hand-offs remain reported evidence and never gate sufficiency, and
+    are never inferred from contact/book_order.
     """
     journey = dossier.get("customer_journey") or {}
     stages = {
@@ -599,25 +614,19 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
             unknowns=unknowns,
             extra={"observed_stage_count": journey.get("observed_stage_count")},
         )
-    handoffs = journey.get("handoffs") or []
-    # RCJ-05: hand-offs now carry a currency flag (historical ones are
-    # retained on stale stages). Sufficiency counts CURRENT hand-offs
-    # only — a historical booking hand-off is not a live route.
-    external_action_handoff = any(
-        str(handoff.get("from")) == "official_website"
-        and str(handoff.get("to")) in ("booking", "ordering")
-        and bool(handoff.get("current"))
-        for handoff in handoffs
-    )
+    coverage = journey.get("public_surface_coverage") or {}
+    coverage_state = str(coverage.get("state") or "not_covered")
     unmet = [
         label
         for label, ok in (
             ("entry_or_evaluation_stage", bool(current & {"discover", "evaluate"})),
             ("customer_action_stage", bool(current & {"contact", "book_order"})),
             (
-                "later_stage_or_action_handoff",
-                bool(current & {"pay", "receive", "support", "return"})
-                or external_action_handoff,
+                "public_surface_coverage",
+                coverage_state in (
+                    "evaluation_observed",
+                    "bounded_inspection_no_evaluation",
+                ),
             ),
         )
         if not ok
@@ -629,6 +638,7 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
             unknowns=unknowns,
             extra={
                 "current_stages": sorted(current),
+                "public_surface_coverage_state": coverage_state,
                 "reconstruction_version": journey.get("reconstruction_version"),
             },
         )
@@ -639,6 +649,7 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
         extra={
             "current_stages": sorted(current),
             "unmet_conditions": unmet,
+            "public_surface_coverage_state": coverage_state,
             "reconstruction_version": journey.get("reconstruction_version"),
         },
     )
