@@ -463,6 +463,24 @@ def _chronology_inputs(
                 f"customer journey {stage.get('stage')} evidence "
                 f"{entry.get('evidence_id')} retrieved_at",
             )
+    # PCJ-02: bounded public-surface coverage can rest on website rows
+    # that generate no fact and belong to no journey stage; their
+    # retrieval times are material assessment inputs and must reach
+    # facts_as_of and the sealed chronology like any other evidence.
+    for support in (
+        (dossier.get("customer_journey") or {})
+        .get("public_surface_coverage", {})
+        .get("support", ())
+    ):
+        key = (str(support.get("evidence_id")), str(support.get("retrieved_at")))
+        if key in journey_chronology_seen:
+            continue
+        journey_chronology_seen.add(key)
+        add(
+            support.get("retrieved_at"),
+            f"customer journey public_surface_coverage evidence "
+            f"{support.get('evidence_id')} retrieved_at",
+        )
     for review in dossier["customer_voice"]["reviews"]:
         add(review.get("observed_at"), f"review {review['observation_id']} observed_at")
         add(review.get("extracted_at"), f"review {review['observation_id']} extracted_at")
@@ -634,11 +652,36 @@ def understanding_state_fingerprint(
 
 def _customer_journey_signature(journey: dict[str, Any]) -> dict[str, Any]:
     """Bounded sealing view of the journey reconstruction: stage states,
-    evidence-backed channels and hand-offs, evidence identities, and the
+    evidence-backed channels and hand-offs, evidence identities, the
+    public-surface coverage judgment with its provenance rows, and the
     fixed missing-knowledge vocabulary. Every material journey input is
-    sealed, so changed channel/page evidence invalidates the assessment."""
+    sealed, so changed channel/page evidence, coverage state, or
+    coverage provenance invalidates the assessment."""
+    coverage = journey.get("public_surface_coverage") or {}
     return {
         "reconstruction_version": journey.get("reconstruction_version"),
+        "public_surface_coverage": {
+            "state": coverage.get("state"),
+            "evidence_ids": sorted(
+                str(item) for item in coverage.get("evidence_ids", ())
+            ),
+            "session_ids": sorted(
+                str(item) for item in coverage.get("session_ids", ())
+            ),
+            "support": [
+                {
+                    "evidence_id": str(item.get("evidence_id")),
+                    "acquisition_session_id": str(
+                        item.get("acquisition_session_id")
+                    ),
+                    "retrieved_at": str(item.get("retrieved_at")),
+                }
+                for item in sorted(
+                    coverage.get("support", ()),
+                    key=lambda item: str(item.get("evidence_id")),
+                )
+            ],
+        },
         "stages": [
             {
                 "stage": stage.get("stage"),

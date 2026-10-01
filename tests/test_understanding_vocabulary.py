@@ -283,7 +283,7 @@ def test_verifiers_detect_drift_in_their_required_or_installed_predicates(tmp_pa
 
 def test_domain_policy_matches_the_agreed_business_understanding_surface() -> None:
     assert VOCABULARY_VERSION == "business-understanding-v3"
-    assert DOSSIER_POLICY_VERSION == "business-understanding-v1"
+    assert DOSSIER_POLICY_VERSION == "business-understanding-v2"
     assert tuple(seed.name for seed in PREDICATE_SEED_V1) == EXPECTED_PREDICATE_NAMES_V1
     assert tuple(seed.name for seed in PREDICATE_SEED_PHASE3) == EXPECTED_PHASE3_PREDICATE_NAMES
     assert tuple(seed.name for seed in FOUNDATION_PREDICATE_SEEDS) == EXPECTED_FOUNDATION_PREDICATE_NAMES

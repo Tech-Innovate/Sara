@@ -56,7 +56,8 @@ class Clock:
         return value
 
 
-def prepared(path: Path, *, reviews=None):
+def prepared(path: Path, *, reviews=None, website="https://seed.example/",
+             phone="+966500000000"):
     conn = connect(path)
     assert apply_migrations(conn) == (1, 2, 3, 4, 5)
     seed_business_understanding_vocabulary(conn)
@@ -73,10 +74,13 @@ def prepared(path: Path, *, reviews=None):
         "place_id": "place-journey", "cid": "cid-journey", "data_id": "data-journey",
         "title": "Journey Business", "category": "Restaurant",
         "address": "Journey Street", "latitude": 21.55, "longitude": 39.18,
-        "phone": "+966500000000", "website": "https://seed.example/",
         "review_rating": 4.4, "review_count": 12, "status": "Open",
         "link": "https://maps.example/journey",
     }
+    if website is not None:
+        record["website"] = website
+    if phone is not None:
+        record["phone"] = phone
     if reviews is not None:
         record["user_reviews"] = reviews
     with patch("sara.storage.utc_now", return_value="2026-09-26T09:59:00+00:00"), patch(
@@ -87,11 +91,13 @@ def prepared(path: Path, *, reviews=None):
     return conn
 
 
-def acquire(conn, tmp_path, *, pages, page_limit=8, clock=None):
+def acquire(conn, tmp_path, *, pages, page_limit=8, clock=None,
+            client_factory=None):
     return collect_official_website(
         conn, evidence_root=tmp_path / "ev", business_id=1,
         config=CrawlConfig(page_limit=page_limit), now=clock or Clock(),
-        client_factory=_fake_client_factory(pages), refresh_assessment=True,
+        client_factory=client_factory or _fake_client_factory(pages),
+        refresh_assessment=True,
     )
 
 
@@ -648,8 +654,21 @@ def test_no_gap_or_quality_vocabulary(tmp_path: Path) -> None:
     allowed_doc_keys = {
         "reconstruction_version", "stages", "handoffs",
         "observed_stage_count", "current_stage_count",
+        "public_surface_coverage",
     }
     assert set(journey) == allowed_doc_keys
+    assert set(journey["public_surface_coverage"]) == {
+        "state", "evidence_ids", "session_ids", "support",
+    }
+    assert journey["public_surface_coverage"]["state"] in {
+        "evaluation_observed",
+        "bounded_inspection_no_evaluation",
+        "not_covered",
+    }
+    for item in journey["public_surface_coverage"]["support"]:
+        assert set(item) == {
+            "evidence_id", "acquisition_session_id", "retrieved_at",
+        }
     for stage in journey["stages"]:
         assert set(stage) == allowed_stage_keys
         assert stage["evidence_state"] in {
@@ -2189,3 +2208,584 @@ def test_sufficient_journey_unblocks_domain(tmp_path: Path) -> None:
     assert reason["code"] == "observable_journey_stages_reconstructed"
     assert "customer_journey" not in seal.blocking_mandatory_domains
     conn.close()
+
+
+# ---- v3 coverage-based sufficiency (public_surface_coverage) ----
+# Rule: entry/evaluation stage + customer-action stage + public-surface
+# coverage (current evaluate evidence, or a sealed bounded inspection
+# with no evaluate surface). Later stages and hand-offs are evidence,
+# never a gate. The reconstruction owns the coverage judgment.
+
+# Deep start whose origin root is unreachable: the crawler enqueues the
+# root for any non-root start, so the root failure forces a partial
+# session (the production B1 mechanics: scope can never be established
+# by a root that was never retained).
+DEEP_LANDING_SITE_BROKEN = {
+    "https://seed.example/landing/start": """
+        <link rel="canonical" href="https://seed.example/">
+        <a href="/landing/details">Details</a>
+    """,
+}
+
+DEEP_LANDING_SITE_NO_CANONICAL = {
+    "https://seed.example/landing/start": """
+        <a href="/landing/details">Details</a>
+    """,
+}
+
+# Root that redirects to a deep, non-evaluative landing: a root start is
+# business-wide scope eligible by construction, and the retained page's
+# role follows the FINAL url, so a complete frontier-exhausted crawl can
+# legitimately carry no evaluate-qualifying page.
+ROOT_REDIRECT_ROUTE = {
+    "https://seed.example/": (
+        "https://seed.example/landing/start",
+        """<a href="/landing/details">Details</a>""",
+    ),
+    "https://seed.example/landing/start": (
+        "https://seed.example/landing/start",
+        """<a href="/landing/details">Details</a>""",
+    ),
+    "https://seed.example/landing/details": (
+        "https://seed.example/landing/details",
+        "",
+    ),
+}
+
+
+def _redirect_client_factory(route):
+    class RedirectClient:
+        def fetch(self, url: str) -> HttpResponse:
+            if url not in route:
+                raise WebsiteFetchError(f"HTTP 404 for {url}")
+            final_url, body = route[url]
+            return HttpResponse(
+                requested_url=url, final_url=final_url, status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=body.encode(),
+                media_type="text/html", charset="utf-8",
+            )
+    client = RedirectClient()
+    return lambda **_kw: client
+
+
+def _coverage(conn, entity, evaluated_at="2026-09-26T12:30:00+00:00"):
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at=evaluated_at)
+    return dossier, dossier["customer_journey"]["public_surface_coverage"]
+
+
+def _journey_state(conn, entity, now="2026-09-26T12:30:00+00:00"):
+    seal = persist_dossier_assessment(conn, entity_id=entity, now=lambda: now)
+    row = conn.execute(
+        "SELECT state, reason_json FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='customer_journey'",
+        (seal.assessment_id,)).fetchone()
+    return row[0], json.loads(row[1])
+
+
+# decisive case 1: evaluate evidence + action => sufficient (v2 said
+# partial on later_stage_or_action_handoff for exactly this shape)
+def test_coverage_menu_only_site_is_sufficient(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-menu.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+    _, coverage = _coverage(conn, entity)
+    assert coverage["state"] == "evaluation_observed"
+    assert coverage["evidence_ids"] and coverage["session_ids"] == []
+    assert {item["evidence_id"] for item in coverage["support"]} == set(
+        coverage["evidence_ids"])
+    state, reason = _journey_state(conn, entity)
+    assert state == "sufficient"
+    assert reason["code"] == "observable_journey_stages_reconstructed"
+    assert reason["public_surface_coverage_state"] == "evaluation_observed"
+    assert reason["derivation_version"] == "dossier-assessment-v3"
+    # invariants: sufficiency never manufactures later stages
+    _, journey = _journey(conn, entity)
+    assert _states(journey)["pay"] == "unknown"
+    assert _states(journey)["receive"] == "unknown"
+    conn.close()
+
+
+# decisive case 2: bounded inspection with no evaluate surface + action
+# => sufficient through the coverage fallback (root redirect to a deep,
+# non-evaluative landing; complete, scope-eligible, frontier-exhausted)
+def test_coverage_bounded_inspection_without_evaluate_is_sufficient(
+        tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-bounded.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=None,
+                    client_factory=_redirect_client_factory(ROOT_REDIRECT_ROUTE))
+    assert stats.status == "complete"
+    assert stats.crawl_frontier_exhausted is True
+    _, journey = _journey(conn, entity)
+    assert _states(journey)["evaluate"] == "unknown"
+    coverage = journey["public_surface_coverage"]
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert coverage["session_ids"] == [stats.session_id]
+    assert coverage["evidence_ids"] == []
+    assert {item["acquisition_session_id"]
+            for item in coverage["support"]} == {stats.session_id}
+    state, reason = _journey_state(conn, entity)
+    assert state == "sufficient"
+    assert reason["public_surface_coverage_state"] == (
+        "bounded_inspection_no_evaluation")
+    assert _states(journey)["pay"] == "unknown"
+    assert _states(journey)["receive"] == "unknown"
+    conn.close()
+
+
+# decisive case 3a: partial crawl without evaluate surface stays partial
+def test_coverage_partial_crawl_no_evaluate_stays_partial(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-partial.sqlite",
+                    website="https://seed.example/landing/start")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=DEEP_LANDING_SITE_BROKEN)
+    assert stats.status == "partial"
+    _, coverage = _coverage(conn, entity)
+    assert coverage["state"] == "not_covered"
+    state, reason = _journey_state(conn, entity)
+    assert state == "partial"
+    assert reason["unmet_conditions"] == ["public_surface_coverage"]
+    conn.close()
+
+
+# decisive case 3b: deep start with unreachable root is partial and
+# uncovered regardless of a declared canonical (the production B1 shape)
+def test_coverage_scope_ineligible_no_evaluate_stays_partial(
+        tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-scope.sqlite",
+                    website="https://seed.example/landing/start")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=DEEP_LANDING_SITE_NO_CANONICAL)
+    assert stats.status == "partial"
+    _, coverage = _coverage(conn, entity)
+    assert coverage["state"] == "not_covered"
+    state, _ = _journey_state(conn, entity)
+    assert state == "partial"
+    conn.close()
+
+
+# decisive case 4: website known but never inspected stays partial (B2)
+def test_coverage_known_website_never_inspected_stays_partial(
+        tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-known.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    _, coverage = _coverage(conn, entity)
+    assert coverage["state"] == "not_covered"
+    assert coverage["evidence_ids"] == [] and coverage["session_ids"] == []
+    state, reason = _journey_state(conn, entity)
+    assert state == "partial"
+    assert reason["unmet_conditions"] == ["public_surface_coverage"]
+    conn.close()
+
+
+# decisive case 5: Maps + phone only stays partial (C)
+def test_coverage_maps_phone_only_stays_partial(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-maps-only.sqlite", website=None)
+    entity = business_entity_id_for_maps_business(1)
+    _, coverage = _coverage(conn, entity)
+    assert coverage["state"] == "not_covered"
+    state, reason = _journey_state(conn, entity)
+    assert state == "partial"
+    assert reason["unmet_conditions"] == ["public_surface_coverage"]
+    conn.close()
+
+
+# decisive case 6: evaluate without an action stage stays partial; a
+# bounded book_order absence never satisfies the action condition
+def test_coverage_evaluate_without_action_stays_partial(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-no-action.sqlite", phone=None)
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+    _, coverage = _coverage(conn, entity)
+    assert coverage["state"] == "evaluation_observed"
+    _, journey = _journey(conn, entity)
+    assert _states(journey)["contact"] == "unknown"
+    assert _states(journey)["book_order"] == (
+        "not_observed_in_bounded_inspection")
+    state, reason = _journey_state(conn, entity)
+    assert state == "partial"
+    assert reason["unmet_conditions"] == ["customer_action_stage"]
+    conn.close()
+
+
+# coverage determinism and currency: same inputs, same judgment; a
+# bounded inspection outside the freshness window no longer covers
+def test_coverage_deterministic_and_staleness_fail_closed(
+        tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-det.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=None,
+            client_factory=_redirect_client_factory(ROOT_REDIRECT_ROUTE))
+    first = _coverage(conn, entity)[1]
+    second = _coverage(conn, entity)[1]
+    assert first == second
+    assert first["state"] == "bounded_inspection_no_evaluation"
+    stale = _coverage(conn, entity, "2026-11-20T12:00:00+00:00")[1]
+    assert stale["state"] == "not_covered"
+    assert stale["session_ids"] == []
+    conn.close()
+
+
+# v3 identity: the sealed snapshot stamps the new derivation version
+def test_v3_derivation_version_sealed_in_assessment(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "cov-v3.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:30:00+00:00")
+    summary = json.loads(conn.execute(
+        "SELECT summary_json FROM dossier_assessments WHERE id=?",
+        (seal.assessment_id,)).fetchone()[0])
+    assert summary["derivation_version"] == "dossier-assessment-v3"
+    assert "customer_journey" not in seal.blocking_mandatory_domains
+    conn.close()
+
+
+# PCJ-01: a bounded session whose rows straddle the freshness boundary is
+# not current coverage. Stale evaluate-qualifying rows must not convert
+# into a current negative judgment through a younger non-evaluative row
+# from the same crawl.
+MENU_AND_DETAILS_SITE = {
+    "https://seed.example/": """
+        <link rel="canonical" href="https://seed.example/">
+        <a href="/menu">Menu</a>
+        <a href="/details">Details</a>
+    """,
+    "https://seed.example/menu": "<h1>Grill and Mezzes</h1>",
+    "https://seed.example/details": "<p>Plain page</p>",
+}
+
+
+def test_pcj01_boundary_straddling_session_not_covered(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "pcj01.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=MENU_AND_DETAILS_SITE)
+    assert stats.status == "complete"
+    assert stats.crawl_frontier_exhausted is True
+    role_times: dict[str, list[datetime]] = {}
+    for retrieved_at, metadata_json in conn.execute(
+        "SELECT retrieved_at, metadata_json FROM evidence_items "
+        "WHERE acquisition_session_id=?",
+        (stats.session_id,),
+    ):
+        role = json.loads(metadata_json).get("page_role")
+        role_times.setdefault(str(role), []).append(
+            datetime.fromisoformat(retrieved_at))
+    evaluative = sorted(role_times["home"] + role_times["offerings"])
+    plain = min(role_times["other"])
+    assert max(evaluative) < plain, "fixture must make evaluate rows older"
+    # evaluate rows fall outside the 30-day window; the plain row stays
+    # inside it — exactly the existential-currency loophole
+    evaluated = (
+        max(evaluative) + timedelta(days=30) + (plain - max(evaluative)) / 2
+    )
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at=evaluated.isoformat())
+    journey = dossier["customer_journey"]
+    evaluate_stage = next(
+        s for s in journey["stages"] if s["stage"] == "evaluate")
+    assert evaluate_stage["evidence_state"] == "stale"
+    coverage = journey["public_surface_coverage"]
+    assert coverage["state"] == "not_covered"
+    assert coverage["session_ids"] == [] and coverage["support"] == []
+    conn.close()
+
+
+# PCJ-02: coverage-supporting website rows that generate no fact and
+# belong to no stage still reach the sealed chronology and facts_as_of.
+def test_pcj02_coverage_only_rows_reach_chronology(tmp_path: Path) -> None:
+    from sara.dossier.assessment import (
+        _chronology_inputs,
+        _customer_journey_signature,
+        _location_owner_resolution_state,
+        _provenance_record_state,
+        _structural_subject_state,
+    )
+
+    conn = prepared(tmp_path / "pcj02.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=None,
+                    client_factory=_redirect_client_factory(
+                        ROOT_REDIRECT_ROUTE))
+    assert stats.status == "complete"
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    journey = dossier["customer_journey"]
+    coverage = journey["public_surface_coverage"]
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert coverage["support"], "bounded coverage must expose provenance"
+    row_ids = {row[0] for row in conn.execute(
+        "SELECT id FROM evidence_items WHERE acquisition_session_id=?",
+        (stats.session_id,))}
+    assert {item["evidence_id"] for item in coverage["support"]} == row_ids
+    assert all(
+        set(item) == {
+            "evidence_id", "acquisition_session_id", "retrieved_at",
+        }
+        for item in coverage["support"]
+    )
+
+    # the sealed journey signature carries the provenance rows
+    sealed = _customer_journey_signature(journey)["public_surface_coverage"]
+    assert sealed["support"] == sorted(
+        coverage["support"], key=lambda item: item["evidence_id"])
+
+    # chronology includes a coverage-labeled entry per support row, and
+    # the persisted watermark is not earlier than the newest such row
+    chronology = _chronology_inputs(
+        dossier,
+        _location_owner_resolution_state(conn, dossier),
+        _structural_subject_state(conn, dossier),
+        _provenance_record_state(conn, dossier),
+    )
+    labels = {str(item["field"]) for item in chronology}
+    journey_labels = [l for l in labels if l.startswith("customer journey")]
+    stage_evidence_ids = {
+        str(entry.get("evidence_id"))
+        for stage in journey["stages"]
+        for entry in stage.get("evidence", ())
+    }
+    for item in coverage["support"]:
+        # every coverage-supporting row is incorporated under SOME
+        # journey chronology label (stage evidence or coverage)
+        assert any(item["evidence_id"] in l for l in journey_labels), item
+    coverage_only = (
+        {item["evidence_id"] for item in coverage["support"]}
+        - stage_evidence_ids
+    )
+    assert coverage_only, "fixture must include a stage-less coverage row"
+    for evidence_id in coverage_only:
+        # rows that no stage claims enter through the coverage route only
+        assert any(
+            evidence_id in l and "public_surface_coverage" in l
+            for l in journey_labels
+        ), evidence_id
+    newest_row = max(
+        datetime.fromisoformat(item["retrieved_at"])
+        for item in coverage["support"]
+    )
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:30:00+00:00")
+    facts_as_of = conn.execute(
+        "SELECT facts_as_of FROM dossier_assessments WHERE id=?",
+        (seal.assessment_id,)).fetchone()[0]
+    assert datetime.fromisoformat(facts_as_of) >= newest_row
+    conn.close()
+
+
+# SR-01: snapshots sealed under a superseded policy identity are never
+# surfaced as the persisted current policy, regardless of computed_at.
+def test_sr01_superseded_policy_snapshot_not_current(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "sr01.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+
+    def persisted_current(evaluated_at="2026-09-26T12:30:00+00:00"):
+        dossier = build_business_dossier(
+            conn, entity_id=entity, evaluated_at=evaluated_at)
+        return dossier["dossier_status"]["persisted_current_policy"]
+
+    # an old-policy-only history: sealed, but never the current policy
+    with patch("sara.dossier.assessment.DOSSIER_POLICY_VERSION",
+               "business-understanding-v1"):
+        old = persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:00:00+00:00")
+    assert old.assessment_id
+    assert persisted_current() is None
+
+    # the active-policy snapshot is surfaced
+    new = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:10:00+00:00")
+    current = persisted_current()
+    assert current is not None
+    assert current["id"] == new.assessment_id
+    assert current["policy_version"] == "business-understanding-v2"
+    assert current["summary"]["derivation_version"] == "dossier-assessment-v3"
+
+    # a LATER old-policy write (freshness advanced by a real crawl) must
+    # not shadow the current-policy snapshot
+    crawl_clock = Clock()
+    crawl_clock.current = datetime.fromisoformat(
+        "2026-09-26T12:20:00+00:00")
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE, clock=crawl_clock)
+    with patch("sara.dossier.assessment.DOSSIER_POLICY_VERSION",
+               "business-understanding-v1"):
+        old_later = persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:40:00+00:00")
+    assert old_later.assessment_id not in {
+        old.assessment_id, new.assessment_id}
+    current = persisted_current()
+    assert current is not None
+    assert current["policy_version"] == "business-understanding-v2"
+    conn.close()
+
+
+def _supersede_website_fact(conn, entity, new_website, at):
+    """Supersede the open official-website fact through the reconciler's
+    own row mutations (close the open fact, insert the successor)."""
+    import hashlib
+
+    from sara.website.reconcile import _close_fact, _insert_fact
+
+    row = conn.execute(
+        "SELECT id, fact_slot FROM facts "
+        "WHERE subject_id=? AND predicate='business.website.official' "
+        "AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
+        (entity,),
+    ).fetchone()
+    assert row is not None, "expected an open website fact"
+    _close_fact(conn, row[0], valid_to=at)
+    value_json = json.dumps(new_website)
+    fact_id = "ft_" + hashlib.sha256(
+        (entity + new_website + at).encode("utf-8")).hexdigest()[:32]
+    _insert_fact(
+        conn, fact_id=fact_id, entity_id=entity,
+        predicate="business.website.official", fact_slot=row[1],
+        value_json=value_json,
+        value_hash=hashlib.sha256(value_json.encode("utf-8")).hexdigest(),
+        status="single_source", valid_from=at, reconciled_at=at,
+    )
+    conn.commit()
+
+
+# SR-02: a bounded crawl of a superseded site must not establish coverage
+# for a different current official website; a same-site change under
+# crawler host semantics (www variant, deep path) keeps legitimate
+# bounded coverage.
+def test_sr02_bounded_coverage_bound_to_current_site(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "sr02.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=None,
+                    client_factory=_redirect_client_factory(
+                        ROOT_REDIRECT_ROUTE))
+    assert stats.status == "complete"
+
+    def domain_state():
+        dossier = build_business_dossier(
+            conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+        coverage = dossier["customer_journey"]["public_surface_coverage"]
+        assessments = {
+            str(a["domain"]): a
+            for a in derive_domain_assessments(dossier)
+        }
+        return coverage, assessments["customer_journey"]
+
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert journey_domain["state"] == "sufficient"
+
+    # same site, different host spelling and path: coverage survives
+    _supersede_website_fact(
+        conn, entity, "https://www.seed.example/landing/elsewhere",
+        at="2026-09-26T11:00:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert journey_domain["state"] == "sufficient"
+
+    # a different site that was never crawled: the bounded crawl of the
+    # superseded site no longer speaks for the public surface
+    _supersede_website_fact(
+        conn, entity, "https://other.example/",
+        at="2026-09-26T11:30:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "not_covered"
+    assert coverage["session_ids"] == [] and coverage["support"] == []
+    assert journey_domain["state"] == "partial"
+    assert journey_domain["reason"]["unmet_conditions"] == [
+        "public_surface_coverage"]
+    conn.close()
+
+
+# SR-03: positive evaluation coverage is site-aware — an evaluate page
+# from a superseded site cannot cover a different current site.
+def test_sr03_positive_coverage_bound_to_current_site(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "sr03.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+
+    def domain_state():
+        dossier = build_business_dossier(
+            conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+        coverage = dossier["customer_journey"]["public_surface_coverage"]
+        assessments = {
+            str(a["domain"]): a
+            for a in derive_domain_assessments(dossier)
+        }
+        return coverage, assessments["customer_journey"]
+
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "evaluation_observed"
+    assert journey_domain["state"] == "sufficient"
+
+    # same site, different host spelling and path: still covered
+    _supersede_website_fact(
+        conn, entity, "https://www.seed.example/landing/elsewhere",
+        at="2026-09-26T11:00:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "evaluation_observed"
+    assert journey_domain["state"] == "sufficient"
+
+    # different-host site B, never crawled, A's evaluate page still
+    # fresh: the superseded site no longer covers the public surface
+    _supersede_website_fact(
+        conn, entity, "https://other.example/",
+        at="2026-09-26T11:30:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "not_covered"
+    assert coverage["evidence_ids"] == [] and coverage["support"] == []
+    assert journey_domain["state"] == "partial"
+    assert journey_domain["reason"]["unmet_conditions"] == [
+        "public_surface_coverage"]
+    conn.close()
+
+
+# SR-03 unit contract for the positive-branch evidence filter: website
+# rows are site-bound, non-website evaluate evidence deliberately is not.
+def test_sr03_coverage_evidence_filter_semantics() -> None:
+    from sara.dossier.customer_journey import _public_surface_coverage
+
+    maps_entry = {
+        "evidence_id": "ev_maps", "source_id": "src_google_maps",
+        "acquisition_session_id": "acq_maps",
+        "retrieved_at": "2026-09-26T10:00:00+00:00",
+    }
+    superseded_web_entry = {
+        "evidence_id": "ev_web_old", "source_id": "src_official_web",
+        "acquisition_session_id": "acq_web_old",
+        "retrieved_at": "2026-09-26T12:00:00+00:00",
+    }
+    stages = [{
+        "stage": "evaluate", "evidence_state": "observed",
+        "channels": [], "handoffs": [],
+        "evidence": [maps_entry, superseded_web_entry],
+        "missing_knowledge": [],
+    }]
+    website_evidence = [{
+        "evidence_id": "ev_web_old",
+        "acquisition_session_id": "acq_web_old",
+        "retrieved_at": "2026-09-26T12:00:00+00:00",
+        "current": True,
+        "session_start_url": "https://old.example/",
+    }]
+    website_facts = [{
+        "status": "single_source",
+        "freshness": {"is_stale": False},
+        "value": "https://new.example/",
+    }]
+
+    # the superseded-site website row is filtered; the Maps evidence
+    # entry still covers the business
+    coverage = _public_surface_coverage(
+        stages, website_evidence, frozenset(), website_facts)
+    assert coverage["state"] == "evaluation_observed"
+    assert coverage["evidence_ids"] == ["ev_maps"]
+    assert [item["evidence_id"] for item in coverage["support"]] == [
+        "ev_maps"]
+
+    # website-only evidence from the superseded site: no coverage
+    stages[0]["evidence"] = [superseded_web_entry]
+    coverage = _public_surface_coverage(
+        stages, website_evidence, frozenset(), website_facts)
+    assert coverage["state"] == "not_covered"
+    assert coverage["evidence_ids"] == [] and coverage["support"] == []

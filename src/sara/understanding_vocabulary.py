@@ -238,7 +238,14 @@ PREDICATE_SEEDS: tuple[PredicateSeed, ...] = (
     FOUNDATION_PREDICATE_SEEDS + PREDICATE_SEED_REVIEW_INTELLIGENCE
 )
 VOCABULARY_VERSION = "business-understanding-v3"
-DOSSIER_POLICY_VERSION = "business-understanding-v1"
+# v2 policy identity: the Customer Journey sufficiency rule changed from a
+# later-stage/hand-off requirement to public-surface coverage (see
+# assessment_policy.DERIVATION_VERSION for the derivation identifier).
+# persisted_current_policy selects snapshots by this identity, so
+# old-policy assessments remain immutable history but are no longer the
+# persisted current policy, and a superseded-policy writer cannot shadow
+# a current-policy snapshot regardless of computed_at.
+DOSSIER_POLICY_VERSION = "business-understanding-v2"
 
 
 DOSSIER_DOMAIN_SEED_V1: tuple[DossierDomainSeed, ...] = (

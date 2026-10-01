@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 #: Local constants rather than imports from the website package: importing
 #: sara.website would pull its collector CLI, which imports this package.
@@ -674,6 +675,183 @@ def _website_channel_candidates(
     )
 
 
+def _host_of(url: object) -> str | None:
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+def _public_surface_coverage(
+    stages: list[dict[str, Any]],
+    website_evidence: list[dict[str, Any]],
+    absence_safe_sessions: frozenset[str],
+    website_facts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Deterministic public-surface coverage judgment over the admitted
+    website surface. The reconstruction — not the assessment policy —
+    owns this decision, so sufficiency mapping never reaches back into
+    acquisition tables.
+
+    States:
+    - ``evaluation_observed``: the evaluate stage is currently observed
+      from ADMISSIBLE evidence. SR-03: website-derived evaluate rows
+      must be same-site (crawler host semantics, so verified
+      root->deep redirects on one host qualify) with a CURRENT
+      business.website.official fact — an evaluate page from a
+      superseded site cannot cover a different current site.
+      Non-website evaluate evidence (e.g. a producer-verified offering
+      fact) deliberately satisfies this branch regardless of site
+      identity: it speaks for the business, not for a site.
+      ``evidence_ids`` are the admissible entries' identities.
+    - ``bounded_inspection_no_evaluation``: no admissible current
+      evaluate evidence, but at least one absence-safe website session
+      (complete, business-wide-scope-eligible, frontier-exhausted on
+      every admitted row) of the entity's CURRENT official website
+      remains current across its ENTIRE admitted row set. PCJ-01: every
+      supporting row must be current and the row set non-empty — one
+      stale row, evaluative or not, disqualifies the session, so stale
+      positive evaluation evidence can never convert into a current
+      negative coverage judgment. SR-02: the session's verified
+      source-time start_url must be same-site with a CURRENT
+      business.website.official fact — a bounded crawl of a superseded
+      site must not establish coverage for a different current site,
+      and with no current website identity the branch fails closed.
+    - ``not_covered``: neither holds; sufficiency must fail closed.
+
+    ``support`` carries the deterministic coverage-provenance rows
+    (evidence identity, session, retrieval time) for BOTH branches, so
+    assessment chronology and the sealed input signature can include
+    coverage evidence that belongs to no journey stage and generated no
+    fact (PCJ-02).
+    """
+    rows_by_session: dict[str, list[dict[str, Any]]] = {}
+    for row in website_evidence:
+        rows_by_session.setdefault(
+            str(row["acquisition_session_id"]), []
+        ).append(row)
+    from ..website.parser import normalize_http_url
+
+    current_site_hosts = set()
+    for fact in website_facts:
+        if not _fact_current(fact):
+            continue
+        value = fact.get("value")
+        if not isinstance(value, str) or not value:
+            continue
+        normalized = normalize_http_url(value)
+        host = _host_of(normalized) or _host_of(value)
+        if host:
+            current_site_hosts.add(host)
+
+    session_site_by_id: dict[str, str | None] = {}
+    for session_id, rows in rows_by_session.items():
+        start = rows[0].get("session_start_url")
+        normalized = (
+            normalize_http_url(start) if isinstance(start, str) else None
+        )
+        session_site_by_id[session_id] = (
+            _host_of(normalized) or _host_of(start)
+        )
+
+    def _admissible(entry: dict[str, Any]) -> bool:
+        if str(entry.get("source_id")) != _OFFICIAL_WEB_SOURCE_ID:
+            return True
+        host = session_site_by_id.get(
+            str(entry.get("acquisition_session_id"))
+        )
+        return host is not None and host in current_site_hosts
+
+    evaluate_stage = next(
+        (stage for stage in stages if str(stage.get("stage")) == "evaluate"),
+        None,
+    )
+    if (
+        evaluate_stage is not None
+        and evaluate_stage.get("evidence_state") == "observed"
+    ):
+        entries = [
+            entry
+            for entry in evaluate_stage.get("evidence", ())
+            if _admissible(entry)
+        ]
+        if entries:
+            return {
+                "state": "evaluation_observed",
+                "evidence_ids": sorted(
+                    {
+                        str(entry.get("evidence_id"))
+                        for entry in entries
+                    }
+                ),
+                "session_ids": [],
+                "support": sorted(
+                    (
+                        {
+                            "evidence_id": str(entry.get("evidence_id")),
+                            "acquisition_session_id": str(
+                                entry.get("acquisition_session_id")
+                            ),
+                            "retrieved_at": str(entry.get("retrieved_at")),
+                        }
+                        for entry in entries
+                    ),
+                    key=lambda item: item["evidence_id"],
+                ),
+            }
+        # SR-03: evaluate is observed only from superseded-site website
+        # evidence (or evidence with no current site identity) — fall
+        # through to the bounded branch, which applies its own
+        # current-site binding.
+
+    bounded_current = sorted(
+        session_id
+        for session_id in absence_safe_sessions
+        if rows_by_session.get(session_id)
+        and all(
+            row.get("current")
+            for row in rows_by_session[session_id]
+        )
+        and session_site_by_id.get(session_id) is not None
+        and session_site_by_id[session_id] in current_site_hosts
+    )
+    if bounded_current:
+        support_rows = [
+            row
+            for session_id in bounded_current
+            for row in rows_by_session[session_id]
+        ]
+        return {
+            "state": "bounded_inspection_no_evaluation",
+            "evidence_ids": [],
+            "session_ids": bounded_current,
+            "support": sorted(
+                (
+                    {
+                        "evidence_id": str(row["evidence_id"]),
+                        "acquisition_session_id": str(
+                            row["acquisition_session_id"]
+                        ),
+                        "retrieved_at": str(row["retrieved_at"]),
+                    }
+                    for row in support_rows
+                ),
+                key=lambda item: item["evidence_id"],
+            ),
+        }
+    return {
+        "state": "not_covered",
+        "evidence_ids": [],
+        "session_ids": [],
+        "support": [],
+    }
+
+
 def reconstruct_customer_journey(
     conn: sqlite3.Connection,
     *,
@@ -1114,18 +1292,6 @@ def reconstruct_customer_journey(
         "book_order": [], "contact": [],
     }
     website_handoff_channel_currency: dict[tuple[str, str], bool] = {}
-    from urllib.parse import urlsplit as _urlsplit
-
-    def _host_of(url: object) -> str | None:
-        if not isinstance(url, str) or not url:
-            return None
-        try:
-            host = (_urlsplit(url).hostname or "").lower().rstrip(".")
-        except ValueError:
-            return None
-        if host.startswith("www."):
-            host = host[4:]
-        return host or None
 
     for channel_type, stage in (
         ("booking", "book_order"),
@@ -1498,6 +1664,10 @@ def reconstruct_customer_journey(
             "handoffs": handoffs,
             "observed_stage_count": observed_stage_count,
             "current_stage_count": current_stage_count,
+            "public_surface_coverage": _public_surface_coverage(
+                stages, website_evidence, absence_safe_sessions,
+                website_facts,
+            ),
         },
         issues,
     )
