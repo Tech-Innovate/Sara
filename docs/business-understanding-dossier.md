@@ -74,7 +74,7 @@ sara-dossier-assess --db data/sara.db --business-id 123 --pretty
 
 The assessment command accepts the same three selectors as `sara-dossier`. It opens an existing writable database but does not repair or prepare it implicitly.
 
-The active policy is `business-understanding-v1`, with derivation implementation `dossier-assessment-v1`. An assessment records:
+The active policy is `business-understanding-v2`, with derivation implementation `dossier-assessment-v3`. An assessment records:
 
 - immutable parent state in `dossier_assessments`;
 - exactly one row for every controlled dossier domain in `dossier_domain_assessments`;
@@ -95,9 +95,9 @@ Fact-support provenance is part of that logical input. Appending a new observati
 
 Time still matters semantically. If the same factual input later crosses a freshness threshold, the derived state changes and Sara creates a new immutable assessment even though `facts_as_of` may be unchanged. Older assessments remain sealed historical judgments.
 
-The read-only dossier returns the chronologically latest complete sealed snapshot for the active policy. It does not silently recompute an old assessment after later facts or freshness conditions change.
+The read-only dossier returns the chronologically latest complete sealed snapshot for the active policy. Snapshots sealed under a superseded policy identity remain immutable history but are never surfaced as the persisted current policy, and cannot shadow a current-policy snapshot regardless of their `computed_at`. It does not silently recompute an old assessment after later facts or freshness conditions change.
 
-## Dossier sufficiency policy v1
+## Dossier sufficiency policy v2
 
 Sara does not represent understanding as one opaque percentage. Every controlled domain receives one of:
 
@@ -112,7 +112,7 @@ conflicted
 not_applicable
 ```
 
-The v1 assessment policy is intentionally conservative:
+The v2 assessment policy is intentionally conservative:
 
 - `identity` requires a fresh trading-name fact plus at least one active strong Maps Location identifier (`place_id`, `cid`, or `data_id`) attributed to Sara's canonical Google Maps source (`src_google_maps`, source type `google_maps`); namespace text from another source is not a Maps identity anchor;
 - `classification` requires a fresh primary-category fact;
@@ -126,7 +126,7 @@ The v1 assessment policy is intentionally conservative:
 - `provenance` requires material current facts/customer voice to trace cleanly to retained evidence;
 - `unknowns` evaluates whether controlled Fact-eligible unresolved state is explicitly enumerated rather than invented away.
 
-`customer_journey` is deliberately capped below sufficiency in this policy because the current model does not yet have a supported stage-reconstruction contract. Adjacent phone, website, transaction, booking, ordering, or messaging evidence can make that domain `partial`, but cannot prove that the major observable journey was reconstructed.
+`customer_journey` is assessed over the deterministic observable-journey reconstruction (`observable-customer-journey-v1`). The domain is `sufficient` when all three conditions hold: a current entry/evaluation stage (`discover` or `evaluate`), a current customer-action stage (`contact` or `book_order`), and public-surface coverage. Coverage is satisfied by current `evaluate` evidence from admitted website evidence, or by a sealed bounded website inspection of the entity's current official website — complete, business-wide-scope-eligible, frontier-exhausted — that found no evaluate surface, current across its entire admitted row set and same-site with the current official-website fact under crawler host semantics. Later stages (`pay`, `receive`, `support`, `return`) and external booking/ordering hand-offs remain reported evidence and never gate sufficiency; nothing is inferred from contact/book_order. A current website that is known but was never successfully inspected, and a Maps-listing-plus-phone-only journey, both remain `partial` on the coverage condition.
 
 `competitive_context` remains `not_started` until Sara has a supported peer-context representation. Name/category similarity is not treated as competitive understanding.
 

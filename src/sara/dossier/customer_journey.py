@@ -4,6 +4,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 #: Local constants rather than imports from the website package: importing
 #: sara.website would pull its collector CLI, which imports this package.
@@ -674,10 +675,23 @@ def _website_channel_candidates(
     )
 
 
+def _host_of(url: object) -> str | None:
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
 def _public_surface_coverage(
     stages: list[dict[str, Any]],
     website_evidence: list[dict[str, Any]],
     absence_safe_sessions: frozenset[str],
+    website_facts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Deterministic public-surface coverage judgment over the admitted
     website surface. The reconstruction — not the assessment policy —
@@ -690,11 +704,17 @@ def _public_surface_coverage(
     - ``bounded_inspection_no_evaluation``: no current evaluate evidence,
       but at least one absence-safe website session (complete,
       business-wide-scope-eligible, frontier-exhausted on every admitted
-      row) remains current across its ENTIRE admitted row set. PCJ-01:
-      every supporting row must be current and the row set non-empty —
-      one stale row, evaluative or not, disqualifies the session, so
-      stale positive evaluation evidence can never convert into a
-      current negative coverage judgment.
+      row) of the entity's CURRENT official website remains current
+      across its ENTIRE admitted row set. PCJ-01: every supporting row
+      must be current and the row set non-empty — one stale row,
+      evaluative or not, disqualifies the session, so stale positive
+      evaluation evidence can never convert into a current negative
+      coverage judgment. SR-02: the session's verified source-time
+      start_url must be same-site (crawler host semantics, so verified
+      root->deep redirects on one host qualify) with a CURRENT
+      business.website.official fact — a bounded crawl of a superseded
+      site must not establish coverage for a different current site,
+      and with no current website identity the branch fails closed.
     - ``not_covered``: neither holds; sufficiency must fail closed.
 
     ``support`` carries the deterministic coverage-provenance rows
@@ -740,6 +760,36 @@ def _public_surface_coverage(
         rows_by_session.setdefault(
             str(row["acquisition_session_id"]), []
         ).append(row)
+    from ..website.parser import normalize_http_url
+
+    current_site_hosts = set()
+    for fact in website_facts:
+        if not _fact_current(fact):
+            continue
+        value = fact.get("value")
+        if not isinstance(value, str) or not value:
+            continue
+        normalized = normalize_http_url(value)
+        host = _host_of(normalized) or _host_of(value)
+        if host:
+            current_site_hosts.add(host)
+    if not current_site_hosts:
+        # SR-02: without a current official-website identity, no bounded
+        # crawl can speak for today's public surface.
+        return {
+            "state": "not_covered",
+            "evidence_ids": [],
+            "session_ids": [],
+            "support": [],
+        }
+
+    def _session_site(rows: list[dict[str, Any]]) -> str | None:
+        start = rows[0].get("session_start_url")
+        normalized = (
+            normalize_http_url(start) if isinstance(start, str) else None
+        )
+        return _host_of(normalized) or _host_of(start)
+
     bounded_current = sorted(
         session_id
         for session_id in absence_safe_sessions
@@ -748,6 +798,7 @@ def _public_surface_coverage(
             row.get("current")
             for row in rows_by_session[session_id]
         )
+        and _session_site(rows_by_session[session_id]) in current_site_hosts
     )
     if bounded_current:
         support_rows = [
@@ -1221,18 +1272,6 @@ def reconstruct_customer_journey(
         "book_order": [], "contact": [],
     }
     website_handoff_channel_currency: dict[tuple[str, str], bool] = {}
-    from urllib.parse import urlsplit as _urlsplit
-
-    def _host_of(url: object) -> str | None:
-        if not isinstance(url, str) or not url:
-            return None
-        try:
-            host = (_urlsplit(url).hostname or "").lower().rstrip(".")
-        except ValueError:
-            return None
-        if host.startswith("www."):
-            host = host[4:]
-        return host or None
 
     for channel_type, stage in (
         ("booking", "book_order"),
@@ -1606,7 +1645,8 @@ def reconstruct_customer_journey(
             "observed_stage_count": observed_stage_count,
             "current_stage_count": current_stage_count,
             "public_surface_coverage": _public_surface_coverage(
-                stages, website_evidence, absence_safe_sessions
+                stages, website_evidence, absence_safe_sessions,
+                website_facts,
             ),
         },
         issues,

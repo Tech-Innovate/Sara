@@ -2573,3 +2573,125 @@ def test_pcj02_coverage_only_rows_reach_chronology(tmp_path: Path) -> None:
         (seal.assessment_id,)).fetchone()[0]
     assert datetime.fromisoformat(facts_as_of) >= newest_row
     conn.close()
+
+
+# SR-01: snapshots sealed under a superseded policy identity are never
+# surfaced as the persisted current policy, regardless of computed_at.
+def test_sr01_superseded_policy_snapshot_not_current(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "sr01.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+
+    def persisted_current(evaluated_at="2026-09-26T12:30:00+00:00"):
+        dossier = build_business_dossier(
+            conn, entity_id=entity, evaluated_at=evaluated_at)
+        return dossier["dossier_status"]["persisted_current_policy"]
+
+    # an old-policy-only history: sealed, but never the current policy
+    with patch("sara.dossier.assessment.DOSSIER_POLICY_VERSION",
+               "business-understanding-v1"):
+        old = persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:00:00+00:00")
+    assert old.assessment_id
+    assert persisted_current() is None
+
+    # the active-policy snapshot is surfaced
+    new = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:10:00+00:00")
+    current = persisted_current()
+    assert current is not None
+    assert current["id"] == new.assessment_id
+    assert current["policy_version"] == "business-understanding-v2"
+    assert current["summary"]["derivation_version"] == "dossier-assessment-v3"
+
+    # a LATER old-policy write (freshness advanced by a real crawl) must
+    # not shadow the current-policy snapshot
+    crawl_clock = Clock()
+    crawl_clock.current = datetime.fromisoformat(
+        "2026-09-26T12:20:00+00:00")
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE, clock=crawl_clock)
+    with patch("sara.dossier.assessment.DOSSIER_POLICY_VERSION",
+               "business-understanding-v1"):
+        old_later = persist_dossier_assessment(
+            conn, entity_id=entity, now=lambda: "2026-09-26T12:40:00+00:00")
+    assert old_later.assessment_id not in {
+        old.assessment_id, new.assessment_id}
+    current = persisted_current()
+    assert current is not None
+    assert current["policy_version"] == "business-understanding-v2"
+    conn.close()
+
+
+def _supersede_website_fact(conn, entity, new_website, at):
+    """Supersede the open official-website fact through the reconciler's
+    own row mutations (close the open fact, insert the successor)."""
+    import hashlib
+
+    from sara.website.reconcile import _close_fact, _insert_fact
+
+    row = conn.execute(
+        "SELECT id, fact_slot FROM facts "
+        "WHERE subject_id=? AND predicate='business.website.official' "
+        "AND valid_to IS NULL ORDER BY created_at DESC LIMIT 1",
+        (entity,),
+    ).fetchone()
+    assert row is not None, "expected an open website fact"
+    _close_fact(conn, row[0], valid_to=at)
+    value_json = json.dumps(new_website)
+    fact_id = "ft_" + hashlib.sha256(
+        (entity + new_website + at).encode("utf-8")).hexdigest()[:32]
+    _insert_fact(
+        conn, fact_id=fact_id, entity_id=entity,
+        predicate="business.website.official", fact_slot=row[1],
+        value_json=value_json,
+        value_hash=hashlib.sha256(value_json.encode("utf-8")).hexdigest(),
+        status="single_source", valid_from=at, reconciled_at=at,
+    )
+    conn.commit()
+
+
+# SR-02: a bounded crawl of a superseded site must not establish coverage
+# for a different current official website; a same-site change under
+# crawler host semantics (www variant, deep path) keeps legitimate
+# bounded coverage.
+def test_sr02_bounded_coverage_bound_to_current_site(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "sr02.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=None,
+                    client_factory=_redirect_client_factory(
+                        ROOT_REDIRECT_ROUTE))
+    assert stats.status == "complete"
+
+    def domain_state():
+        dossier = build_business_dossier(
+            conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+        coverage = dossier["customer_journey"]["public_surface_coverage"]
+        assessments = {
+            str(a["domain"]): a
+            for a in derive_domain_assessments(dossier)
+        }
+        return coverage, assessments["customer_journey"]
+
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert journey_domain["state"] == "sufficient"
+
+    # same site, different host spelling and path: coverage survives
+    _supersede_website_fact(
+        conn, entity, "https://www.seed.example/landing/elsewhere",
+        at="2026-09-26T11:00:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert journey_domain["state"] == "sufficient"
+
+    # a different site that was never crawled: the bounded crawl of the
+    # superseded site no longer speaks for the public surface
+    _supersede_website_fact(
+        conn, entity, "https://other.example/",
+        at="2026-09-26T11:30:00+00:00")
+    coverage, journey_domain = domain_state()
+    assert coverage["state"] == "not_covered"
+    assert coverage["session_ids"] == [] and coverage["support"] == []
+    assert journey_domain["state"] == "partial"
+    assert journey_domain["reason"]["unmet_conditions"] == [
+        "public_surface_coverage"]
+    conn.close()
