@@ -1430,6 +1430,100 @@ BUSINESS_UNDERSTANDING_V4 = (
     """,
 )
 
+BUSINESS_UNDERSTANDING_V5 = (
+    """
+    ALTER TABLE acquisition_sessions ADD COLUMN child_seal_sha256 TEXT
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_child_seal_set
+    BEFORE UPDATE OF child_seal_sha256 ON acquisition_sessions
+    WHEN NEW.child_seal_sha256 IS NOT NULL
+      AND OLD.child_seal_sha256 IS NULL
+    BEGIN
+      SELECT CASE
+        WHEN OLD.status IN ('complete','partial','blocked','failed','cancelled')
+        THEN RAISE(ABORT, 'child seal is granted only at the terminal transition, never afterward')
+      END;
+      SELECT CASE
+        WHEN NEW.status NOT IN ('complete','partial','blocked','failed','cancelled')
+        THEN RAISE(ABORT, 'child seal requires a terminal acquisition session')
+      END;
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_website_terminal_requires_seal
+    BEFORE UPDATE OF status ON acquisition_sessions
+    WHEN OLD.status IN ('planned','running')
+      AND NEW.status IN ('complete','partial')
+      AND NEW.collector_name = 'sara.website'
+      AND NEW.child_seal_sha256 IS NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'website acquisition finalization requires its child seal');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_website_no_terminal_insert
+    BEFORE INSERT ON acquisition_sessions
+    WHEN NEW.collector_name = 'sara.website'
+      AND NEW.status IN ('complete','partial','blocked','failed','cancelled')
+    BEGIN
+      SELECT RAISE(ABORT, 'website acquisition sessions are finalized from running, not born terminal');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_child_seal_immutable
+    BEFORE UPDATE OF child_seal_sha256 ON acquisition_sessions
+    WHEN OLD.child_seal_sha256 IS NOT NULL
+      AND NEW.child_seal_sha256 IS NOT OLD.child_seal_sha256
+    BEGIN
+      SELECT RAISE(ABORT, 'terminal acquisition session child seal is immutable');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_child_seal_not_at_insert
+    BEFORE INSERT ON acquisition_sessions
+    WHEN NEW.child_seal_sha256 IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'child seal is set only by finalization after the child set exists');
+    END
+    """,
+    """
+    CREATE TRIGGER evidence_items_no_insert_under_sealed_session
+    BEFORE INSERT ON evidence_items
+    WHEN EXISTS (
+      SELECT 1 FROM acquisition_sessions a
+      WHERE a.id = NEW.acquisition_session_id
+        AND a.child_seal_sha256 IS NOT NULL
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'cannot append evidence to a sealed acquisition session');
+    END
+    """,
+    """
+    CREATE TRIGGER observations_no_insert_under_sealed_session
+    BEFORE INSERT ON observations
+    WHEN EXISTS (
+      SELECT 1 FROM evidence_items e
+      JOIN acquisition_sessions a ON a.id = e.acquisition_session_id
+      WHERE e.id = NEW.evidence_id
+        AND a.child_seal_sha256 IS NOT NULL
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'cannot append observations to a sealed acquisition session');
+    END
+    """,
+    """
+    CREATE TRIGGER acquisition_sessions_sealed_counters_immutable
+    BEFORE UPDATE OF evidence_count, observation_count ON acquisition_sessions
+    WHEN OLD.child_seal_sha256 IS NOT NULL
+      AND (NEW.evidence_count IS NOT OLD.evidence_count
+        OR NEW.observation_count IS NOT OLD.observation_count)
+    BEGIN
+      SELECT RAISE(ABORT, 'sealed acquisition session counters are immutable');
+    END
+    """,
+)
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=1,
@@ -1450,6 +1544,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=4,
         name="planner_decisions_append_only_v4",
         statements=BUSINESS_UNDERSTANDING_V4,
+    ),
+    Migration(
+        version=5,
+        name="terminal_session_child_seal_v5",
+        statements=BUSINESS_UNDERSTANDING_V5,
     ),
 )
 

@@ -13,6 +13,42 @@ from .config import BoundingBox
 from .maps_source import MapsSourceShapeError, official_website
 
 
+def session_child_seal_digest(conn: sqlite3.Connection, session_id: str) -> str:
+    """The deterministic child-set seal for an acquisition session.
+
+    XJ-01: sha256 over the session's sorted evidence ids and sorted
+    observation ids (observations joined through their evidence rows),
+    joined with the \x1f separator. Producers stamp this into
+    acquisition_sessions.child_seal_sha256 at finalization — AFTER the
+    child set exists — and the migration's triggers make the seal and
+    the child set immutable from then on. Readers recompute this digest
+    over the live rows and require equality, so no child can be added,
+    removed, or reshaped after finalization without detection.
+    """
+    import hashlib
+
+    evidence_ids = sorted(
+        str(row[0])
+        for row in conn.execute(
+            "SELECT id FROM evidence_items WHERE acquisition_session_id=?",
+            (session_id,),
+        )
+    )
+    observation_ids = sorted(
+        str(row[0])
+        for row in conn.execute(
+            "SELECT o.id FROM observations o "
+            "JOIN evidence_items e ON e.id=o.evidence_id "
+            "WHERE e.acquisition_session_id=?",
+            (session_id,),
+        )
+    )
+    payload = "\x1f".join(evidence_ids) + "\x1f" + "\x1f".join(
+        observation_ids
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

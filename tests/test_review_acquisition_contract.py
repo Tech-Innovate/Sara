@@ -21,7 +21,7 @@ from sara.understanding_vocabulary import seed_business_understanding_vocabulary
 
 def prepared(path: Path, *, reviews: list[dict] | None = None):
     conn = connect(path)
-    assert apply_migrations(conn) == (1, 2, 3, 4)
+    assert apply_migrations(conn) == (1, 2, 3, 4, 5)
     seed_business_understanding_vocabulary(conn)
     conn.execute(
         "INSERT INTO runs(id,area_name,bbox_json,cell_km,depth,queries_json,scraper_image,"
