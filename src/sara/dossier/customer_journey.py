@@ -690,12 +690,18 @@ def _public_surface_coverage(
     - ``bounded_inspection_no_evaluation``: no current evaluate evidence,
       but at least one absence-safe website session (complete,
       business-wide-scope-eligible, frontier-exhausted on every admitted
-      row) carries current evidence — a bounded inspection of the public
-      surface that found nothing evaluative. ``session_ids`` are those
-      sessions. A stale bounded inspection does not count: the surface
-      may have grown evaluative content since, mirroring the
-      bounded-absence currency contract.
+      row) remains current across its ENTIRE admitted row set. PCJ-01:
+      every supporting row must be current and the row set non-empty —
+      one stale row, evaluative or not, disqualifies the session, so
+      stale positive evaluation evidence can never convert into a
+      current negative coverage judgment.
     - ``not_covered``: neither holds; sufficiency must fail closed.
+
+    ``support`` carries the deterministic coverage-provenance rows
+    (evidence identity, session, retrieval time) for BOTH branches, so
+    assessment chronology and the sealed input signature can include
+    coverage evidence that belongs to no journey stage and generated no
+    fact (PCJ-02).
     """
     evaluate_stage = next(
         (stage for stage in stages if str(stage.get("stage")) == "evaluate"),
@@ -705,15 +711,29 @@ def _public_surface_coverage(
         evaluate_stage is not None
         and evaluate_stage.get("evidence_state") == "observed"
     ):
+        entries = list(evaluate_stage.get("evidence", ()))
         return {
             "state": "evaluation_observed",
             "evidence_ids": sorted(
                 {
                     str(entry.get("evidence_id"))
-                    for entry in evaluate_stage.get("evidence", ())
+                    for entry in entries
                 }
             ),
             "session_ids": [],
+            "support": sorted(
+                (
+                    {
+                        "evidence_id": str(entry.get("evidence_id")),
+                        "acquisition_session_id": str(
+                            entry.get("acquisition_session_id")
+                        ),
+                        "retrieved_at": str(entry.get("retrieved_at")),
+                    }
+                    for entry in entries
+                ),
+                key=lambda item: item["evidence_id"],
+            ),
         }
     rows_by_session: dict[str, list[dict[str, Any]]] = {}
     for row in website_evidence:
@@ -723,18 +743,42 @@ def _public_surface_coverage(
     bounded_current = sorted(
         session_id
         for session_id in absence_safe_sessions
-        if any(
+        if rows_by_session.get(session_id)
+        and all(
             row.get("current")
-            for row in rows_by_session.get(session_id, ())
+            for row in rows_by_session[session_id]
         )
     )
     if bounded_current:
+        support_rows = [
+            row
+            for session_id in bounded_current
+            for row in rows_by_session[session_id]
+        ]
         return {
             "state": "bounded_inspection_no_evaluation",
             "evidence_ids": [],
             "session_ids": bounded_current,
+            "support": sorted(
+                (
+                    {
+                        "evidence_id": str(row["evidence_id"]),
+                        "acquisition_session_id": str(
+                            row["acquisition_session_id"]
+                        ),
+                        "retrieved_at": str(row["retrieved_at"]),
+                    }
+                    for row in support_rows
+                ),
+                key=lambda item: item["evidence_id"],
+            ),
         }
-    return {"state": "not_covered", "evidence_ids": [], "session_ids": []}
+    return {
+        "state": "not_covered",
+        "evidence_ids": [],
+        "session_ids": [],
+        "support": [],
+    }
 
 
 def reconstruct_customer_journey(

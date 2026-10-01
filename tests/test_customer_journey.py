@@ -658,13 +658,17 @@ def test_no_gap_or_quality_vocabulary(tmp_path: Path) -> None:
     }
     assert set(journey) == allowed_doc_keys
     assert set(journey["public_surface_coverage"]) == {
-        "state", "evidence_ids", "session_ids",
+        "state", "evidence_ids", "session_ids", "support",
     }
     assert journey["public_surface_coverage"]["state"] in {
         "evaluation_observed",
         "bounded_inspection_no_evaluation",
         "not_covered",
     }
+    for item in journey["public_surface_coverage"]["support"]:
+        assert set(item) == {
+            "evidence_id", "acquisition_session_id", "retrieved_at",
+        }
     for stage in journey["stages"]:
         assert set(stage) == allowed_stage_keys
         assert stage["evidence_state"] in {
@@ -2289,6 +2293,8 @@ def test_coverage_menu_only_site_is_sufficient(tmp_path: Path) -> None:
     _, coverage = _coverage(conn, entity)
     assert coverage["state"] == "evaluation_observed"
     assert coverage["evidence_ids"] and coverage["session_ids"] == []
+    assert {item["evidence_id"] for item in coverage["support"]} == set(
+        coverage["evidence_ids"])
     state, reason = _journey_state(conn, entity)
     assert state == "sufficient"
     assert reason["code"] == "observable_journey_stages_reconstructed"
@@ -2318,6 +2324,8 @@ def test_coverage_bounded_inspection_without_evaluate_is_sufficient(
     assert coverage["state"] == "bounded_inspection_no_evaluation"
     assert coverage["session_ids"] == [stats.session_id]
     assert coverage["evidence_ids"] == []
+    assert {item["acquisition_session_id"]
+            for item in coverage["support"]} == {stats.session_id}
     state, reason = _journey_state(conn, entity)
     assert state == "sufficient"
     assert reason["public_surface_coverage_state"] == (
@@ -2432,4 +2440,136 @@ def test_v3_derivation_version_sealed_in_assessment(tmp_path: Path) -> None:
         (seal.assessment_id,)).fetchone()[0])
     assert summary["derivation_version"] == "dossier-assessment-v3"
     assert "customer_journey" not in seal.blocking_mandatory_domains
+    conn.close()
+
+
+# PCJ-01: a bounded session whose rows straddle the freshness boundary is
+# not current coverage. Stale evaluate-qualifying rows must not convert
+# into a current negative judgment through a younger non-evaluative row
+# from the same crawl.
+MENU_AND_DETAILS_SITE = {
+    "https://seed.example/": """
+        <link rel="canonical" href="https://seed.example/">
+        <a href="/menu">Menu</a>
+        <a href="/details">Details</a>
+    """,
+    "https://seed.example/menu": "<h1>Grill and Mezzes</h1>",
+    "https://seed.example/details": "<p>Plain page</p>",
+}
+
+
+def test_pcj01_boundary_straddling_session_not_covered(tmp_path: Path) -> None:
+    conn = prepared(tmp_path / "pcj01.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=MENU_AND_DETAILS_SITE)
+    assert stats.status == "complete"
+    assert stats.crawl_frontier_exhausted is True
+    role_times: dict[str, list[datetime]] = {}
+    for retrieved_at, metadata_json in conn.execute(
+        "SELECT retrieved_at, metadata_json FROM evidence_items "
+        "WHERE acquisition_session_id=?",
+        (stats.session_id,),
+    ):
+        role = json.loads(metadata_json).get("page_role")
+        role_times.setdefault(str(role), []).append(
+            datetime.fromisoformat(retrieved_at))
+    evaluative = sorted(role_times["home"] + role_times["offerings"])
+    plain = min(role_times["other"])
+    assert max(evaluative) < plain, "fixture must make evaluate rows older"
+    # evaluate rows fall outside the 30-day window; the plain row stays
+    # inside it — exactly the existential-currency loophole
+    evaluated = (
+        max(evaluative) + timedelta(days=30) + (plain - max(evaluative)) / 2
+    )
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at=evaluated.isoformat())
+    journey = dossier["customer_journey"]
+    evaluate_stage = next(
+        s for s in journey["stages"] if s["stage"] == "evaluate")
+    assert evaluate_stage["evidence_state"] == "stale"
+    coverage = journey["public_surface_coverage"]
+    assert coverage["state"] == "not_covered"
+    assert coverage["session_ids"] == [] and coverage["support"] == []
+    conn.close()
+
+
+# PCJ-02: coverage-supporting website rows that generate no fact and
+# belong to no stage still reach the sealed chronology and facts_as_of.
+def test_pcj02_coverage_only_rows_reach_chronology(tmp_path: Path) -> None:
+    from sara.dossier.assessment import (
+        _chronology_inputs,
+        _customer_journey_signature,
+        _location_owner_resolution_state,
+        _provenance_record_state,
+        _structural_subject_state,
+    )
+
+    conn = prepared(tmp_path / "pcj02.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=None,
+                    client_factory=_redirect_client_factory(
+                        ROOT_REDIRECT_ROUTE))
+    assert stats.status == "complete"
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    journey = dossier["customer_journey"]
+    coverage = journey["public_surface_coverage"]
+    assert coverage["state"] == "bounded_inspection_no_evaluation"
+    assert coverage["support"], "bounded coverage must expose provenance"
+    row_ids = {row[0] for row in conn.execute(
+        "SELECT id FROM evidence_items WHERE acquisition_session_id=?",
+        (stats.session_id,))}
+    assert {item["evidence_id"] for item in coverage["support"]} == row_ids
+    assert all(
+        set(item) == {
+            "evidence_id", "acquisition_session_id", "retrieved_at",
+        }
+        for item in coverage["support"]
+    )
+
+    # the sealed journey signature carries the provenance rows
+    sealed = _customer_journey_signature(journey)["public_surface_coverage"]
+    assert sealed["support"] == sorted(
+        coverage["support"], key=lambda item: item["evidence_id"])
+
+    # chronology includes a coverage-labeled entry per support row, and
+    # the persisted watermark is not earlier than the newest such row
+    chronology = _chronology_inputs(
+        dossier,
+        _location_owner_resolution_state(conn, dossier),
+        _structural_subject_state(conn, dossier),
+        _provenance_record_state(conn, dossier),
+    )
+    labels = {str(item["field"]) for item in chronology}
+    journey_labels = [l for l in labels if l.startswith("customer journey")]
+    stage_evidence_ids = {
+        str(entry.get("evidence_id"))
+        for stage in journey["stages"]
+        for entry in stage.get("evidence", ())
+    }
+    for item in coverage["support"]:
+        # every coverage-supporting row is incorporated under SOME
+        # journey chronology label (stage evidence or coverage)
+        assert any(item["evidence_id"] in l for l in journey_labels), item
+    coverage_only = (
+        {item["evidence_id"] for item in coverage["support"]}
+        - stage_evidence_ids
+    )
+    assert coverage_only, "fixture must include a stage-less coverage row"
+    for evidence_id in coverage_only:
+        # rows that no stage claims enter through the coverage route only
+        assert any(
+            evidence_id in l and "public_surface_coverage" in l
+            for l in journey_labels
+        ), evidence_id
+    newest_row = max(
+        datetime.fromisoformat(item["retrieved_at"])
+        for item in coverage["support"]
+    )
+    seal = persist_dossier_assessment(
+        conn, entity_id=entity, now=lambda: "2026-09-26T12:30:00+00:00")
+    facts_as_of = conn.execute(
+        "SELECT facts_as_of FROM dossier_assessments WHERE id=?",
+        (seal.assessment_id,)).fetchone()[0]
+    assert datetime.fromisoformat(facts_as_of) >= newest_row
     conn.close()
