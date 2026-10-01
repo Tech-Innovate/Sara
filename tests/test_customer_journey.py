@@ -437,6 +437,11 @@ def _forge_website_session(
             "INSERT INTO sources(id,source_type,name,base_url,created_at,active) "
             "VALUES ('src_official_web','official_website','Official website',NULL,"
             "'2026-01-01T00:00:00+00:00',1)")
+    action_predicates = {
+        "booking": "capability.online_booking",
+        "ordering": "capability.online_ordering",
+        "whatsapp": "capability.whatsapp",
+    }
     config = wcanonical(
         {
             "entity_id": entity,
@@ -458,6 +463,12 @@ def _forge_website_session(
     )
     config_hash = wsha(config)
     session_id = wopaque("acq", entity, started_at, config_hash)
+    total_observations = sum(
+        1
+        for candidate_list in [c for _, _, c in pages]
+        for candidate in candidate_list
+        if candidate["channel_type"] in action_predicates
+    )
     conn.execute(
         "INSERT INTO acquisition_sessions("
         "id,target_subject_id,source_id,collector_name,collector_version,"
@@ -466,10 +477,29 @@ def _forge_website_session(
         ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (session_id, entity, "src_official_web", "sara.website",
          COLLECTOR_VERSION, config, config_hash, "complete",
-         started_at, started_at, None, None, len(pages), 0))
+         started_at, started_at, None, None, len(pages),
+         total_observations))
     for index, (final_url, content, channels) in enumerate(pages):
         content_sha = wsha(content)
         evidence_id = wopaque("ev", session_id, final_url, content_sha)
+        # Producer-faithful: the parser detects an action channel iff the
+        # page carries it, and the producer then emits the matching
+        # capability observation bound to this evidence row.
+        observation_ids = []
+        pending_observations = []
+        for candidate in channels:
+            predicate = action_predicates.get(candidate["channel_type"])
+            if predicate is None:
+                continue
+            value_json = wcanonical(True)
+            observation_id = wopaque(
+                "obs", evidence_id, predicate, wsha(value_json))
+            pending_observations.append(
+                (observation_id, entity, predicate, evidence_id,
+                 value_json, value_json, wsha(value_json),
+                 "detected_capability", started_at, started_at,
+                 "heuristic", "sara.website", "5", 0.8, started_at))
+            observation_ids.append(observation_id)
         metadata = (
             "not-json-at-all"
             if bad_metadata and index == 0
@@ -488,7 +518,7 @@ def _forge_website_session(
                     "title": None,
                     "canonical_url": final_url,
                     "channels": channels,
-                    "observation_ids": [],
+                    "observation_ids": sorted(observation_ids),
                 }
             )
         )
@@ -499,6 +529,15 @@ def _forge_website_session(
             ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
             (evidence_id, session_id, "src_official_web", final_url,
              "official", started_at, content_sha, metadata, started_at))
+        for row in pending_observations:
+            conn.execute(
+                "INSERT INTO observations("
+                "id,subject_id,predicate,evidence_id,value_json,"
+                "normalized_value_json,value_hash,observation_kind,"
+                "observed_at,extracted_at,extraction_method,extractor_name,"
+                "extractor_version,confidence,created_at"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                row)
     conn.commit()
     return session_id
 
@@ -1018,18 +1057,98 @@ def test_unsupported_website_version_is_silently_out_of_scope(tmp_path: Path) ->
          config, wsha(config), "complete", started_at, started_at,
          None, None, 0, 0))
     conn.commit()
+    # R4: the v4 session carries a UNIQUE booking endpoint; exclusion is
+    # asserted through acquisition_session_id (the reviewer-corrected
+    # contract — evidence ids can never equal session ids) and through
+    # the endpoint never surfacing in any channel.
+    from sara.website.model import (
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    page_url = "https://legacy.example/booking"
+    content = "legacy booking page"
+    content_sha = wsha(content)
+    evidence_id = wopaque("ev", session_id, page_url, content_sha)
+    booking_channel = [{
+        "channel_type": "booking",
+        "identifier": "https://booksy.com/legacy-v4",
+        "normalized_identifier": "https://booksy.com/legacy-v4",
+        "url": "https://booksy.com/legacy-v4",
+        "extraction": "action_link",
+        "canonicalized_channel_id": None,
+        "canonicalized_scope": None,
+    }]
+    observation_json = wcanonical(True)
+    observation_id = wopaque(
+        "obs", evidence_id, "capability.online_booking",
+        wsha(observation_json))
+    metadata = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://legacy.example/",
+            "requested_url": page_url,
+            "final_url": page_url,
+            "crawl_depth": 0,
+            "page_role": "booking",
+            "home_page": False,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": None,
+            "canonical_url": page_url,
+            "channels": booking_channel,
+            "observation_ids": [observation_id],
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (evidence_id, session_id, "src_official_web", page_url, "official",
+         started_at, content_sha, metadata, started_at))
+    conn.execute(
+        "INSERT INTO observations("
+        "id,subject_id,predicate,evidence_id,value_json,"
+        "normalized_value_json,value_hash,observation_kind,"
+        "observed_at,extracted_at,extraction_method,extractor_name,"
+        "extractor_version,confidence,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (observation_id, entity, "capability.online_booking", evidence_id,
+         observation_json, observation_json, wsha(observation_json),
+         "detected_capability", started_at, started_at, "heuristic",
+         "sara.website", "4", 0.8, started_at))
+    conn.execute(
+        "UPDATE acquisition_sessions SET evidence_count=1, observation_count=1 "
+        "WHERE id=?", (session_id,))
+    conn.commit()
     dossier = build_business_dossier(
         conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
     codes = {i["code"] for i in dossier["integrity_issues"]}
     assert "customer_journey_website_session_invalid" not in codes
     assert "customer_journey_website_evidence_invalid" not in codes
-    # Out of scope means not used, not flagged.
-    used = {
-        entry["evidence_id"]
+    # Out of scope means not used, not flagged — asserted through the
+    # session id, which CAN legitimately appear in evidence entries.
+    used_sessions = {
+        entry["acquisition_session_id"]
         for stage in dossier["customer_journey"]["stages"]
         for entry in stage["evidence"]
     }
-    assert session_id not in used
+    assert session_id not in used_sessions
+    all_channels = {
+        (c["identifier"], c["normalized_identifier"])
+        for stage in dossier["customer_journey"]["stages"]
+        for c in stage["channels"]
+    }
+    assert ("https://booksy.com/legacy-v4", "https://booksy.com/legacy-v4") not in (
+        all_channels
+    )
+    assert not any(
+        h["evidence_id"] == evidence_id
+        for h in dossier["customer_journey"]["handoffs"]
+    )
     conn.close()
 
 
@@ -1111,6 +1230,13 @@ def test_future_version_with_extra_config_keys_stays_admissible(tmp_path: Path) 
             "screenshot_ref": "x",  # hypothetical v6 metadata addition
         }
     )
+    # Producer-faithful: the booking channel implies its capability
+    # observation on this row (R1 seal).
+    value_json = wcanonical(True)
+    observation_id = wopaque(
+        "obs", evidence_id, "capability.online_booking", wsha(value_json))
+    metadata = wcanonical(
+        json.loads(metadata) | {"observation_ids": [observation_id]})
     conn.execute(
         "INSERT INTO evidence_items("
         "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
@@ -1119,7 +1245,19 @@ def test_future_version_with_extra_config_keys_stays_admissible(tmp_path: Path) 
         (evidence_id, session_id, "src_official_web", page_url, "official",
          started_at, content_sha, metadata, started_at))
     conn.execute(
-        "UPDATE acquisition_sessions SET evidence_count=1 WHERE id=?",
+        "INSERT INTO observations("
+        "id,subject_id,predicate,evidence_id,value_json,"
+        "normalized_value_json,value_hash,observation_kind,"
+        "observed_at,extracted_at,extraction_method,extractor_name,"
+        "extractor_version,confidence,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (observation_id, entity, "capability.online_booking", evidence_id,
+         value_json, value_json, wsha(value_json), "detected_capability",
+         started_at, started_at, "heuristic", "sara.website", "6",
+         0.8, started_at))
+    conn.execute(
+        "UPDATE acquisition_sessions SET evidence_count=1, observation_count=1 "
+        "WHERE id=?",
         (session_id,))
     conn.commit()
     dossier = build_business_dossier(
@@ -1530,6 +1668,308 @@ def test_explicit_stale_status_fact_remains_contribution(tmp_path: Path) -> None
     contact = next(s for s in doc["stages"] if s["stage"] == "contact")
     assert contact["evidence_state"] == "stale"
     assert contact["evidence"], "historical surface retained"
+    conn.close()
+
+
+
+# ---- R1-R4 decisive regressions (frozen review, exact head fd8a2e0) ----
+
+def test_full_shape_booking_child_with_empty_observations_invalid(tmp_path: Path) -> None:
+    """R1: the reviewer's third case — complete metadata contract,
+    deterministic id, booking channel, observation_ids=[], zero attached
+    observations, corrected counters. Impossible producer output (the
+    parser emits a booking observation whenever a booking channel
+    exists); the semantic seal rejects it."""
+    from sara.website.model import canonical_json as wcanonical
+    from sara.website.model import opaque_id as wopaque, sha256_text as wsha
+
+    conn = prepared(tmp_path / "forged3.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=BOOKING_SITE)
+    session_id = stats.session_id
+    stored = conn.execute(
+        "SELECT evidence_count FROM acquisition_sessions WHERE id=?",
+        (session_id,)).fetchone()[0]
+    forged_url = "https://seed.example/forged3"
+    forged_content = "forged3 body"
+    forged_sha = wsha(forged_content)
+    forged_id = wopaque("ev", session_id, forged_url, forged_sha)
+    metadata = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://seed.example/",
+            "requested_url": forged_url,
+            "final_url": forged_url,
+            "crawl_depth": 0,
+            "page_role": "booking",
+            "home_page": False,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": None,
+            "canonical_url": forged_url,
+            "channels": [{
+                "channel_type": "booking",
+                "identifier": "https://booksy.com/forged3",
+                "normalized_identifier": "https://booksy.com/forged3",
+                "url": "https://booksy.com/forged3",
+                "extraction": "action_link",
+                "canonicalized_channel_id": None,
+                "canonicalized_scope": None,
+            }],
+            "observation_ids": [],
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,'https://seed.example/forged3','official','usable',"
+        "?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (forged_id, session_id, "src_official_web",
+         "2026-09-26T12:00:09+00:00", forged_sha, metadata,
+         "2026-09-26T12:00:09+00:00"))
+    conn.execute(
+        "UPDATE acquisition_sessions SET evidence_count=? WHERE id=?",
+        (stored + 1, session_id))
+    conn.commit()
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    assert any(
+        i["code"] == "customer_journey_website_evidence_invalid"
+        and i["evidence_id"] == forged_id
+        for i in dossier["integrity_issues"]
+    )
+    channels = {
+        (c["identifier"], c["normalized_identifier"])
+        for stage in dossier["customer_journey"]["stages"]
+        for c in stage["channels"]
+    }
+    assert ("https://booksy.com/forged3", "https://booksy.com/forged3") not in (
+        channels
+    )
+    assert not any(
+        h["evidence_id"] == forged_id
+        for h in dossier["customer_journey"]["handoffs"]
+    )
+    conn.close()
+
+
+def test_absence_on_complete_nonexhausted_session_not_bounded(tmp_path: Path) -> None:
+    """R2: absence support bound to the producer's actual contract — a
+    genuine v5 complete, scope-eligible session with
+    crawl_frontier_exhausted=False cannot establish journey bounded
+    not-observed."""
+    from sara.dossier.customer_journey import reconstruct_customer_journey
+    from sara.website.model import (
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    conn = prepared(tmp_path / "absence2.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    stats = acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    absence_fact = next(
+        fact for fact in dossier["facts"]
+        if fact["predicate"] == "capability.online_booking"
+        and fact["status"] == "not_observed")
+    support = absence_fact["acquisition_support"][0]
+
+    # A producer-valid v5 complete scope-eligible session whose crawl was
+    # budget-truncated: frontier_exhausted=False on every row.
+    forged_session = "acq_nonexhausted_probe"
+    config = wcanonical(
+        {
+            "entity_id": entity,
+            "start_url": "https://seed.example/",
+            "page_limit": 8, "depth_limit": 2,
+            "max_response_bytes": 1048576, "timeout_seconds": 10.0,
+            "request_interval_seconds": 1.0,
+            "max_policy_delay_seconds": 30.0,
+            "retry_attempt_limit": 4, "retry_base_delay_seconds": 1.0,
+            "retry_max_delay_seconds": 30.0,
+            "retry_delay_budget_seconds": 60.0,
+            "user_agent": "SaraBusinessUnderstanding/1.0",
+            "obey_robots": True,
+            "evidence_root": "/tmp/ev",
+        }
+    )
+    started_at = "2026-09-26T12:10:00+00:00"
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (forged_session, entity, "src_official_web", "sara.website", "5",
+         config, wsha(config), "complete", started_at, started_at,
+         None, None, 1, 0))
+    page_url = "https://seed.example/"
+    content_sha = wsha("home")
+    evidence_id = wopaque("ev", forged_session, page_url, content_sha)
+    metadata = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": page_url,
+            "requested_url": page_url,
+            "final_url": page_url,
+            "crawl_depth": 0,
+            "page_role": "home",
+            "home_page": True,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": False,  # budget-truncated
+            "title": None,
+            "canonical_url": page_url,
+            "channels": [],
+            "observation_ids": [],
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (evidence_id, forged_session, "src_official_web", page_url,
+         "official", started_at, content_sha, metadata, started_at))
+    conn.commit()
+
+    facts = [dict(f) for f in dossier["facts"]]
+    for index, fact in enumerate(facts):
+        if fact["id"] == absence_fact["id"]:
+            patched = dict(fact)
+            patched_support = dict(support)
+            patched_support["acquisition_session_id"] = forged_session
+            patched["acquisition_support"] = [patched_support]
+            facts[index] = patched
+    doc, _ = reconstruct_customer_journey(
+        conn, entity_id=entity, facts=facts, evidence=dossier["evidence"],
+        evaluated_at="2026-09-26T12:30:00+00:00")
+    book_order = next(s for s in doc["stages"] if s["stage"] == "book_order")
+    assert book_order["evidence_state"] == "unknown"
+    assert book_order["evidence_state"] != "not_observed_in_bounded_inspection"
+    conn.close()
+
+
+def test_domain_move_never_reclassifies_old_same_site_link(tmp_path: Path) -> None:
+    """R3: a historical booking link that was SAME-SITE at source time
+    (old.example/book on old.example) must not become an external
+    hand-off after the business moves to a new domain — even while the
+    old evidence is still inside the currency window."""
+    from sara.website.model import (
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    conn = prepared(tmp_path / "domainmove.sqlite")
+    entity = business_entity_id_for_maps_business(1)
+    # Current, real crawl on seed.example: today's website fact host.
+    acquire(conn, tmp_path, pages=MENU_ONLY_SITE)
+    # A producer-valid historical session on the OLD domain whose booking
+    # link is SAME-SITE under that old domain.
+    config = wcanonical(
+        {
+            "entity_id": entity,
+            "start_url": "https://old.example/",
+            "page_limit": 8, "depth_limit": 2,
+            "max_response_bytes": 1048576, "timeout_seconds": 10.0,
+            "request_interval_seconds": 1.0,
+            "max_policy_delay_seconds": 30.0,
+            "retry_attempt_limit": 4, "retry_base_delay_seconds": 1.0,
+            "retry_max_delay_seconds": 30.0,
+            "retry_delay_budget_seconds": 60.0,
+            "user_agent": "SaraBusinessUnderstanding/1.0",
+            "obey_robots": True,
+            "evidence_root": "/tmp/ev",
+        }
+    )
+    started_at = "2026-09-26T12:20:00+00:00"
+    old_session = wopaque("acq", entity, started_at, wsha(config))
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (old_session, entity, "src_official_web", "sara.website", "5",
+         config, wsha(config), "complete", started_at, started_at,
+         None, None, 1, 1))
+    page_url = "https://old.example/book"
+    content_sha = wsha("old booking page")
+    evidence_id = wopaque("ev", old_session, page_url, content_sha)
+    observation_json = wcanonical(True)
+    observation_id = wopaque(
+        "obs", evidence_id, "capability.online_booking",
+        wsha(observation_json))
+    metadata = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://old.example/",
+            "requested_url": page_url,
+            "final_url": page_url,
+            "crawl_depth": 0,
+            "page_role": "booking",
+            "home_page": False,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": None,
+            "canonical_url": page_url,
+            "channels": [{
+                "channel_type": "booking",
+                "identifier": "https://old.example/book",
+                "normalized_identifier": "https://old.example/book",
+                "url": "https://old.example/book",
+                "extraction": "action_link",
+                "canonicalized_channel_id": None,
+                "canonicalized_scope": None,
+            }],
+            "observation_ids": [observation_id],
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,status,retrieved_at,"
+        "published_at,language,media_type,content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (evidence_id, old_session, "src_official_web", page_url, "official",
+         started_at, content_sha, metadata, started_at))
+    conn.execute(
+        "INSERT INTO observations("
+        "id,subject_id,predicate,evidence_id,value_json,"
+        "normalized_value_json,value_hash,observation_kind,"
+        "observed_at,extracted_at,extraction_method,extractor_name,"
+        "extractor_version,confidence,created_at"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (observation_id, entity, "capability.online_booking", evidence_id,
+         observation_json, observation_json, wsha(observation_json),
+         "detected_capability", started_at, started_at, "heuristic",
+         "sara.website", "5", 0.8, started_at))
+    conn.commit()
+    dossier = build_business_dossier(
+        conn, entity_id=entity, evaluated_at="2026-09-26T12:30:00+00:00")
+    journey = dossier["customer_journey"]
+    # The old evidence IS admitted and current (booking channel present on
+    # the book_order stage)...
+    book_order = next(s for s in journey["stages"] if s["stage"] == "book_order")
+    assert book_order["evidence_state"] == "observed"
+    assert any(
+        c["normalized_identifier"] == "https://old.example/book"
+        for c in book_order["channels"]
+    )
+    # ...but NO hand-off to old.example/book exists: at source time it was
+    # a same-site action link, and today's seed.example fact must not
+    # reclassify it as an external booking endpoint.
+    assert not any(
+        h["from"] == "official_website"
+        and h["to"] == "booking"
+        and h["evidence_id"] == evidence_id
+        for h in journey["handoffs"]
+    )
     conn.close()
 
 

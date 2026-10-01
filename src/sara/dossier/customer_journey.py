@@ -72,6 +72,20 @@ _WEBSITE_EVIDENCE_REQUIRED_METADATA_KEYS = frozenset({
 #: not-observed (RCJ-01).
 _ABSENCE_SAFE_WEBSITE_VERSION = 5
 
+#: Positive-evidence compatible website collector versions: every version
+#: from the absence-safe era onward, whose producer output this reader
+#: structurally verifies (config/metadata contracts, deterministic ids,
+#: observation seals). OLDER versions are silently out of scope for
+#: journey evidence — never integrity failures — and future versions are
+#: admitted by the same structural verification (R4). The lower bound
+#: and the absence-safe bound are deliberately the same era.
+def _positive_evidence_version(version: object) -> bool:
+    try:
+        parsed = int(str(version))
+    except (TypeError, ValueError):
+        return False
+    return parsed >= _ABSENCE_SAFE_WEBSITE_VERSION
+
 _SOCIAL_CHANNEL_TYPES = {
     "instagram", "facebook", "linkedin", "x", "tiktok", "youtube",
 }
@@ -159,14 +173,18 @@ def _entity_lineage(conn: sqlite3.Connection, entity_id: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
-def _bounded_absence_current(fact: dict[str, Any]) -> bool:
-    """Bounded not-observed for the journey: the value was not observed,
-    the inspection is current, and a complete bounded acquisition session
-    of the WEBSITE collector at an absence-safe version (>= v5, when
-    frontier-exhaustion semantics became trustworthy) supports the
-    absence claim. never absence. (RCJ-01: pre-v5 exhaustion and
-    non-website acquisitions cannot establish journey bounded
-    not-observed.)"""
+def _bounded_absence_current(
+    fact: dict[str, Any], absence_safe_sessions: frozenset[str]
+) -> bool:
+    """Bounded not-observed for the journey, bound to the producer's own
+    absence contract (R2): the value was not observed, the inspection is
+    current, and the absence is supported by a session that the journey
+    reader has ALREADY producer-verified AND that satisfies the exact
+    conditions under which the website collector claims absence —
+    status complete, business-wide scope eligible, frontier exhausted,
+    website collector at an absence-safe version (>= v5). A complete but
+    budget-truncated or scope-ineligible session can never establish
+    bounded not-observed. never absence."""
     return (
         fact["status"] == "not_observed"
         and not bool(fact["freshness"]["is_stale"])
@@ -177,6 +195,8 @@ def _bounded_absence_current(fact: dict[str, Any]) -> bool:
             and str(support.get("source_id")) == _OFFICIAL_WEB_SOURCE_ID
             and str(support.get("collector_name")) == _WEBSITE_COLLECTOR_NAME
             and _absence_safe_version(support.get("collector_version"))
+            and str(support.get("acquisition_session_id"))
+            in absence_safe_sessions
             for support in fact["acquisition_support"]
         )
     )
@@ -307,6 +327,10 @@ def _load_website_evidence(
         target = str(session["target_subject_id"] or "")
         if target not in lineage_set:
             continue  # CJ-01: another Entity's acquisition — not ours
+        # R4: versions before the compatible era are silently out of
+        # scope for positive journey evidence — not integrity failures.
+        if not _positive_evidence_version(session["collector_version"]):
+            continue
         # RCJ-02: source-time acquisition identity. The producer writes
         # source_id=src_official_web, legacy_run_id=NULL, and the SAME
         # source-time Entity into target and config. Convergence admits
@@ -487,11 +511,51 @@ def _load_website_evidence(
                 row_invalid = True
         else:
             row_invalid = True
+        # R1: PRODUCER-SEMANTIC SEAL. The parser sets booking/ordering/
+        # whatsapp detection iff the page carries a channel of that type,
+        # and the producer then emits the matching capability observation
+        # bound to THIS evidence row. A row declaring an action channel
+        # with no matching attached observation is impossible producer
+        # output — however perfect its shape — and is never admissible.
+        channel_observation_predicates = set()
+        for candidate in channels:
+            if candidate["channel_type"] == "booking":
+                channel_observation_predicates.add("capability.online_booking")
+            elif candidate["channel_type"] == "ordering":
+                channel_observation_predicates.add("capability.online_ordering")
+            elif candidate["channel_type"] == "whatsapp":
+                channel_observation_predicates.add("capability.whatsapp")
+        if channel_observation_predicates:
+            actual_predicates = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT o.predicate FROM observations o "
+                    "WHERE o.evidence_id=?",
+                    (evidence_id,),
+                ).fetchall()
+            }
+            if not channel_observation_predicates <= actual_predicates:
+                row_invalid = True
         retrieved_at = _parse_instant(
             item["retrieved_at"],
             field=f"website evidence {evidence_id} retrieved_at",
         )
         if retrieved_at is None:
+            row_invalid = True
+        if row_invalid:
+            issues.append(
+                {"code": "customer_journey_website_evidence_invalid",
+                 "evidence_id": evidence_id}
+            )
+            continue
+        scope_eligible = metadata.get("business_wide_scope_eligible")
+        frontier_exhausted = metadata.get("crawl_frontier_exhausted")
+        if not isinstance(scope_eligible, bool):
+            row_invalid = True
+        if not isinstance(frontier_exhausted, bool):
+            row_invalid = True
+        start_url = metadata.get("start_url")
+        if not isinstance(start_url, str) or not start_url:
             row_invalid = True
         if row_invalid:
             issues.append(
@@ -518,6 +582,12 @@ def _load_website_evidence(
                 ),
                 "page_role": page_role,
                 "channels": channels,
+                # Verified producer flags + the row's SOURCE-TIME site
+                # identity (R2/R3): the hand-off same-site test uses this
+                # start_url, never today's website fact.
+                "business_wide_scope_eligible": scope_eligible,
+                "crawl_frontier_exhausted": frontier_exhausted,
+                "start_url": start_url,
                 "current": 0 <= age_days <= _JOURNEY_EVIDENCE_FRESHNESS_DAYS,
             }
         )
@@ -554,27 +624,6 @@ def _channel_entry(
         "scope": scope,
         "evidence_id": evidence_id,
     }
-
-
-def _official_site_host(facts: list[dict[str, Any]]) -> str | None:
-    from urllib.parse import urlsplit
-
-    supported = [fact for fact in facts if _supported_fact(fact)]
-    for fact in supported:
-        if fact["predicate"] != "business.website.official":
-            continue
-        value = fact.get("value")
-        if not isinstance(value, str) or not value:
-            continue
-        try:
-            host = urlsplit(value).hostname or ""
-        except ValueError:
-            continue
-        host = host.lower().rstrip(".")
-        if host.startswith("www."):
-            host = host[4:]
-        return host or None
-    return None
 
 
 def _website_channel_candidates(
@@ -657,8 +706,6 @@ def reconstruct_customer_journey(
             for fact in facts_by_predicate.get(predicate, [])
             if fact["status"] == "conflicted"
         ]
-
-    official_site_host = _official_site_host(facts)
 
     # ---- contributions per stage -------------------------------------
     # Each contribution: {"current": bool, "channels": [...], "evidence": [...]}
@@ -966,12 +1013,30 @@ def reconstruct_customer_journey(
         )
 
     # ---- bounded absence for book_order ------------------------------
+    # R2: sessions that actually satisfy the producer's absence contract
+    # — producer-verified by the journey reader, status complete, and
+    # EVERY retained row reports business-wide scope eligibility and
+    # frontier exhaustion (the producer writes these flags per row,
+    # constant across one crawl).
+    absence_safe_sessions = frozenset(
+        session_id
+        for session_id in sorted({
+            row["acquisition_session_id"] for row in website_evidence
+        })
+        if all(
+            row["acquisition_status"] == "complete"
+            and row["business_wide_scope_eligible"]
+            and row["crawl_frontier_exhausted"]
+            for row in website_evidence
+            if row["acquisition_session_id"] == session_id
+        )
+    )
     booking_absent = any(
-        _bounded_absence_current(fact)
+        _bounded_absence_current(fact, absence_safe_sessions)
         for fact in facts_by_predicate.get("capability.online_booking", [])
     )
     ordering_absent = any(
-        _bounded_absence_current(fact)
+        _bounded_absence_current(fact, absence_safe_sessions)
         for fact in facts_by_predicate.get("capability.online_ordering", [])
     )
     book_order_bounded_absence = booking_absent and ordering_absent
@@ -983,6 +1048,19 @@ def reconstruct_customer_journey(
         "book_order": [], "contact": [],
     }
     website_handoff_channel_currency: dict[tuple[str, str], bool] = {}
+    from urllib.parse import urlsplit as _urlsplit
+
+    def _host_of(url: object) -> str | None:
+        if not isinstance(url, str) or not url:
+            return None
+        try:
+            host = (_urlsplit(url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            return None
+        if host.startswith("www."):
+            host = host[4:]
+        return host or None
+
     for channel_type, stage in (
         ("booking", "book_order"),
         ("ordering", "book_order"),
@@ -994,21 +1072,16 @@ def reconstruct_customer_journey(
         for candidate, row in _website_channel_candidates(
             website_evidence, channel_type=channel_type, current_only=False
         ):
-            target_host = None
-            if isinstance(candidate.get("url"), str) and candidate["url"]:
-                from urllib.parse import urlsplit as _urlsplit
-
-                try:
-                    target_host = (_urlsplit(candidate["url"]).hostname or "").lower()
-                except ValueError:
-                    target_host = None
-            if official_site_host and target_host:
-                normalized_target = target_host.rstrip(".")
-                if normalized_target.startswith("www."):
-                    normalized_target = normalized_target[4:]
-                if normalized_target == official_site_host:
-                    # Same-site action link: booking evidence, not a
-                    # hand-off to an external endpoint.
+            # R3: the same-site/external decision uses the row's VERIFIED
+            # SOURCE-TIME site (producer start_url), never today's
+            # website fact — a later domain move must not reclassify a
+            # historical same-site action link as an external hand-off.
+            source_time_host = _host_of(row.get("start_url"))
+            target_host = _host_of(candidate.get("url"))
+            if source_time_host and target_host:
+                if target_host == source_time_host:
+                    # Same-site action link at source time: booking
+                    # evidence, not a hand-off to an external endpoint.
                     continue
             handoffs.append(
                 {
