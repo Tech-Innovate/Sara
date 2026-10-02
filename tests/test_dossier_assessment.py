@@ -518,6 +518,10 @@ def test_provenance_invalid_only_support_stays_insufficient(
     legacy_sid, legacy_eid = _forge_legacy_unsealed_session(
         conn, entity, "2026-09-27T10:00:00+00:00")
     stamp = "2026-09-27T10:00:00+00:00"
+    from sara.website.model import sha256_text as wsha
+    value_hash = wsha("true")  # matching observation/fact value hashes:
+    # no unrelated support_observation_value_mismatch may contaminate
+    # this regression (PR24-T1)
     conn.execute(
         "INSERT INTO observations("
         "id,subject_id,predicate,evidence_id,value_json,"
@@ -528,7 +532,7 @@ def test_provenance_invalid_only_support_stays_insufficient(
         "'detected_capability', ?, ?, 'heuristic', 'sara.website', '5', "
         "0.8, ?)",
         (entity, "capability.whatsapp", legacy_eid,
-         "a" * 64, stamp, stamp, stamp))
+         value_hash, stamp, stamp, stamp))
     conn.execute(
         "INSERT INTO facts("
         "id,subject_id,predicate,fact_slot,value_json,"
@@ -537,7 +541,7 @@ def test_provenance_invalid_only_support_stays_insufficient(
         ") VALUES ('fact_legacy_dep',?, 'capability.whatsapp', "
         "'__single__', 'true', 'true', ?, 'single_source', ?, NULL, ?, ?, "
         "'legacy-test', ?)",
-        (entity, "b" * 64, stamp, stamp, stamp, stamp))
+        (entity, value_hash, stamp, stamp, stamp, stamp))
     conn.execute(
         "INSERT INTO fact_observation_support(fact_id,observation_id,"
         "support_role) VALUES ('fact_legacy_dep','obs_legacy_dep',"
@@ -548,9 +552,9 @@ def test_provenance_invalid_only_support_stays_insufficient(
 
     dossier = build_business_dossier(
         conn, business_id=1, evaluated_at="2026-09-28T11:30:00+00:00")
-    assert any(
-        str(i["code"]) == "customer_journey_website_session_invalid"
-        for i in dossier["integrity_issues"])
+    # the invalid historical session is the ONLY integrity issue class
+    assert {str(i["code"]) for i in dossier["integrity_issues"]} == {
+        "customer_journey_website_session_invalid"}
     seal = persist_dossier_assessment(
         conn, business_id=1, now=lambda: "2026-09-28T11:30:00+00:00")
     row = conn.execute(
@@ -566,6 +570,139 @@ def test_provenance_invalid_only_support_stays_insufficient(
     assert "provenance" in seal.blocking_mandatory_domains
     conn.close()
 
+
+
+# 2a. PR24-01 adversarial: invalid-session `supports` + valid-session
+# `contradicts` must NOT count as independent support
+def test_provenance_invalid_supports_with_valid_contradicts_dependent(
+        tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "prov-contradicts.sqlite",
+                     migrations=MIGRATIONS[:4])
+    entity = _entity_of(conn)
+    legacy_sid, legacy_eid = _forge_legacy_unsealed_session(
+        conn, entity, "2026-09-27T10:00:00+00:00")
+    assert apply_migrations(conn) == (5,)
+    seed_business_understanding_vocabulary(conn)
+    # the valid, usable, non-invalid evidence is the Maps snapshot
+    valid_eid = conn.execute(
+        "SELECT e.id FROM evidence_items e JOIN acquisition_sessions a "
+        "ON a.id=e.acquisition_session_id WHERE e.source_id="
+        "'src_google_maps' AND e.status='usable' LIMIT 1").fetchone()[0]
+    stamp = "2026-09-27T10:00:00+00:00"
+    from sara.website.model import sha256_text as wsha
+    value_hash = wsha("true")
+    for obs_id, evidence_id in (("obs_inv_sup", legacy_eid),
+                                ("obs_val_con", valid_eid)):
+        conn.execute(
+            "INSERT INTO observations("
+            "id,subject_id,predicate,evidence_id,value_json,"
+            "normalized_value_json,value_hash,observation_kind,observed_at,"
+            "extracted_at,extraction_method,extractor_name,"
+            "extractor_version,confidence,created_at"
+            ") VALUES (?,?,?,?,'true','true',?,'detected_capability',"
+            "?,?, 'heuristic', 'sara.website', '5', 0.8, ?)",
+            (obs_id, entity, "capability.whatsapp", evidence_id,
+             value_hash, stamp, stamp, stamp))
+    conn.execute(
+        "INSERT INTO facts("
+        "id,subject_id,predicate,fact_slot,value_json,"
+        "normalized_value_json,value_hash,status,valid_from,valid_to,"
+        "last_verified_at,reconciled_at,reconciliation_version,created_at"
+        ") VALUES ('fact_contra',?, 'capability.whatsapp', '__single__', "
+        "'true', 'true', ?, 'single_source', ?, NULL, ?, ?, "
+        "'legacy-test', ?)",
+        (entity, value_hash, stamp, stamp, stamp, stamp))
+    # the ONLY affirmative (supports) edge sits on the invalid session;
+    # the valid session carries a contradicts edge, which must never
+    # substitute for support
+    conn.execute(
+        "INSERT INTO fact_observation_support(fact_id,observation_id,"
+        "support_role) VALUES ('fact_contra','obs_inv_sup','supports')")
+    conn.execute(
+        "INSERT INTO fact_observation_support(fact_id,observation_id,"
+        "support_role) VALUES ('fact_contra','obs_val_con','contradicts')")
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn, business_id=1, evaluated_at="2026-09-28T11:30:00+00:00")
+    assert {str(i["code"]) for i in dossier["integrity_issues"]} == {
+        "customer_journey_website_session_invalid"}
+    seal = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:30:00+00:00")
+    row = conn.execute(
+        "SELECT state, reason_json FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='provenance'",
+        (seal.assessment_id,)).fetchone()
+    assert row[0] == "insufficient"
+    reason = json.loads(row[1])
+    assert reason["material_items_dependent_on_invalid_sessions"] == [
+        {"kind": "fact", "id": "fact_contra",
+         "predicate": "capability.whatsapp"}]
+    conn.close()
+
+
+# 2b. PR24-01 adversarial: invalid-session `supports_absence` + a valid
+# session's `searched`/`context` edges must NOT count as independent
+def test_provenance_invalid_absence_with_valid_searched_dependent(
+        tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "prov-absence.sqlite",
+                     migrations=MIGRATIONS[:4])
+    entity = _entity_of(conn)
+    legacy_sid, legacy_eid = _forge_legacy_unsealed_session(
+        conn, entity, "2026-09-27T10:00:00+00:00")
+    assert apply_migrations(conn) == (5,)
+    seed_business_understanding_vocabulary(conn)
+    # a valid non-invalid session for the searched/context edges: the
+    # Maps sync session (the roles never substitute for bounded
+    # absence, so its target does not matter to the expected outcome)
+    non_website_sids = [r[0] for r in conn.execute(
+        "SELECT DISTINCT a.id FROM acquisition_sessions a JOIN "
+        "evidence_items e ON e.acquisition_session_id=a.id WHERE "
+        "a.collector_name!='sara.website' ORDER BY a.id LIMIT 2")]
+    stamp = "2026-09-27T10:00:00+00:00"
+    conn.execute(
+        "INSERT INTO facts("
+        "id,subject_id,predicate,fact_slot,value_json,"
+        "normalized_value_json,value_hash,status,valid_from,valid_to,"
+        "last_verified_at,reconciled_at,reconciliation_version,created_at"
+        ") VALUES ('fact_absence',?, 'capability.online_booking', "
+        "'__single__', NULL, NULL, NULL, 'not_observed', ?, NULL, ?, "
+        "?, 'legacy-test', ?)",
+        (entity, stamp, stamp, stamp, stamp))
+    # the ONLY supports_absence edge sits on the invalid session; the
+    # valid session contributes searched/context edges, which must
+    # never substitute for bounded-absence support
+    conn.execute(
+        "INSERT INTO fact_acquisition_support(fact_id,"
+        "acquisition_session_id,support_role) VALUES "
+        "('fact_absence',?, 'supports_absence')", (legacy_sid,))
+    conn.execute(
+        "INSERT INTO fact_acquisition_support(fact_id,"
+        "acquisition_session_id,support_role) VALUES "
+        "('fact_absence',?, 'searched')", (non_website_sids[0],))
+    if len(non_website_sids) > 1:
+        conn.execute(
+            "INSERT INTO fact_acquisition_support(fact_id,"
+            "acquisition_session_id,support_role) VALUES "
+            "('fact_absence',?, 'context')", (non_website_sids[1],))
+    conn.commit()
+
+    dossier = build_business_dossier(
+        conn, business_id=1, evaluated_at="2026-09-28T11:30:00+00:00")
+    assert {str(i["code"]) for i in dossier["integrity_issues"]} == {
+        "customer_journey_website_session_invalid"}
+    seal = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:30:00+00:00")
+    row = conn.execute(
+        "SELECT state, reason_json FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='provenance'",
+        (seal.assessment_id,)).fetchone()
+    assert row[0] == "insufficient"
+    reason = json.loads(row[1])
+    assert reason["material_items_dependent_on_invalid_sessions"] == [
+        {"kind": "fact", "id": "fact_absence",
+         "predicate": "capability.online_booking"}]
+    conn.close()
 
 # 3. old-policy snapshots never surface under the v3 policy identity
 def test_v2_snapshots_not_current_under_v3_policy(tmp_path: Path) -> None:

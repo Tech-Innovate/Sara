@@ -675,44 +675,75 @@ def _invalid_website_session_ids(dossier: dict[str, Any]) -> list[str]:
     )
 
 
+_VALUE_BEARING_FACT_STATUSES = frozenset(
+    {"confirmed", "single_source", "stale"}
+)
+
+
 def _material_items_dependent_on_invalid_sessions(
     dossier: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Current material items whose support chains reference an
-    inadmissible historical website session without any independent
-    admissible chain.
+    """Current material items whose affirmative support depends on an
+    inadmissible historical website session (PR24-01: independence is
+    support-role and fact-state aware).
 
-    v4 supersession contract: an inadmissible website session is
-    nonblocking for provenance exactly when nothing material depends on
-    it alone. A fact's chains are its observation support (independent
-    when the evidence is usable and the session is not an invalid one)
-    and its acquisition support (independent when the session is not an
-    invalid one). Customer-voice reviews are material items in their
-    own right: a review whose evidence belongs to an invalid session is
-    dependence, keeping provenance coverage of customer reviews intact.
+    A fact references an invalid session through ANY observation or
+    acquisition edge, whatever its role. Independence then requires a
+    chain that affirmatively establishes the fact's CURRENT state on
+    non-invalid evidence:
+
+    - value-bearing facts (confirmed / single_source / stale) need a
+      usable observation edge with support_role == "supports" on a
+      non-invalid session. "contradicts" and "supersedes" edges never
+      substitute for affirmative support.
+    - not_observed facts need a non-invalid acquisition edge with
+      support_role == "supports_absence" meeting the existing
+      bounded-support validity condition (completed session whose
+      target matches the fact's subject, fact not stale) — "searched"
+      and "context" edges never substitute.
+    - every other status (conflicted included) fails closed: this
+      policy cannot judge whether non-invalid evidence independently
+      establishes the same conflicted state.
+
+    Customer-voice reviews are material items in their own right: a
+    review whose evidence belongs to an invalid session is dependence.
     """
     invalid = set(_invalid_website_session_ids(dossier))
     if not invalid:
         return []
     dependent: list[dict[str, str]] = []
     for fact in dossier["facts"]:
-        chains = [
-            (
-                str(support.get("acquisition_session_id")),
-                str(support.get("evidence_status")),
-            )
-            for support in fact.get("observation_support", ())
-        ]
-        chains.extend(
-            (str(support.get("acquisition_session_id")), "usable")
-            for support in fact.get("acquisition_support", ())
+        observation_edges = fact.get("observation_support", ())
+        acquisition_edges = fact.get("acquisition_support", ())
+        references_invalid = any(
+            str(edge.get("acquisition_session_id")) in invalid
+            for edge in (*observation_edges, *acquisition_edges)
         )
-        if not any(session in invalid for session, _status in chains):
+        if not references_invalid:
             continue
-        independent = any(
-            session not in invalid and status == "usable"
-            for session, status in chains
-        )
+        status = str(fact.get("status"))
+        if status in _VALUE_BEARING_FACT_STATUSES:
+            independent = any(
+                str(edge.get("support_role")) == "supports"
+                and str(edge.get("evidence_status")) == "usable"
+                and str(edge.get("acquisition_session_id")) not in invalid
+                for edge in observation_edges
+            )
+        elif status == "not_observed":
+            independent = (
+                not bool(fact.get("freshness", {}).get("is_stale"))
+                and any(
+                    str(edge.get("support_role")) == "supports_absence"
+                    and edge.get("status") == "complete"
+                    and str(edge.get("target_subject_id"))
+                    == str(fact.get("subject_id"))
+                    and str(edge.get("acquisition_session_id"))
+                    not in invalid
+                    for edge in acquisition_edges
+                )
+            )
+        else:
+            independent = False
         if not independent:
             dependent.append(
                 {
