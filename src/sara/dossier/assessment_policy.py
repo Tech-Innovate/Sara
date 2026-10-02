@@ -17,7 +17,13 @@ from .core import parse_timestamp
 # booking/ordering hand-off is evidence, not a promotion gate. Later
 # stages keep their independent evidence states and are never inferred
 # from contact/book_order. Identity-affecting for the same reason as v2.
-DERIVATION_VERSION = "dossier-assessment-v3"
+# v4: provenance supersession — an inadmissible historical website session
+# (customer_journey_website_session_invalid) no longer blocks the provenance
+# domain when every current material item referencing it also has an
+# independent admissible support chain; the session itself, and the
+# integrity issue reporting it, are preserved untouched. Identity-affecting
+# for the same reason as v2/v3.
+DERIVATION_VERSION = "dossier-assessment-v4"
 _VALUE_STATUSES = frozenset({"confirmed", "single_source"})
 _CAPABILITY_PREDICATES = (
     "capability.online_booking",
@@ -655,6 +661,110 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
     )
 
 
+_SUPERSEDED_NONBLOCKING_ISSUE = "customer_journey_website_session_invalid"
+
+
+def _invalid_website_session_ids(dossier: dict[str, Any]) -> list[str]:
+    return sorted(
+        {
+            str(item.get("session_id"))
+            for item in dossier.get("integrity_issues", ())
+            if str(item.get("code")) == _SUPERSEDED_NONBLOCKING_ISSUE
+            and item.get("session_id")
+        }
+    )
+
+
+_VALUE_BEARING_FACT_STATUSES = frozenset(
+    {"confirmed", "single_source", "stale"}
+)
+
+
+def _material_items_dependent_on_invalid_sessions(
+    dossier: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Current material items whose affirmative support depends on an
+    inadmissible historical website session (PR24-01: independence is
+    support-role and fact-state aware).
+
+    A fact references an invalid session through ANY observation or
+    acquisition edge, whatever its role. Independence then requires a
+    chain that affirmatively establishes the fact's CURRENT state on
+    non-invalid evidence:
+
+    - value-bearing facts (confirmed / single_source / stale) need a
+      usable observation edge with support_role == "supports" on a
+      non-invalid session. "contradicts" and "supersedes" edges never
+      substitute for affirmative support.
+    - not_observed facts need a non-invalid acquisition edge with
+      support_role == "supports_absence" meeting the existing
+      bounded-support validity condition (completed session whose
+      target matches the fact's subject, fact not stale) — "searched"
+      and "context" edges never substitute.
+    - every other status (conflicted included) fails closed: this
+      policy cannot judge whether non-invalid evidence independently
+      establishes the same conflicted state.
+
+    Customer-voice reviews are material items in their own right: a
+    review whose evidence belongs to an invalid session is dependence.
+    """
+    invalid = set(_invalid_website_session_ids(dossier))
+    if not invalid:
+        return []
+    dependent: list[dict[str, str]] = []
+    for fact in dossier["facts"]:
+        observation_edges = fact.get("observation_support", ())
+        acquisition_edges = fact.get("acquisition_support", ())
+        references_invalid = any(
+            str(edge.get("acquisition_session_id")) in invalid
+            for edge in (*observation_edges, *acquisition_edges)
+        )
+        if not references_invalid:
+            continue
+        status = str(fact.get("status"))
+        if status in _VALUE_BEARING_FACT_STATUSES:
+            independent = any(
+                str(edge.get("support_role")) == "supports"
+                and str(edge.get("evidence_status")) == "usable"
+                and str(edge.get("acquisition_session_id")) not in invalid
+                for edge in observation_edges
+            )
+        elif status == "not_observed":
+            independent = (
+                not bool(fact.get("freshness", {}).get("is_stale"))
+                and any(
+                    str(edge.get("support_role")) == "supports_absence"
+                    and edge.get("status") == "complete"
+                    and str(edge.get("target_subject_id"))
+                    == str(fact.get("subject_id"))
+                    and str(edge.get("acquisition_session_id"))
+                    not in invalid
+                    for edge in acquisition_edges
+                )
+            )
+        else:
+            independent = False
+        if not independent:
+            dependent.append(
+                {
+                    "kind": "fact",
+                    "id": str(fact.get("id")),
+                    "predicate": str(fact.get("predicate")),
+                }
+            )
+    for review in dossier["customer_voice"].get("reviews", ()):
+        evidence = review.get("evidence") or {}
+        if str(evidence.get("acquisition_session_id")) in invalid:
+            dependent.append(
+                {
+                    "kind": "review",
+                    "id": str(review.get("observation_id")),
+                    "predicate": "reputation.customer_review",
+                }
+            )
+    return sorted(dependent, key=lambda item: (item["kind"], item["id"]))
+
+
 def _provenance_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     facts, unknowns, _fresh = _domain_context(dossier, "provenance")
     traceable_items = len(dossier["facts"]) + int(dossier["customer_voice"]["review_count"])
@@ -663,15 +773,45 @@ def _provenance_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             code="nothing_material_to_trace", facts=facts, unknowns=unknowns
         )
     if dossier["integrity_issues"]:
+        invalid_ids = _invalid_website_session_ids(dossier)
+        other_issues = [
+            item
+            for item in dossier["integrity_issues"]
+            if str(item.get("code")) != _SUPERSEDED_NONBLOCKING_ISSUE
+        ]
+        dependent = (
+            _material_items_dependent_on_invalid_sessions(dossier)
+            if invalid_ids
+            else []
+        )
+        if invalid_ids and not other_issues and not dependent:
+            # v4: every material item that references an inadmissible
+            # historical session also has an independent admissible
+            # chain, so superseded history does not block provenance.
+            # The sessions and the integrity issues reporting them are
+            # preserved untouched.
+            return "sufficient", _reason(
+                code="material_traces_with_superseded_invalid_history",
+                facts=facts,
+                unknowns=unknowns,
+                extra={
+                    "traceable_item_count": traceable_items,
+                    "superseded_invalid_sessions": invalid_ids,
+                },
+            )
+        extra: dict[str, Any] = {
+            "integrity_issue_codes": sorted(
+                {str(item["code"]) for item in dossier["integrity_issues"]}
+            )
+        }
+        if invalid_ids:
+            extra["superseded_invalid_sessions"] = invalid_ids
+            extra["material_items_dependent_on_invalid_sessions"] = dependent
         return "insufficient", _reason(
             code="provenance_integrity_issues_present",
             facts=facts,
             unknowns=unknowns,
-            extra={
-                "integrity_issue_codes": sorted(
-                    {str(item["code"]) for item in dossier["integrity_issues"]}
-                )
-            },
+            extra=extra,
         )
     return "sufficient", _reason(
         code="material_current_state_traces_to_retained_evidence",

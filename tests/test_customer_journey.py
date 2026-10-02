@@ -2299,7 +2299,7 @@ def test_coverage_menu_only_site_is_sufficient(tmp_path: Path) -> None:
     assert state == "sufficient"
     assert reason["code"] == "observable_journey_stages_reconstructed"
     assert reason["public_surface_coverage_state"] == "evaluation_observed"
-    assert reason["derivation_version"] == "dossier-assessment-v3"
+    assert reason["derivation_version"] == "dossier-assessment-v4"
     # invariants: sufficiency never manufactures later stages
     _, journey = _journey(conn, entity)
     assert _states(journey)["pay"] == "unknown"
@@ -2438,7 +2438,7 @@ def test_v3_derivation_version_sealed_in_assessment(tmp_path: Path) -> None:
     summary = json.loads(conn.execute(
         "SELECT summary_json FROM dossier_assessments WHERE id=?",
         (seal.assessment_id,)).fetchone()[0])
-    assert summary["derivation_version"] == "dossier-assessment-v3"
+    assert summary["derivation_version"] == "dossier-assessment-v4"
     assert "customer_journey" not in seal.blocking_mandatory_domains
     conn.close()
 
@@ -2600,8 +2600,8 @@ def test_sr01_superseded_policy_snapshot_not_current(tmp_path: Path) -> None:
     current = persisted_current()
     assert current is not None
     assert current["id"] == new.assessment_id
-    assert current["policy_version"] == "business-understanding-v2"
-    assert current["summary"]["derivation_version"] == "dossier-assessment-v3"
+    assert current["policy_version"] == "business-understanding-v3"
+    assert current["summary"]["derivation_version"] == "dossier-assessment-v4"
 
     # a LATER old-policy write (freshness advanced by a real crawl) must
     # not shadow the current-policy snapshot
@@ -2617,7 +2617,7 @@ def test_sr01_superseded_policy_snapshot_not_current(tmp_path: Path) -> None:
         old.assessment_id, new.assessment_id}
     current = persisted_current()
     assert current is not None
-    assert current["policy_version"] == "business-understanding-v2"
+    assert current["policy_version"] == "business-understanding-v3"
     conn.close()
 
 

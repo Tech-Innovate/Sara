@@ -74,7 +74,7 @@ sara-dossier-assess --db data/sara.db --business-id 123 --pretty
 
 The assessment command accepts the same three selectors as `sara-dossier`. It opens an existing writable database but does not repair or prepare it implicitly.
 
-The active policy is `business-understanding-v2`, with derivation implementation `dossier-assessment-v3`. An assessment records:
+The active policy is `business-understanding-v3`, with derivation implementation `dossier-assessment-v4`. An assessment records:
 
 - immutable parent state in `dossier_assessments`;
 - exactly one row for every controlled dossier domain in `dossier_domain_assessments`;
@@ -97,7 +97,7 @@ Time still matters semantically. If the same factual input later crosses a fresh
 
 The read-only dossier returns the chronologically latest complete sealed snapshot for the active policy. Snapshots sealed under a superseded policy identity remain immutable history but are never surfaced as the persisted current policy, and cannot shadow a current-policy snapshot regardless of their `computed_at`. It does not silently recompute an old assessment after later facts or freshness conditions change.
 
-## Dossier sufficiency policy v2
+## Dossier sufficiency policy v3
 
 Sara does not represent understanding as one opaque percentage. Every controlled domain receives one of:
 
@@ -112,7 +112,7 @@ conflicted
 not_applicable
 ```
 
-The v2 assessment policy is intentionally conservative:
+The v3 assessment policy is intentionally conservative:
 
 - `identity` requires a fresh trading-name fact plus at least one active strong Maps Location identifier (`place_id`, `cid`, or `data_id`) attributed to Sara's canonical Google Maps source (`src_google_maps`, source type `google_maps`); namespace text from another source is not a Maps identity anchor;
 - `classification` requires a fresh primary-category fact;
@@ -123,7 +123,7 @@ The v2 assessment policy is intentionally conservative:
 - `digital_presence` requires a fresh official-website fact;
 - `digital_capabilities` requires bounded inspection of online booking, online ordering, and WhatsApp. A current `not_observed` fact counts as inspection only when it has a `supports_absence` edge to a completed acquisition whose `target_subject_id` matches that Fact's subject; failed, blocked, partial, cancelled, or subject-mismatched acquisitions never satisfy inspection and are reported as integrity issues. `not_observed` never becomes confirmed absence;
 - `reputation` requires current platform rating/review-count facts plus retained customer-review evidence retrieved within the policy's 30-day review-collection freshness window before it can become `sufficient`. If at least one required reputation component remains current while others are missing/expired, the domain is `partial`; when retained platform/customer-voice evidence is wholly expired, the domain becomes `stale` rather than remaining permanently `partial`;
-- `provenance` requires material current facts/customer voice to trace cleanly to retained evidence;
+- `provenance` requires material current facts/customer voice to trace cleanly to retained evidence. An inadmissible historical website session (`customer_journey_website_session_invalid`) is nonblocking when every material item referencing it also has an independent admissible support chain — superseded history is preserved, never repaired, and never blocks provenance on its own; any material item that depends solely on such a session keeps the domain `insufficient`; all other integrity-issue classes remain blocking;
 - `unknowns` evaluates whether controlled Fact-eligible unresolved state is explicitly enumerated rather than invented away.
 
 `customer_journey` is assessed over the deterministic observable-journey reconstruction (`observable-customer-journey-v1`). The domain is `sufficient` when all three conditions hold: a current entry/evaluation stage (`discover` or `evaluate`), a current customer-action stage (`contact` or `book_order`), and public-surface coverage. Coverage is satisfied by current admissible `evaluate` evidence, or by a sealed bounded website inspection of the entity's current official website — complete, business-wide-scope-eligible, frontier-exhausted — that found no evaluate surface, current across its entire admitted row set and same-site with the current official-website fact under crawler host semantics. Website-derived evaluate rows are themselves same-site-bound: an evaluate page retained from a superseded site cannot cover a different current site. Non-website evaluate evidence (for example a producer-verified offering fact) deliberately qualifies regardless of site identity, because it speaks for the business rather than for a site. Later stages (`pay`, `receive`, `support`, `return`) and external booking/ordering hand-offs remain reported evidence and never gate sufficiency; nothing is inferred from contact/book_order. A current website that is known but was never successfully inspected, and a Maps-listing-plus-phone-only journey, both remain `partial` on the coverage condition.
