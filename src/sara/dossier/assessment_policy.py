@@ -17,7 +17,13 @@ from .core import parse_timestamp
 # booking/ordering hand-off is evidence, not a promotion gate. Later
 # stages keep their independent evidence states and are never inferred
 # from contact/book_order. Identity-affecting for the same reason as v2.
-DERIVATION_VERSION = "dossier-assessment-v3"
+# v4: provenance supersession — an inadmissible historical website session
+# (customer_journey_website_session_invalid) no longer blocks the provenance
+# domain when every current material item referencing it also has an
+# independent admissible support chain; the session itself, and the
+# integrity issue reporting it, are preserved untouched. Identity-affecting
+# for the same reason as v2/v3.
+DERIVATION_VERSION = "dossier-assessment-v4"
 _VALUE_STATUSES = frozenset({"confirmed", "single_source"})
 _CAPABILITY_PREDICATES = (
     "capability.online_booking",
@@ -655,6 +661,79 @@ def _customer_journey_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, An
     )
 
 
+_SUPERSEDED_NONBLOCKING_ISSUE = "customer_journey_website_session_invalid"
+
+
+def _invalid_website_session_ids(dossier: dict[str, Any]) -> list[str]:
+    return sorted(
+        {
+            str(item.get("session_id"))
+            for item in dossier.get("integrity_issues", ())
+            if str(item.get("code")) == _SUPERSEDED_NONBLOCKING_ISSUE
+            and item.get("session_id")
+        }
+    )
+
+
+def _material_items_dependent_on_invalid_sessions(
+    dossier: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Current material items whose support chains reference an
+    inadmissible historical website session without any independent
+    admissible chain.
+
+    v4 supersession contract: an inadmissible website session is
+    nonblocking for provenance exactly when nothing material depends on
+    it alone. A fact's chains are its observation support (independent
+    when the evidence is usable and the session is not an invalid one)
+    and its acquisition support (independent when the session is not an
+    invalid one). Customer-voice reviews are material items in their
+    own right: a review whose evidence belongs to an invalid session is
+    dependence, keeping provenance coverage of customer reviews intact.
+    """
+    invalid = set(_invalid_website_session_ids(dossier))
+    if not invalid:
+        return []
+    dependent: list[dict[str, str]] = []
+    for fact in dossier["facts"]:
+        chains = [
+            (
+                str(support.get("acquisition_session_id")),
+                str(support.get("evidence_status")),
+            )
+            for support in fact.get("observation_support", ())
+        ]
+        chains.extend(
+            (str(support.get("acquisition_session_id")), "usable")
+            for support in fact.get("acquisition_support", ())
+        )
+        if not any(session in invalid for session, _status in chains):
+            continue
+        independent = any(
+            session not in invalid and status == "usable"
+            for session, status in chains
+        )
+        if not independent:
+            dependent.append(
+                {
+                    "kind": "fact",
+                    "id": str(fact.get("id")),
+                    "predicate": str(fact.get("predicate")),
+                }
+            )
+    for review in dossier["customer_voice"].get("reviews", ()):
+        evidence = review.get("evidence") or {}
+        if str(evidence.get("acquisition_session_id")) in invalid:
+            dependent.append(
+                {
+                    "kind": "review",
+                    "id": str(review.get("observation_id")),
+                    "predicate": "reputation.customer_review",
+                }
+            )
+    return sorted(dependent, key=lambda item: (item["kind"], item["id"]))
+
+
 def _provenance_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     facts, unknowns, _fresh = _domain_context(dossier, "provenance")
     traceable_items = len(dossier["facts"]) + int(dossier["customer_voice"]["review_count"])
@@ -663,15 +742,45 @@ def _provenance_domain(dossier: dict[str, Any]) -> tuple[str, dict[str, Any]]:
             code="nothing_material_to_trace", facts=facts, unknowns=unknowns
         )
     if dossier["integrity_issues"]:
+        invalid_ids = _invalid_website_session_ids(dossier)
+        other_issues = [
+            item
+            for item in dossier["integrity_issues"]
+            if str(item.get("code")) != _SUPERSEDED_NONBLOCKING_ISSUE
+        ]
+        dependent = (
+            _material_items_dependent_on_invalid_sessions(dossier)
+            if invalid_ids
+            else []
+        )
+        if invalid_ids and not other_issues and not dependent:
+            # v4: every material item that references an inadmissible
+            # historical session also has an independent admissible
+            # chain, so superseded history does not block provenance.
+            # The sessions and the integrity issues reporting them are
+            # preserved untouched.
+            return "sufficient", _reason(
+                code="material_traces_with_superseded_invalid_history",
+                facts=facts,
+                unknowns=unknowns,
+                extra={
+                    "traceable_item_count": traceable_items,
+                    "superseded_invalid_sessions": invalid_ids,
+                },
+            )
+        extra: dict[str, Any] = {
+            "integrity_issue_codes": sorted(
+                {str(item["code"]) for item in dossier["integrity_issues"]}
+            )
+        }
+        if invalid_ids:
+            extra["superseded_invalid_sessions"] = invalid_ids
+            extra["material_items_dependent_on_invalid_sessions"] = dependent
         return "insufficient", _reason(
             code="provenance_integrity_issues_present",
             facts=facts,
             unknowns=unknowns,
-            extra={
-                "integrity_issue_codes": sorted(
-                    {str(item["code"]) for item in dossier["integrity_issues"]}
-                )
-            },
+            extra=extra,
         )
     return "sufficient", _reason(
         code="material_current_state_traces_to_retained_evidence",

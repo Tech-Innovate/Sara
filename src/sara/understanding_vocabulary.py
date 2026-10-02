@@ -245,7 +245,12 @@ VOCABULARY_VERSION = "business-understanding-v3"
 # old-policy assessments remain immutable history but are no longer the
 # persisted current policy, and a superseded-policy writer cannot shadow
 # a current-policy snapshot regardless of computed_at.
-DOSSIER_POLICY_VERSION = "business-understanding-v2"
+# v3 policy identity: provenance supersession — an inadmissible
+# historical website session no longer blocks the provenance domain
+# when no material item depends on it alone. Same dossier inputs now
+# produce a different domain judgment, so the identity moves again
+# rather than letting v2-era snapshots masquerade as current policy.
+DOSSIER_POLICY_VERSION = "business-understanding-v3"
 
 
 DOSSIER_DOMAIN_SEED_V1: tuple[DossierDomainSeed, ...] = (

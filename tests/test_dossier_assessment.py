@@ -341,3 +341,263 @@ def test_dossier_reader_on_v1_only_schema_fails_closed(tmp_path: Path) -> None:
         assert not conn.in_transaction
     finally:
         conn.close()
+
+# ---- v4 provenance supersession (invalid historical website sessions) ----
+
+MENU_SITE = {
+    "https://assessment.example/": """
+        <link rel="canonical" href="https://assessment.example/">
+        <a href="/menu">Menu</a>
+    """,
+    "https://assessment.example/menu": "<h1>Signature dishes</h1>",
+}
+
+
+def _acquire(conn, tmp_path):
+    from sara.website import CrawlConfig, collect_official_website
+    from sara.website.http import HttpResponse, WebsiteFetchError
+
+    class FakeClient:
+        def __init__(self, site_pages):
+            self.site_pages = site_pages
+
+        def fetch(self, url: str) -> HttpResponse:
+            if url not in self.site_pages:
+                raise WebsiteFetchError(f"HTTP 404 for {url}")
+            return HttpResponse(
+                requested_url=url, final_url=url, status=200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                body=self.site_pages[url].encode(),
+                media_type="text/html", charset="utf-8",
+            )
+
+    client = FakeClient(MENU_SITE)
+    return collect_official_website(
+        conn, evidence_root=tmp_path / "ev", business_id=1,
+        config=CrawlConfig(page_limit=8),
+        now=lambda: "2026-09-28T11:00:00+00:00",
+        client_factory=lambda **_kw: client, refresh_assessment=False,
+    )
+
+
+def _forge_legacy_unsealed_session(conn, entity, started_at):
+    """Insert a pre-v5 historical website session at schema v4 (running
+    -> finalization WITHOUT a seal, exactly how production's 30 invalid
+    sessions were born), returning (session_id, evidence_id)."""
+    from sara.website.model import (
+        COLLECTOR_VERSION,
+        canonical_json as wcanonical,
+        opaque_id as wopaque,
+        sha256_text as wsha,
+    )
+
+    if conn.execute(
+        "SELECT 1 FROM sources WHERE id='src_official_web'"
+    ).fetchone() is None:
+        conn.execute(
+            "INSERT INTO sources(id,source_type,name,base_url,created_at,"
+            "active) VALUES ('src_official_web','official_web',"
+            "'Official website',NULL,'2026-01-01T00:00:00+00:00',1)")
+    config = wcanonical(
+        {
+            "entity_id": entity,
+            "start_url": "https://legacy.example/",
+            "page_limit": 8,
+            "depth_limit": 2,
+            "max_response_bytes": 1048576,
+            "timeout_seconds": 10.0,
+            "request_interval_seconds": 1.0,
+            "max_policy_delay_seconds": 30.0,
+            "retry_attempt_limit": 4,
+            "retry_base_delay_seconds": 1.0,
+            "retry_max_delay_seconds": 30.0,
+            "retry_delay_budget_seconds": 60.0,
+            "user_agent": "SaraBusinessUnderstanding/1.0",
+            "obey_robots": True,
+            "evidence_root": "/tmp/legacy-ev",
+        }
+    )
+    config_hash = wsha(config)
+    session_id = wopaque("acq", entity, started_at, config_hash)
+    conn.execute(
+        "INSERT INTO acquisition_sessions("
+        "id,target_subject_id,source_id,collector_name,collector_version,"
+        "config_json,config_hash,status,started_at,finished_at,error,"
+        "legacy_run_id,evidence_count,observation_count"
+        ") VALUES (?,?,?,?,?,?,?,'running',?,NULL,NULL,NULL,0,0)",
+        (session_id, entity, "src_official_web", "sara.website",
+         COLLECTOR_VERSION, config, config_hash, started_at))
+    content = "<html>legacy home</html>"
+    content_sha = wsha(content)
+    evidence_id = wopaque("ev", session_id, "https://legacy.example/",
+                          content_sha)
+    metadata = wcanonical(
+        {
+            "acquisition_kind": "bounded_official_website",
+            "entity_id": entity,
+            "start_url": "https://legacy.example/",
+            "requested_url": "https://legacy.example/",
+            "final_url": "https://legacy.example/",
+            "crawl_depth": 0,
+            "page_role": "home",
+            "home_page": True,
+            "business_wide_scope_eligible": True,
+            "crawl_frontier_exhausted": True,
+            "title": "Legacy",
+            "canonical_url": "https://legacy.example/",
+            "channels": [],
+            "observation_ids": [],
+        }
+    )
+    conn.execute(
+        "INSERT INTO evidence_items("
+        "id,acquisition_session_id,source_id,source_locator,source_role,"
+        "status,retrieved_at,published_at,language,media_type,"
+        "content_sha256,artifact_ref,metadata_json,created_at"
+        ") VALUES (?,?,?,?,?,'usable',?,NULL,NULL,'text/html',?,NULL,?,?)",
+        (evidence_id, session_id, "src_official_web",
+         "https://legacy.example/", "official", started_at, content_sha,
+         metadata, started_at))
+    # pre-v5 finalization: terminal WITHOUT a seal (impossible under v5)
+    conn.execute(
+        "UPDATE acquisition_sessions SET status='complete', finished_at=?, "
+        "error=NULL, evidence_count=1, observation_count=0 WHERE id=? "
+        "AND status='running'", (started_at, session_id))
+    conn.commit()
+    return session_id, evidence_id
+
+
+def _entity_of(conn):
+    from sara.maps_backfill import business_entity_id_for_maps_business
+    return business_entity_id_for_maps_business(1)
+
+
+# 1. superseded invalid session + independent valid support => sufficient
+def test_provenance_superseded_invalid_session_is_sufficient(
+        tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "prov-super.sqlite",
+                     migrations=MIGRATIONS[:4])
+    entity = _entity_of(conn)
+    legacy_sid, legacy_eid = _forge_legacy_unsealed_session(
+        conn, entity, "2026-09-27T10:00:00+00:00")
+    assert apply_migrations(conn) == (5,)
+    seed_business_understanding_vocabulary(conn)
+    _acquire(conn, tmp_path)
+
+    dossier = build_business_dossier(
+        conn, business_id=1, evaluated_at="2026-09-28T11:30:00+00:00")
+    issue_codes = {str(i["code"]) for i in dossier["integrity_issues"]}
+    assert "customer_journey_website_session_invalid" in issue_codes
+    journey_evidence = {
+        str(entry.get("evidence_id"))
+        for stage in dossier["customer_journey"]["stages"]
+        for entry in stage.get("evidence", ())
+    }
+    assert legacy_eid not in journey_evidence
+
+    seal = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:30:00+00:00")
+    row = conn.execute(
+        "SELECT state, reason_json FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='provenance'",
+        (seal.assessment_id,)).fetchone()
+    assert row[0] == "sufficient"
+    reason = json.loads(row[1])
+    assert reason["code"] == "material_traces_with_superseded_invalid_history"
+    assert reason["superseded_invalid_sessions"] == [legacy_sid]
+    assert "provenance" not in seal.blocking_mandatory_domains
+    conn.close()
+
+
+# 2. material fact supported ONLY by the invalid session => insufficient
+def test_provenance_invalid_only_support_stays_insufficient(
+        tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "prov-dep.sqlite",
+                     migrations=MIGRATIONS[:4])
+    entity = _entity_of(conn)
+    legacy_sid, legacy_eid = _forge_legacy_unsealed_session(
+        conn, entity, "2026-09-27T10:00:00+00:00")
+    stamp = "2026-09-27T10:00:00+00:00"
+    conn.execute(
+        "INSERT INTO observations("
+        "id,subject_id,predicate,evidence_id,value_json,"
+        "normalized_value_json,value_hash,observation_kind,observed_at,"
+        "extracted_at,extraction_method,extractor_name,extractor_version,"
+        "confidence,created_at"
+        ") VALUES ('obs_legacy_dep',?,?,?, 'true', 'true', ?, "
+        "'detected_capability', ?, ?, 'heuristic', 'sara.website', '5', "
+        "0.8, ?)",
+        (entity, "capability.whatsapp", legacy_eid,
+         "a" * 64, stamp, stamp, stamp))
+    conn.execute(
+        "INSERT INTO facts("
+        "id,subject_id,predicate,fact_slot,value_json,"
+        "normalized_value_json,value_hash,status,valid_from,valid_to,"
+        "last_verified_at,reconciled_at,reconciliation_version,created_at"
+        ") VALUES ('fact_legacy_dep',?, 'capability.whatsapp', "
+        "'__single__', 'true', 'true', ?, 'single_source', ?, NULL, ?, ?, "
+        "'legacy-test', ?)",
+        (entity, "b" * 64, stamp, stamp, stamp, stamp))
+    conn.execute(
+        "INSERT INTO fact_observation_support(fact_id,observation_id,"
+        "support_role) VALUES ('fact_legacy_dep','obs_legacy_dep',"
+        "'supports')")
+    conn.commit()
+    assert apply_migrations(conn) == (5,)
+    seed_business_understanding_vocabulary(conn)
+
+    dossier = build_business_dossier(
+        conn, business_id=1, evaluated_at="2026-09-28T11:30:00+00:00")
+    assert any(
+        str(i["code"]) == "customer_journey_website_session_invalid"
+        for i in dossier["integrity_issues"])
+    seal = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:30:00+00:00")
+    row = conn.execute(
+        "SELECT state, reason_json FROM dossier_domain_assessments "
+        "WHERE assessment_id=? AND domain='provenance'",
+        (seal.assessment_id,)).fetchone()
+    assert row[0] == "insufficient"
+    reason = json.loads(row[1])
+    assert reason["code"] == "provenance_integrity_issues_present"
+    assert reason["material_items_dependent_on_invalid_sessions"] == [
+        {"kind": "fact", "id": "fact_legacy_dep",
+         "predicate": "capability.whatsapp"}]
+    assert "provenance" in seal.blocking_mandatory_domains
+    conn.close()
+
+
+# 3. old-policy snapshots never surface under the v3 policy identity
+def test_v2_snapshots_not_current_under_v3_policy(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "prov-policy.sqlite")
+    with patch("sara.dossier.assessment.DOSSIER_POLICY_VERSION",
+               "business-understanding-v2"):
+        persist_dossier_assessment(
+            conn, business_id=1, now=lambda: "2026-09-28T11:00:00+00:00")
+    dossier = build_business_dossier(
+        conn, business_id=1, evaluated_at="2026-09-28T11:30:00+00:00")
+    assert dossier["dossier_status"]["persisted_current_policy"] is None
+    seal = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:10:00+00:00")
+    current = build_business_dossier(
+        conn, business_id=1,
+        evaluated_at="2026-09-28T11:30:00+00:00"
+    )["dossier_status"]["persisted_current_policy"]
+    assert current is not None
+    assert current["id"] == seal.assessment_id
+    assert current["policy_version"] == "business-understanding-v3"
+    assert current["summary"]["derivation_version"] == (
+        "dossier-assessment-v4")
+    conn.close()
+
+
+# 4. deterministic identity under the new derivation
+def test_v4_deterministic_assessment_identity(tmp_path: Path) -> None:
+    conn = _prepared(tmp_path / "prov-det.sqlite")
+    first = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:00:00+00:00")
+    second = persist_dossier_assessment(
+        conn, business_id=1, now=lambda: "2026-09-28T11:05:00+00:00")
+    assert second.assessment_id == first.assessment_id
+    assert second.already_assessed
+    conn.close()
